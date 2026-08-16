@@ -7043,6 +7043,13 @@ initFrame:SetScript("OnEvent", function(self)
                           local p = DB(); if not p then return end
                           p.secondary.shiftElementsIfNoResourceExtraY = v
                           RebuildClass()
+                          -- BuildBars' cascade is edge-gated on the shift
+                          -- DIRECTION, which a magnitude edit never flips --
+                          -- re-cascade explicitly so the slider applies live
+                          -- while the shift is active.
+                          if EllesmereUI.PropagateAnchorChain then
+                              EllesmereUI.PropagateAnchorChain("ERB_ClassResource")
+                          end
                       end },
                 },
             })
@@ -7081,6 +7088,12 @@ initFrame:SetScript("OnEvent", function(self)
                           local p = DB(); if not p then return end
                           p.primary.shiftElementsIfNoPowerExtraY = v
                           RebuildPower()
+                          -- Same explicit re-cascade as the class-resource
+                          -- Shift Offset cog: the direction edge gate never
+                          -- fires on a magnitude edit.
+                          if EllesmereUI.PropagateAnchorChain then
+                              EllesmereUI.PropagateAnchorChain("ERB_Power")
+                          end
                       end },
                 },
             })
