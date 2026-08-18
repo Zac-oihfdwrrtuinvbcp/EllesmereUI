@@ -7198,6 +7198,38 @@ local function BuildListRow(parent, y, entry)
             end
         end
     end
+    -- A conditional entry whose fkey a SPEC override also owns never applies at
+    -- runtime: Cond.WriteValues skips spec-owned fkeys outside an editing session
+    -- (the forSession gate), so the value shows while the session is open and is
+    -- dropped the moment it closes. The row otherwise reads as live while doing
+    -- nothing, which is the whole reason this is hard to diagnose -- name the
+    -- owner instead of leaving the eviction silent.
+    if isCondEntry then
+        local ownerEntry
+        for fkey in pairs(entry.values and entry.values.default or {}) do
+            ownerEntry = EntryOwning(fkey)
+            if ownerEntry then break end
+        end
+        if ownerEntry then
+            local og = GroupById(ownerEntry.group)
+            local warn = EllesmereUI.MakeFont(row, 11, nil, 1, 0.45, 0.45, 0.85)
+            warn:SetPoint("LEFT", crumb, "RIGHT", 10, 0)
+            warn:SetText(string.format(L("held by '%s'"), (og and og.name) or "?"))
+            local hit = CreateFrame("Frame", nil, row)
+            hit:SetAllPoints(warn)
+            hit:EnableMouse(true)
+            hit:SetScript("OnEnter", function(self)
+                if EllesmereUI.ShowWidgetTooltip then
+                    EllesmereUI.ShowWidgetTooltip(self,
+                        L("A spec override owns this setting, so this conditional value never applies outside an editing session. Remove the spec override to let it through."))
+                end
+            end)
+            hit:SetScript("OnLeave", function()
+                if EllesmereUI.HideWidgetTooltip then EllesmereUI.HideWidgetTooltip() end
+            end)
+        end
+    end
+
     local rm, rmBrd = MakeBtn("Remove Override", -20, 116)
     rm:SetScript("OnEnter", function() if rmBrd and rmBrd.SetColor then rmBrd:SetColor(1, 0.35, 0.35, 0.8) end end)
     rm:SetScript("OnLeave", function() if rmBrd and rmBrd.SetColor then rmBrd:SetColor(1, 1, 1, 0.22) end end)
@@ -7467,6 +7499,43 @@ local function BuildUnlockLayoutRow(parent, y, g, opts)
         })
     end)
 
+    -- Edit: opens the fork's OWN editing session, then jumps to its manager page.
+    -- The session is load-bearing: the manager page prelude engages the fork only
+    -- while a session is open, and Cond.ExitEdit is the sole release path, so the
+    -- swap is never engaged directly here.
+    if opts.editKind and opts.editPage then
+        local e = CreateFrame("Button", nil, row)
+        e:SetSize(116, 22)
+        e:SetPoint("RIGHT", b, "LEFT", -8, 0)
+        EllesmereUI.SolidTex(e, "BACKGROUND", 0.10, 0.10, 0.11, 0.9)
+        local ebrd = EllesmereUI.MakeBorder(e, 1, 1, 1, 0.22)
+        local elbl = EllesmereUI.MakeFont(e, 11, nil, 1, 1, 1, 0.8)
+        elbl:SetPoint("CENTER")
+        elbl:SetText(L("Edit"))
+        e:SetScript("OnEnter", function() if ebrd and ebrd.SetColor then ebrd:SetColor(ACCENT_R, ACCENT_G, ACCENT_B, 0.8) end end)
+        e:SetScript("OnLeave", function() if ebrd and ebrd.SetColor then ebrd:SetColor(1, 1, 1, 0.22) end end)
+        e:SetScript("OnClick", function()
+            -- Raid Frames must be registered to navigate to (same gate as the
+            -- entry rows' Go to Setting).
+            if not (EllesmereUI.GetModuleTitle and EllesmereUI:GetModuleTitle("EllesmereUIRaidFrames")) then return end
+            -- Both entry points refuse (own popup) when another fork holds the
+            -- manager page; only navigate once the session actually opened.
+            if opts.editKind == "cond" then
+                if not Cond.EnterEdit then return end
+                Cond.EnterEdit(g)
+                if Cond._edit ~= g then return end
+            else
+                if not EnterGroupEdit then return end
+                EnterGroupEdit(g)
+                if _editGroup ~= g then return end
+            end
+            EllesmereUI:SelectModule("EllesmereUIRaidFrames")
+            if EllesmereUI.SelectPage then
+                EllesmereUI:SelectPage(opts.editPage)
+            end
+        end)
+    end
+
     return row, 38
 end
 
@@ -7476,12 +7545,14 @@ local BM_ROW_SPEC = {
     title = "Delete Custom Buff Manager",
     message = "Delete the custom Buff Manager for '%s'? Its specs return to your default Buff Manager.",
     removeFn = function(gid) EllesmereUI.SpecOverrides_RemoveBmLayout(gid) end,
+    editKind = "spec", editPage = "Buff Manager",
 }
 local BM_ROW_COND = {
     crumb = "Custom Buff Manager",
     title = "Delete Custom Buff Manager",
     message = "Delete the custom Buff Manager for '%s'? Its conditions return to your default Buff Manager.",
     removeFn = function(gid) EllesmereUI.Conditions_RemoveBmLayout(gid) end,
+    editKind = "cond", editPage = "Buff Manager",
 }
 
 --- Row presets for the Debuff Manager forks (spec + conditional variants).
@@ -7490,12 +7561,14 @@ local DM_ROW_SPEC = {
     title = "Delete Custom Debuff Manager",
     message = "Delete the custom Debuff Manager for '%s'? Its specs return to your default Debuff Manager.",
     removeFn = function(gid) EllesmereUI.SpecOverrides_RemoveDmLayout(gid) end,
+    editKind = "spec", editPage = "Debuff Manager",
 }
 local DM_ROW_COND = {
     crumb = "Custom Debuff Manager",
     title = "Delete Custom Debuff Manager",
     message = "Delete the custom Debuff Manager for '%s'? Its conditions return to your default Debuff Manager.",
     removeFn = function(gid) EllesmereUI.Conditions_RemoveDmLayout(gid) end,
+    editKind = "cond", editPage = "Debuff Manager",
 }
 
 -------------------------------------------------------------------------------

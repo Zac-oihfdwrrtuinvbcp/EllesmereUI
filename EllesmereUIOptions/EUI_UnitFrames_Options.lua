@@ -1331,10 +1331,8 @@ initFrame:SetScript("OnEvent", function(self)
         local function PreviewPowerColor(fs, contentKey, usePowerColor)
             if not fs or not usePowerColor then return end
             if contentKey == "perpp" or contentKey == "curpp" or contentKey == "curhp_curpp" or contentKey == "perhp_perpp" then
-                -- EUI global power color (player's current power) as the real frame
-                -- uses, not hardcoded blue.
-                local _, pToken = UnitPowerType("player")
-                local info = EllesmereUI.GetPowerColor(pToken or "MANA")
+                local pcR, pcG, pcB = EllesmereUI.ResolveUnitPowerColor("player")
+                local info = pcR and { r = pcR, g = pcG, b = pcB }
                 if info then fs:SetTextColor(info.r, info.g, info.b)
                 else fs:SetTextColor(1, 1, 1) end
             end
@@ -5719,7 +5717,7 @@ initFrame:SetScript("OnEvent", function(self)
                   -- healthClassColored are left exactly as the user had them and come
                   -- back untouched the moment Dynamic Color goes to Off.
                   disabled = function() return SVal("healthColorMode", "none") ~= "none" end,
-                  disabledTooltip = "Dynamic Color is on -- the fill color comes from the unit's health",
+                  disabledTooltip = "Dynamic Color is on -- the fill color comes from the unit's health", rawTooltip = true,
                   getValue = function()
                       local c = SGet("customFillColor")
                       if c then return c.r, c.g, c.b end
@@ -5754,7 +5752,7 @@ initFrame:SetScript("OnEvent", function(self)
                   -- uses the class color, but as the 100% stop of the curve, not as
                   -- this flat choice.
                   disabled = function() return SVal("healthColorMode", "none") ~= "none" end,
-                  disabledTooltip = "Dynamic Color is on -- the fill color comes from the unit's health",
+                  disabledTooltip = "Dynamic Color is on -- the fill color comes from the unit's health", rawTooltip = true,
                   getValue = function()
                       local _, ct = UnitClass("player")
                       if ct and RAID_CLASS_COLORS[ct] then
@@ -7684,22 +7682,32 @@ initFrame:SetScript("OnEvent", function(self)
                 sharedPowerRow5, h = W:DualRow(parent, y,
                     { type="dropdown", text="Power Type",
                       values = ptValues, order = ptOrder,
+                      -- Stored by SPEC ID, not the GetSpecialization() index: one
+                      -- profile holds one set, so an index key collides across
+                      -- classes (slot 3 is Guardian, Shadow AND Augmentation).
+                      -- classAlts stays index-keyed, it is already per class.
                       getValue = function()
                           local s = GetSpecialization and GetSpecialization()
                           if not s or not classAlts[s] then return "default" end
+                          local sid = C_SpecializationInfo
+                              and C_SpecializationInfo.GetSpecializationInfo(s)
+                          if not sid then return "default" end
                           local ov = UNIT_DB_MAP["player"]().powerTypeOverride
-                          if ov and ov[s] then return "alt" end
+                          if ov and ov[sid] then return "alt" end
                           return "default"
                       end,
                       setValue = function(v)
                           local s = GetSpecialization and GetSpecialization()
                           if not s then return end
+                          local sid = C_SpecializationInfo
+                              and C_SpecializationInfo.GetSpecializationInfo(s)
+                          if not sid then return end
                           local pdb = UNIT_DB_MAP["player"]()
                           if v == "alt" then
                               if not pdb.powerTypeOverride then pdb.powerTypeOverride = {} end
-                              pdb.powerTypeOverride[s] = true
+                              pdb.powerTypeOverride[sid] = true
                           else
-                              if pdb.powerTypeOverride then pdb.powerTypeOverride[s] = nil end
+                              if pdb.powerTypeOverride then pdb.powerTypeOverride[sid] = nil end
                           end
                           ReloadAndUpdate()
                       end },
@@ -10512,6 +10520,17 @@ initFrame:SetScript("OnEvent", function(self)
                     if ns.PAB_ImportBM2Filters then ns.PAB_ImportBM2Filters() end
                     local ps = UNIT_DB_MAP[selectedUnit]()
                     local ALL_KEY, DUR_KEY = "__allBuffs", "__hasDuration"
+                    -- Hovering a dimmed Show box explains the dim (the lane is inert
+                    -- while a broad mode already shows everything), same wording as
+                    -- the Debuff Filter.
+                    local lockedTip = EllesmereUI.L("All Buffs or Has Duration is selected, so every buff already shows. Use the red Hide box to exclude these instead.")
+                    -- Any Show-lane filter, or a direct Extra Spell, counts as a
+                    -- content source once neither broad mode is on.
+                    local function OtherContent()
+                        if ps.buffFilters and next(ps.buffFilters) then return true end
+                        if ps.buffSpells and #ps.buffSpells > 0 then return true end
+                        return false
+                    end
                     local function FilterItems()
                         local items = {
                             { isTopAction = true, label = "Edit Filters", onClick = function()
@@ -10580,11 +10599,12 @@ initFrame:SetScript("OnEvent", function(self)
                         end)
                         for i = 1, #sorted do
                             items[#items + 1] = { key = sorted[i].id, label = sorted[i].name,
-                                dual = true, showLockedFn = BroadOn }
+                                dual = true, showLockedFn = BroadOn, showLockedTooltip = lockedTip }
                         end
                         return items
                     end
                     if ns.UF_EnsurePlayerAuraLanes then ns.UF_EnsurePlayerAuraLanes(ps) end
+                    local warnClosed
                     cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
                         rgn, 210, rgn:GetFrameLevel() + 2,
                         FilterItems,
@@ -10598,19 +10618,12 @@ initFrame:SetScript("OnEvent", function(self)
                             return ps.buffFilters and ps.buffFilters[k] == true
                         end,
                         function(k, v, neg)
-                            -- No-empty rule (Player Aura Bars parity): the frame's
-                            -- buff filter always keeps a content source. Sources
-                            -- besides the broad modes: Show-lane filters + direct
-                            -- spells.
-                            local function OtherContent()
-                                if ps.buffFilters and next(ps.buffFilters) then return true end
-                                if ps.buffSpells and #ps.buffSpells > 0 then return true end
-                                return false
-                            end
                             if k == ALL_KEY then
-                                -- Silent block: the last content source cannot be
-                                -- unchecked (use Buff Display None to blank the frame).
-                                if not v and not OtherContent() then return end
+                                -- Written unconditionally (Player Aura Bars parity): the
+                                -- Show lane is locked while a broad mode is on, so a
+                                -- no-empty guard here would make the toggle impossible to
+                                -- turn off. AttachEmptyFilterWarn below owns the feedback
+                                -- for the resulting empty selection instead.
                                 ps.buffShowAll = v
                                 -- Mutually exclusive with Has Duration (both are broad-content
                                 -- modes). Lanes persist across mode flips (the hide lane
@@ -10621,7 +10634,6 @@ initFrame:SetScript("OnEvent", function(self)
                                 return
                             end
                             if k == DUR_KEY then
-                                if not v and not OtherContent() then return end
                                 ps.buffHasDuration = v or nil
                                 -- Mutually exclusive with All Buffs (its own broad-content
                                 -- mode); lanes persist.
@@ -10646,14 +10658,19 @@ initFrame:SetScript("OnEvent", function(self)
                                 end
                             end
                             if ps.buffFilters and not next(ps.buffFilters) then ps.buffFilters = nil end
-                            -- Removing the last add-mode source falls back to All Buffs.
-                            if ps.buffShowAll == false and ps.buffHasDuration ~= true
-                                and not OtherContent() then
-                                ps.buffShowAll = nil
-                            end
                             ReloadAndUpdate()
+                            -- Non-force: runs only the registered lightweight refresh
+                            -- callbacks (the empty-selection warning below) in place,
+                            -- without closing this open dropdown.
+                            EllesmereUI:RefreshPage()
                         end,
-                        nil, 12)
+                        nil, 12, nil, nil, function() if warnClosed then warnClosed() end end)
+                    -- Empty-selection warning (Player Aura Bars parity): replaces the
+                    -- old silent block. A Buff Display of None already dims the whole
+                    -- control, so it is not warned about a second time.
+                    warnClosed = EllesmereUI.AttachEmptyFilterWarn(rgn, cbDD,
+                        EllesmereUI.L("You are displaying NO buffs at all."),
+                        function() return BuffDisabled() or ps.buffShowAll ~= false or ps.buffHasDuration == true or OtherContent() end)
                 else
                     cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
                         rgn, 210, rgn:GetFrameLevel() + 2, buffFilterItems,
@@ -10703,6 +10720,24 @@ initFrame:SetScript("OnEvent", function(self)
                     local ps = UNIT_DB_MAP[selectedUnit]()
                     local ALL_KEY = "__allDebuffs"
                     local function AllOn() return ps.debuffShowAll ~= false end
+                    -- Hovering a dimmed Show box explains the dim (the lane is inert
+                    -- while All Debuffs already shows everything), same wording as
+                    -- Player Aura Bars.
+                    local lockedTip = EllesmereUI.L("All Debuffs is selected, so every debuff already shows. Use the red Hide box to exclude these instead.")
+                    -- Any Show-lane class counts as a content source -- scanned over the
+                    -- FULL vocabulary (stale keys from retired checkboxes still render in
+                    -- add mode, so they legitimately hold content).
+                    local function AnyShowClass()
+                        local function Scan(list)
+                            if not list then return false end
+                            for i = 1, #list do
+                                local class = list[i]
+                                if not class.buffOnly and ps["debuff" .. class.skey] == true then return true end
+                            end
+                            return false
+                        end
+                        return Scan(ns.UF_TokenClasses) or Scan(ns.UF_CandidateClasses)
+                    end
                     local function FilterItems()
                         local items = {
                             { key = ALL_KEY, label = "All Debuffs",
@@ -10713,11 +10748,12 @@ initFrame:SetScript("OnEvent", function(self)
                         for i = 1, #classItems do
                             local ci = classItems[i]
                             items[#items + 1] = { key = ci.key, label = ci.label, tooltip = ci.tooltip,
-                                dual = true, showLockedFn = AllOn }
+                                dual = true, showLockedFn = AllOn, showLockedTooltip = lockedTip }
                         end
                         return items
                     end
                     if ns.UF_EnsurePlayerAuraLanes then ns.UF_EnsurePlayerAuraLanes(ps) end
+                    local warnClosed
                     cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
                         rgn, 210, rgn:GetFrameLevel() + 2,
                         FilterItems,
@@ -10730,25 +10766,12 @@ initFrame:SetScript("OnEvent", function(self)
                             return ps["debuff" .. k] == true
                         end,
                         function(k, v, neg)
-                            -- No-empty rule (Player Aura Bars parity): any Show-lane
-                            -- class counts as a content source -- scanned over the FULL
-                            -- vocabulary (stale keys from retired checkboxes still
-                            -- render in add mode, so they legitimately hold content).
-                            local function AnyShowClass()
-                                local function Scan(list)
-                                    if not list then return false end
-                                    for i = 1, #list do
-                                        local class = list[i]
-                                        if not class.buffOnly and ps["debuff" .. class.skey] == true then return true end
-                                    end
-                                    return false
-                                end
-                                return Scan(ns.UF_TokenClasses) or Scan(ns.UF_CandidateClasses)
-                            end
                             if k == ALL_KEY then
-                                -- Silent block: the last content source cannot be
-                                -- unchecked (use Debuff Display None to blank the frame).
-                                if not v and not AnyShowClass() then return end
+                                -- Written unconditionally (Player Aura Bars parity): the
+                                -- Show lane is locked while All Debuffs is on, so a
+                                -- no-empty guard here would make the toggle impossible to
+                                -- turn off. AttachEmptyFilterWarn below owns the feedback
+                                -- for the resulting empty selection instead.
                                 -- Lanes persist across mode flips (the hide lane
                                 -- subtracts in both modes; the show lane goes dormant
                                 -- while All Debuffs is on).
@@ -10770,13 +10793,19 @@ initFrame:SetScript("OnEvent", function(self)
                                     if not next(ps.debuffNegClasses) then ps.debuffNegClasses = nil end
                                 end
                             end
-                            -- Removing the last add-mode class falls back to All Debuffs.
-                            if ps.debuffShowAll == false and not AnyShowClass() then
-                                ps.debuffShowAll = nil
-                            end
                             ReloadAndUpdate()
+                            -- Non-force: runs only the registered lightweight refresh
+                            -- callbacks (the empty-selection warning below) in place,
+                            -- without closing this open dropdown.
+                            EllesmereUI:RefreshPage()
                         end,
-                        nil, 12)
+                        nil, 12, nil, nil, function() if warnClosed then warnClosed() end end)
+                    -- Empty-selection warning (Player Aura Bars parity): replaces the
+                    -- old silent block. A Debuff Display of None already dims the whole
+                    -- control, so it is not warned about a second time.
+                    warnClosed = EllesmereUI.AttachEmptyFilterWarn(rgn, cbDD,
+                        EllesmereUI.L("You are displaying NO debuffs at all."),
+                        function() return DebuffDisabled() or AllOn() or AnyShowClass() end)
                 else
                     cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
                         rgn, 210, rgn:GetFrameLevel() + 2, debuffFilterItems,

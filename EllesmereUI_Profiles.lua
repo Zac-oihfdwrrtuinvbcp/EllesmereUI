@@ -1854,7 +1854,7 @@ do
         "reskinItemUpgrade", "reskinLoot", "reskinLootToast", "lootToastQualityStrip",
         "lootToastQualityStripMoney", "lootToastScale",
         "reskinLootRoll", "reskinLootHistory", "reskinGroupInvite",
-        "reskinReadyCheck", "readyCheckHidePortrait",
+        "reskinReadyCheck",
         "reskinMicroMenu", "reskinHousing", "reskinDressUp", "reskinTransmog",
         "reskinMerchant", "reskinAuctionHouse", "reskinMacros",
         "reskinSettings", "reskinAddonList", "reskinCraftOrders",
@@ -1873,7 +1873,8 @@ do
         "showMythicRating", "showItemLevel", "showUpgradeTrack", "showGems",
         "showEnchants", "showPvpItemLevel", "charSheetSocketPanel",
         "charSheetIconZoom", "charSheetEnchantNames", "charSheetEnchantSize",
-        "flyoutItemLevels", "showSecondaryRaw", "showSecondaryBoth",
+        "flyoutItemLevels", "showCharSheetDurability", "charSheetDurabilityLocation",
+        "charSheetDurabilityShowLabel", "showSecondaryRaw", "showSecondaryBoth",
         "showTertiaryRaw", "showTertiaryBoth", "showAdjustedStats",
         "showManaStat",
         -- Inspect card
