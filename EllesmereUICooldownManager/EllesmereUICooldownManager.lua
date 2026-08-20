@@ -1246,6 +1246,11 @@ end
 function ns.PresetHasCdState(frame)
     local fc = ns._ecmeFC and ns._ecmeFC[frame]
     if not fc or not fc.spellID then return false end
+    -- Only frames WE inject can own a custom active state -- same gate the
+    -- Fake-Active engine applies before honoring one. Without it an orphaned
+    -- profile-level entry both hid a plain tracked spell and stopped the
+    -- appearance refresh from ever clearing the flag it set.
+    if ns.CdmIsInjectedFrame and not ns.CdmIsInjectedFrame(frame) then return false end
     local cas = ns.GetEffectiveCustomActiveState(fc.spellID)
     local eff = cas and cas.cdStateEffect
     if eff == false then eff = nil end  -- blocking-false = no effect
@@ -2096,7 +2101,7 @@ local function UpdateAllCDMBorders()
                     border:Show()
                     if slot.__ECMEIcon then slot.__ECMEIcon:SetTexCoord(crop, 1 - crop, crop, 1 - crop) end
                     if slot.__ECMECooldown then
-                        slot.__ECMECooldown:SetSwipeTexture("Interface\\Buttons\\WHITE8x8")
+                        slot.__ECMECooldown:SetSwipeTexture("Interface\\AddOns\\EllesmereUI\\media\\white-square.png")
                     end
                     for _, h in ipairs(slot.__ECMEHidden) do
                         if h and h.Hide then h:Hide() end
@@ -4909,7 +4914,7 @@ ApplyShapeToCDMIcon = function(icon, shape, barData, ssb)
         if cd then
             cd:ClearAllPoints()
             cd:SetAllPoints(icon)
-            pcall(cd.SetSwipeTexture, cd, "Interface\\Buttons\\WHITE8x8")
+            pcall(cd.SetSwipeTexture, cd, "Interface\\AddOns\\EllesmereUI\\media\\white-square.png")
             if cd.SetUseCircularEdge then pcall(cd.SetUseCircularEdge, cd, false) end
         end
 
@@ -5055,7 +5060,7 @@ function ns.ApplyShapeToOverlay(icon, oIcon, oCd, barData)
         -- Square overlay. IconTexture already copied the underlying texcoords.
         if oIcon then oIcon:ClearAllPoints(); oIcon:SetAllPoints(oIcon:GetParent()) end
         if oCd then
-            pcall(oCd.SetSwipeTexture, oCd, "Interface\\Buttons\\WHITE8x8")
+            pcall(oCd.SetSwipeTexture, oCd, "Interface\\AddOns\\EllesmereUI\\media\\white-square.png")
             if oCd.SetUseCircularEdge then pcall(oCd.SetUseCircularEdge, oCd, false) end
         end
         return
@@ -5360,6 +5365,9 @@ local function RefreshCDMIconAppearance(barKey)
         -- Glow + Duration Text + Charge/Stack below; nil = inherit the bar's value. Variant-aware:
         -- a setting stored under any spell in the icon's family (base/talent-override) resolves here -- options keys off the live/canonical id, which may differ from fc.spellID.
         local ssb
+        -- Canonical id for buff-family icons, hoisted so the Threshold Text block below can
+        -- reuse it instead of re-walking GetCanonicalSpellIDForFrame a second time this pass.
+        local sidb
         local isBuffFamilyBar = (barData.barType == "buffs" or barKey == "buffs")
         -- Login/refresh coverage for Max Stacks Glow: a charge spell at max never fires the swipe hook, so register here too. Gated on the feature flag so non-users skip the call entirely.
         if ns._cdmAnyMaxStacksGlow and not isBuffFamilyBar and ns.WatchMaxStacksIfEnabled then
@@ -5398,7 +5406,7 @@ local function RefreshCDMIconAppearance(barKey)
             -- whose base is a generic spec spell shared across icons (Consecration's standing-in
             -- aura -> Prot Paladin 137028), keying off the base misses the real buff AND lets one
             -- icon's setting shadow another's. canon as primary makes settings[canon] the fast path. Own placeholder/custom frames have no live spell -> fc.spellID.
-            local sidb = (ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(icon))
+            sidb = (ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(icon))
                 or (fcb and fcb.spellID)
             if sidb then
                 local sdb = ns.GetBarSpellData(barKey)
@@ -5510,9 +5518,15 @@ local function RefreshCDMIconAppearance(barKey)
             -- decimals/a color change below the spell's Threshold Seconds. Gated by the session
             -- flag, so zero cost/zero behavior change unless at least one spell arms it. Resolution
             -- order matches Reverse Swipe above: family store (variant-aware via the frame) first, then the preset/custom customActiveStates entry.
+            -- sid resolves canon-first like sidb above -- fc.spellID alone is the cooldownInfo
+            -- BASE, which for a hosted buff/debuff can be a generic id shared across icons (or
+            -- simply not the id the options menu wrote the entry under), so it misses the armed
+            -- per-spell entry entirely. Reuse sidb when the buff block above already computed it.
             if ns._cdmAnyThresholdText and ns.ApplyThresholdFormatter then
                 local ttFc = _ecmeFC[icon]
-                local ttSid = ttFc and ttFc.spellID
+                local ttSid = sidb
+                    or (ns.GetCanonicalSpellIDForFrame and ns.GetCanonicalSpellIDForFrame(icon))
+                    or (ttFc and ttFc.spellID)
                 local tt
                 if ttSid and ns.ResolveThresholdTextSettings then
                     tt = ns.ResolveThresholdTextSettings(icon, ttSid, ns.GetBarSpellData(barKey), barKey)
@@ -6778,6 +6792,18 @@ local function UpdateAllCDMBars(dt) end
 --  Bar Visibility (always / in combat / never) + Housing
 -------------------------------------------------------------------------------
 
+-- Does this cd/utility bar draw any frame out of the BuffIcon viewer? True for a
+-- hosted buff (spellID-keyed) and for a cd-claimed collided buff slot. Called
+-- only for the BuffIcon viewer's vote below, so bars pay nothing in the common
+-- case where nothing is hosted. On ns, not a file local: this file sits at
+-- Lua's 200-local cap.
+function ns.BarUsesBuffViewer(barKey)
+    local sd = ns.GetBarSpellData and ns.GetBarSpellData(barKey)
+    if not sd then return false end
+    if sd.hostedBuffSpellIDs and next(sd.hostedBuffSpellIDs) then return true end
+    return (ns.CollectCdClaimSet and ns.CollectCdClaimSet(sd)) and true or false
+end
+
 _CDMApplyVisibility = function()
     local p = ECME.db and ECME.db.profile
     if not p then return end
@@ -6940,6 +6966,16 @@ _CDMApplyVisibility = function()
                             if bt == "buffs" and viewerBarKey == "buffs" then
                                 anyVisible = true; break
                             elseif bt ~= "buffs" and (viewerBarKey == "cooldowns" or viewerBarKey == "utility") then
+                                anyVisible = true; break
+                            -- A HOSTED buff renders on a cd/utility bar but its frame
+                            -- still comes out of the BuffIcon viewer pool and is never
+                            -- reparented, so it inherits that viewer's alpha. Without
+                            -- this vote a visible cd/utility bar hosting a buff went
+                            -- dark the moment the buffs bar was hidden: the aura-down
+                            -- placeholder (our own frame, parented to UIParent) kept
+                            -- rendering while the live buff did not.
+                            elseif bt ~= "buffs" and viewerBarKey == "buffs"
+                                   and ns.BarUsesBuffViewer(barData.key) then
                                 anyVisible = true; break
                             end
                         end
@@ -7892,6 +7928,15 @@ function ns.ReseedAssignedSpellsFromLiveIcons(cdUtilOnly)
     -- spells spill onto default bars until the migration ghosts them, and materializing those spills would defeat the import-authoritative hide.
     if aprof and aprof._importGhostMode then return end
 
+    -- Unlike every other assignedSpells mutation site (the picker's add/remove/move calls,
+    -- BuildAllCDMBars), this one never marked the cached render-order map (spellOrder,
+    -- CdmHooks.lua ~7000) dirty -- so a spell this pass just materialized had no key in the
+    -- STALE cache, fell through every OrderKeyFor match probe, and rendered via the raw
+    -- layoutIndex spillover fallback (the same imprecise path #1211/#1420 already fixed once)
+    -- instead of the position it was just given. Field-confirmed: Cobra Shot's assignedSpells
+    -- entry was correct and it still rendered first. Set once, only when something actually inserted.
+    local didInsert = false
+
     -- Spell -> owning bar (variant-aware), built once. A live icon whose stored owner is a DIFFERENT bar is a transient spillover we must not materialize.
     local ownerOf
     -- One-racial-total invariant (see NormalizeRacialAssignments): while ANY
@@ -8011,14 +8056,24 @@ function ns.ReseedAssignedSpellsFromLiveIcons(cdUtilOnly)
                             local racialBlocked = anyRacialOwned and ALL_RACIAL_SPELLS[sid]
                             if not ghosted and not racialBlocked and not (owner and owner ~= barData.key) then
                                 -- Store the BASE form, matching what the options normalize pass writes -- otherwise this pass persists the talent-override form and the two writers diverge (exports could ship either).
+                                -- Only trust that substitution when Blizzard's OWN cooldownInfo already
+                                -- recorded a base/display split for THIS icon (fc.baseSpellID ~= fc.resolvedSid,
+                                -- e.g. a Wither slot whose base is Immolate). GetBaseSpell can also tie
+                                -- together spells with no override relationship at all -- field-confirmed
+                                -- for Cobra Shot -> Arcane Shot, and #842 saw the same API do it to SV Kill
+                                -- Command -- and substituting on that spurious tie stores an id the live
+                                -- spell never actually shares a slot with, orphaning it as a permanent spillover.
                                 local nsid = sid
-                                if C_Spell and C_Spell.GetBaseSpell then
+                                if C_Spell and C_Spell.GetBaseSpell
+                                   and fc.baseSpellID and fc.resolvedSid
+                                   and fc.baseSpellID ~= fc.resolvedSid then
                                     local b = C_Spell.GetBaseSpell(sid)
                                     if b and b > 0 then nsid = b end
                                 end
                                 local pos = insertPos and (insertPos + 1) or 1
                                 table.insert(sd.assignedSpells, pos, nsid)
                                 insertPos = pos
+                                didInsert = true
                             end
                         end
                     end
@@ -8026,6 +8081,7 @@ function ns.ReseedAssignedSpellsFromLiveIcons(cdUtilOnly)
             end
         end
     end
+    if didInsert then ns._spellOrderDirty = true end
 end
 
 -- Parent-facing bridge for the automatic/export-time reconcile: cd and utility bars only

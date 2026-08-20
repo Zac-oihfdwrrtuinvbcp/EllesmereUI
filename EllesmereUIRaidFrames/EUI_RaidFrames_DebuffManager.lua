@@ -347,19 +347,32 @@ function ns.DM_FxFP()
     return FxListFP(dm and dm.fxList)
 end
 
+-- Base Icons view for the CURRENT spec. The base grid lives in All Specs
+-- like any indicator there, so a concrete spec can switch it off for itself
+-- (ns.DM_SetBaseDisabled): every base-owned input (mode, lanes, duration
+-- modifier, base effects) then reads this empty view and no base record is
+-- built -- tiles, claims and the shared dispel flavor (always read off the
+-- profile table) are untouched. Read-only by construction.
+local BASE_OFF_VIEW = { all = false }
+local function BaseView(dm)
+    if ns.DM_CurrentSpecBaseOff and ns.DM_CurrentSpecBaseOff() then return BASE_OFF_VIEW end
+    return dm
+end
+
 function ns.DM_CfgFP()
     EnsureMigrated() -- profile switches re-fingerprint before rendering
     local dm = DM() or {}
     FxHeal(dm)
+    local bv = BaseView(dm)
     local prof = ns.db and ns.db.profile
-    local neg = dm.neg
+    local neg = bv.neg
     local parts = {
         "on",
-        dm.all ~= false and 1 or 0, dm.hasDuration == true and 1 or 0,
-        dm.boss and 1 or 0, dm.role and 1 or 0,
-        dm.priority and 1 or 0, dm.cc == true and 1 or 0, dm.raid and 1 or 0,
-        dm.raidcombat and 1 or 0, dm.dispel and 1 or 0,
-        dm.nonplayer and 1 or 0,
+        bv.all ~= false and 1 or 0, bv.hasDuration == true and 1 or 0,
+        bv.boss and 1 or 0, bv.role and 1 or 0,
+        bv.priority and 1 or 0, bv.cc == true and 1 or 0, bv.raid and 1 or 0,
+        bv.raidcombat and 1 or 0, bv.dispel and 1 or 0,
+        bv.nonplayer and 1 or 0,
         -- Hide lane (dm.neg): subtracts in both modes, so every entry is a
         -- record-shape input.
         neg and table.concat({
@@ -367,7 +380,7 @@ function ns.DM_CfgFP()
             neg.cc and 1 or 0, neg.raid and 1 or 0, neg.raidcombat and 1 or 0,
             neg.dispel and 1 or 0, neg.nonplayer and 1 or 0 }, "") or "-",
         (dm.dispelMode == "typed") and "typed" or "you",
-        FxListFP(dm.fxList), -- base effects force records
+        FxListFP(bv.fxList), -- base effects force records
         -- Exclude set varies only with the lust-debuff opt-out (hardcoded lists are load-constant).
         (not prof or prof.hideLustDebuff ~= false) and "lx1" or "lx0",
     }
@@ -474,7 +487,10 @@ end
 -- filter, CC glow style); a claimed cc renders in its tile with the tile
 -- style, and the CC glow stays a base-group property.
 local function BuildRecords(s, dm)
-    local eff, claims, claimsAll = EffectiveState(dm)
+    -- Base-owned inputs read the current spec's base view (empty when the
+    -- spec switched the All Specs base grid off); dm keeps the shared flavor.
+    local bv = BaseView(dm)
+    local eff, claims, claimsAll = EffectiveState(bv)
     -- EFFECTS routing: per-filter icon effects need their categories as
     -- SEPARATE base records even under Show All (like claims, but rendering in
     -- the base container) so the effect can target exactly those buttons
@@ -482,7 +498,7 @@ local function BuildRecords(s, dm)
     -- boolean categories duplicate (accepted, same limitation as claims).
     local fxCats = {}
     do
-        local fl = dm.fxList
+        local fl = bv.fxList
         if fl then
             for i = 1, #fl do
                 local e = fl[i]
@@ -497,15 +513,15 @@ local function BuildRecords(s, dm)
             end
         end
     end
-    local allOn = dm.all ~= false -- Show All defaults ON (legacy "all" preset parity)
+    local allOn = bv.all ~= false -- Show All defaults ON (legacy "all" preset parity)
     -- Has Duration is an AND-MODIFIER (user directive 2026-08-16): it rides
     -- every base-owned record via the duration fold at the bottom. The base
     -- catch-all record joins when Show All is on, or when Has Duration is
     -- checked with no show-lane picks (checked alone = every timed debuff).
-    local durOn = dm.hasDuration == true
-    local anyShow = dm.boss == true or dm.role == true or dm.priority == true
-        or dm.cc == true or dm.raid == true or dm.raidcombat == true
-        or dm.dispel == true or dm.nonplayer == true
+    local durOn = bv.hasDuration == true
+    local anyShow = bv.boss == true or bv.role == true or bv.priority == true
+        or bv.cc == true or bv.raid == true or bv.raidcombat == true
+        or bv.dispel == true or bv.nonplayer == true
     local durAlone = durOn and not allOn and not anyShow
     -- HIDE lane (dm.neg): subtracts in BOTH modes. Token categories negate off
     -- every lower-ranked record (ownership rank cc > dispel > raid > raidcombat
@@ -513,7 +529,7 @@ local function BuildRecords(s, dm)
     -- overlap, same doctrine as cc owning dispellable CC), typed dispels ride
     -- excludeDispelTypes, boolean categories use false-valued candidate booleans
     -- (nonplayer via the complementary TRUE).
-    local neg = dm.neg
+    local neg = bv.neg
     local function NegHas(cat) return neg ~= nil and neg[cat] == true end
     local sub = allOn and {
         boss = NegHas("boss"), role = NegHas("role"),
@@ -618,7 +634,7 @@ local function BuildRecords(s, dm)
 
     -- Sized base crowd control: Icon Effects Size cannot resize the legacy "cc" group (group->style binding fixed
     -- at declare), so cc becomes a base record variant carrying the CC-glow style; apply pass parks the legacy group while this record exists.
-    if eff.cc and not claims.cc and FxSizeFor(dm.fxList, "cc") then
+    if eff.cc and not claims.cc and FxSizeFor(bv.fxList, "cc") then
         recs[#recs + 1] = { key = "cc", tokens = { "HARMFUL", "CROWD_CONTROL" },
             cand = { excludeSpellIDs = ex } }
     end
@@ -704,6 +720,36 @@ local function BuildRecords(s, dm)
             cand = cf, tile = claimsAll }
     end
 
+    -- Dead-corpse catch-all: ONE indicator showing Non-Player Auras drops ALL its
+    -- filters while its unit is dead and shows every debuff instead (persist-through-
+    -- death NPC debuffs matter for res decisions). Compiled as an extra token-only
+    -- record (HARMFUL + hygiene excludes; token-only on purpose -- candidate flags
+    -- don't stream on dead units) parked at 0; the apply pass wires the death-edge
+    -- swap (park the indicator's normal records, unpark this). Qualifier = first
+    -- enabled ICONS tile whose show lane includes nonplayer, else the base grid's
+    -- nonplayer checkbox; suppressed entirely when a literal All Debuffs indicator
+    -- exists (base Show All or a grid tile's All bit) -- everything already shows.
+    do
+        local deadTile, deadBlocked
+        if allOn then deadBlocked = true end
+        local dtiles = ns.DM_ActiveTiles()
+        if dtiles then
+            for i = 1, #dtiles do
+                local t = dtiles[i]
+                if t.enabled and (t.type == "icons" or t.type == "square") and t.all == true then
+                    deadBlocked = true
+                end
+                if not deadTile and t.enabled and t.type == "icons" and t.claim and t.claim.nonplayer then
+                    deadTile = t
+                end
+            end
+        end
+        if not deadBlocked and (deadTile or bv.nonplayer == true) then
+            recs[#recs + 1] = { key = "npdead", tokens = { "HARMFUL" },
+                cand = { excludeSpellIDs = ex }, deadOnly = true, tile = deadTile }
+        end
+    end
+
     -- Tile HIDE lanes: a hosting tile's hide lane folds into every record it
     -- hosts, additive to the base lane (which already rode Cand/sub above).
     -- Token categories negate via tokens, typed dispels via the exclude map,
@@ -720,7 +766,8 @@ local function BuildRecords(s, dm)
     for i = 1, #recs do
         local r = recs[i]
         local tn = r.tile and r.tile.neg
-        if tn and r.key ~= "cc" then
+        -- npdead ignores ALL filters by definition: no hide-lane folds, no duration cap.
+        if tn and r.key ~= "cc" and r.key ~= "npdead" then
             local toks, cf, key = r.tokens, r.cand, r.key
             if tn.cc == true and not HasTok(toks, "!CROWD_CONTROL") then
                 toks[#toks + 1] = "!CROWD_CONTROL"
@@ -758,11 +805,11 @@ local function BuildRecords(s, dm)
     -- base blocks, tile-hosted reads its tile's).
     for i = 1, #recs do
         local r = recs[i]
-        local owner = r.tile or dm
-        if owner.hasDuration == true and r.key ~= "cc" then
+        local owner = r.tile or bv
+        if owner.hasDuration == true and r.key ~= "cc" and r.key ~= "npdead" then
             r.cand.maxDuration = math.huge
         end
-        r.fxSize = FxSizeFor(r.tile and r.tile.fxList or dm.fxList, r.key)
+        r.fxSize = FxSizeFor(r.tile and r.tile.fxList or bv.fxList, r.key)
     end
 
     return recs, ccCand, claims, Cand, fxCats
@@ -1457,6 +1504,11 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
 
     local recs, ccCand, claims, _, fxCats = BuildRecords(s, dm)
 
+    -- Dead-corpse swap state rebuilds fresh every apply; a config that lost its
+    -- npdead record sheds the swap here (the stale variant parks below).
+    d.dmDeadSwap = nil
+    local deadRec, ccParkCount
+
     -- Partition records: base container vs per-tile containers.
     local wantedBase, missingBase = {}, false
     local baseSizedCC = false -- sized cc record replaces the legacy cc group
@@ -1464,6 +1516,7 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
     for i = 1, #recs do
         local r = recs[i]
         r.gkey = GroupKey(AK, r)
+        if r.deadOnly then deadRec = r end
         if r.tile then
             local id = r.tile.id
             local list = tileRecs[id]
@@ -1490,12 +1543,14 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
         -- the cc lead/glow group is on unless Crowd Control rides the hide lane (dm.neg.cc = subtracted); in add
         -- mode it is on exactly when the show lane checks it; fx routing forces it either way. Has Duration never
         -- flips this: cc surfaces are exempt from the duration fold (declaration-fixed candidates).
-        local allOn = dm.all ~= false
-        local ccHidden = dm.neg ~= nil and dm.neg.cc == true
-        local ccPicked = (allOn and not ccHidden) or (not allOn and dm.cc == true)
+        local bv = BaseView(dm)
+        local allOn = bv.all ~= false
+        local ccHidden = bv.neg ~= nil and bv.neg.cc == true
+        local ccPicked = (allOn and not ccHidden) or (not allOn and bv.cc == true)
         local ccBase = (ccPicked or (fxCats and fxCats.cc)) and not claims.cc
             and not baseSizedCC
-        container:SetAuraGroupMaxFrameCount("cc", ccBase and cap or 0)
+        ccParkCount = ccBase and cap or 0
+        container:SetAuraGroupMaxFrameCount("cc", ccParkCount)
         container:SetAuraGroupCandidateFilters("cc", ccCand)
         container:SetAuraGroupLayout("cc", layout)
     end
@@ -1512,6 +1567,7 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                 gatedKeys[#gatedKeys + 1] = gkey
                 if not assist then n = 0 end
             end
+            if r.deadOnly then n = 0 end -- parked until the death edge unparks it
             container:SetAuraGroupMaxFrameCount(gkey, n)
             container:SetAuraGroupCandidateFilters(gkey, r.cand)
             if r.fxSize then
@@ -1529,6 +1585,19 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
     end
     d.dmGatedKeys = gatedKeys
     d.dmCap = cap
+
+    -- Base-hosted dead swap: park set = every normal base record (legacy cc group
+    -- included) with its restore count; the death edge zeroes them and unparks npdead.
+    if deadRec and not deadRec.tile and declared[deadRec.gkey] then
+        local park = {}
+        for gkey, r in pairs(wantedBase) do
+            if declared[gkey] and not r.deadOnly then
+                park[gkey] = (r.gated and not assist) and 0 or cap
+            end
+        end
+        if declared.cc then park.cc = ccParkCount end
+        d.dmDeadSwap = { show = deadRec.gkey, cap = cap, park = park }
+    end
 
     -- Missing base record variants: declare on the combat-legal live lane, then re-apply (mirrors the containers file's preset-ensure pattern).
     if missingBase and not d.dmEnsure then
@@ -1701,6 +1770,7 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                     gatedContent = true
                                     if not assist then n = 0 end
                                 end
+                                if r.deadOnly then n = 0 end -- parked until the death edge unparks it
                                 tc:SetAuraGroupMaxFrameCount(gkey, n)
                                 tc:SetAuraGroupCandidateFilters(gkey, r.cand)
                                 if r.fxSize then
@@ -1762,6 +1832,16 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                 end, "rf:dm-tile-groups")
                             end
                         end
+                        -- Tile-hosted dead swap: park set = the tile's normal records with restore counts.
+                        if deadRec and deadRec.tile == t and tDecl[deadRec.gkey] then
+                            local park = {}
+                            for gkey, r in pairs(tWanted) do
+                                if tDecl[gkey] and not r.deadOnly then
+                                    park[gkey] = (r.gated and not assist) and 0 or tCap
+                                end
+                            end
+                            d.dmDeadSwap = { show = deadRec.gkey, cap = tCap, park = park, tileId = t.id }
+                        end
                         AnchorTileContainer(tc, d.rfcHealth, s, t)
                     end
 
@@ -1801,6 +1881,33 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
         if stale and d.rfcHealth then ns.RF_ClearBarTints(d.rfcHealth, "dm") end
     end
     d.dmGatedTiles = gatedTiles
+
+    -- Sync the dead swap to the unit's actual state: the count loops above wrote
+    -- alive-shape counts, so a corpse existing at apply time (config change while
+    -- someone is dead) must swap now -- no later event is guaranteed on a corpse.
+    d.dmDead = nil
+    if d.dmDeadSwap and d.rfcUnit then ns.DM_DeadEdge(d, d.rfcUnit) end
+end
+
+-- Death-edge hook (from the UNIT_HEALTH repaint path, unit assignment, and the
+-- apply tail). Change-gated on d.dmDead; d.dmDeadSwap is nil for every button
+-- unless a config qualifies, so the hot-path cost is one field read. Count flips
+-- re-render engine-side without an UpdateAllAuras (the assist gate's proven channel).
+function ns.DM_DeadEdge(d, unit)
+    local swap = d.dmDeadSwap
+    if not swap or not unit then return end
+    local dead = UnitIsDeadOrGhost(unit) and true or false
+    if d.dmDead == dead then return end
+    d.dmDead = dead
+    local c = swap.tileId and (d.dmTiles and d.dmTiles[swap.tileId]) or d.rfcDebuffs
+    if not c then return end
+    if dead then
+        for k in pairs(swap.park) do c:SetAuraGroupMaxFrameCount(k, 0) end
+        c:SetAuraGroupMaxFrameCount(swap.show, swap.cap)
+    else
+        for k, n in pairs(swap.park) do c:SetAuraGroupMaxFrameCount(k, n) end
+        c:SetAuraGroupMaxFrameCount(swap.show, 0)
+    end
 end
 
 -- Legacy-config tail hook: while INACTIVE the legacy ApplyDebuffConfig drives only its own preset groups, so a
@@ -1819,6 +1926,11 @@ end
 -- Unit re-assignment hook (from RFC_OnUnitAssigned's unit-change branch): tile containers must re-point like every
 -- per-button container; the engine does not re-parse on unit change alone.
 function ns.DM_OnUnitAssigned(d, unit)
+    -- New unit, unknown dead state: force the dead swap to re-evaluate.
+    if d.dmDeadSwap then
+        d.dmDead = nil
+        ns.DM_DeadEdge(d, unit)
+    end
     local tiles = d.dmTiles
     if not tiles then return end
     for _, c in pairs(tiles) do
@@ -1839,8 +1951,18 @@ function ns.DM_OnAssistChanged(d)
     local container = d.rfcDebuffs
     if keys and container then
         local n = assist and (d.dmCap or 3) or 0
+        -- Base-hosted dead swap: while the unit is dead its parked records must stay
+        -- at 0, but their restore counts track the assist state for the revive flip.
+        local swap = d.dmDeadSwap
+        local swapBase = swap and not swap.tileId and swap.park or nil
         for i = 1, #keys do
-            container:SetAuraGroupMaxFrameCount(keys[i], n)
+            local k = keys[i]
+            if swapBase and swapBase[k] then
+                swapBase[k] = n
+                if not d.dmDead then container:SetAuraGroupMaxFrameCount(k, n) end
+            else
+                container:SetAuraGroupMaxFrameCount(k, n)
+            end
         end
     end
     local tiles = d.dmGatedTiles
@@ -1899,7 +2021,7 @@ end
 
 -------------------------------------------------------------------------------
 -- Editing-spec buckets. dm.tiles IS "allspecs"; every other bucket lives
--- under dm.specTiles[key] = { tiles, inhDis }, key = "nonhealer"/"tanks"/
+-- under dm.specTiles[key] = { tiles, inhDis, baseOff }, key = "nonhealer"/"tanks"/
 -- "dps"/"healers" (group buckets) or "spec<ID>" (a concrete spec -- healer
 -- specs included; the Debuff Manager has no healer-key legacy). Tile ids
 -- stay globally unique across buckets (one shared dm.nextTileId), so
@@ -1947,6 +2069,34 @@ function ns.DM_SetInhDisabled(concreteKey, id, disabled)
     if not (dm and concreteKey and id) then return end
     local b = SpecBucket(dm, concreteKey, true)
     b.inhDis[id] = disabled and true or nil
+end
+
+-- Per-spec disable of the Base Icons grid (the All Specs base, inherited by
+-- every concrete spec like an All Specs tile): b.baseOff on the viewing
+-- spec's bucket, beside the tile disables.
+function ns.DM_BaseDisabled(concreteKey)
+    local dm = DM()
+    local b = dm and SpecBucket(dm, concreteKey, false)
+    return (b and b.baseOff) and true or false
+end
+
+function ns.DM_SetBaseDisabled(concreteKey, disabled)
+    local dm = DM()
+    if not (dm and concreteKey) then return end
+    local b = SpecBucket(dm, concreteKey, true)
+    b.baseOff = disabled and true or nil
+end
+
+-- Runtime read for the player's CURRENT spec (record synthesis + FP). No
+-- specTiles = buckets never used = zero cost.
+function ns.DM_CurrentSpecBaseOff()
+    local dm = DM()
+    local st = dm and dm.specTiles
+    if not st then return false end
+    local idx = GetSpecialization and GetSpecialization()
+    local sid = idx and GetSpecializationInfo and GetSpecializationInfo(idx) or nil
+    local b = sid and st["spec" .. sid] or nil
+    return (b and b.baseOff) and true or false
 end
 
 -- The ACTIVE union: every tile the CURRENT spec renders, in bucket order

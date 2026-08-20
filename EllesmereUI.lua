@@ -286,14 +286,14 @@ local ICONS_PATH    = MEDIA_PATH .. "icons\\"
 --    altSpellIDs - optional variant teleport spell ids
 -------------------------------------------------------------------------------
 EllesmereUI.SEASON_PORTALS = {
-    { spellID = 1254400, short = "WRS", dungeonID = 2739, names = { "windrunner spire", "шпиль ветрокрылых" } },
-    { spellID = 1254572, short = "MT",  dungeonID = 3085, names = { "magisters' terrace", "терраса магистров" } },
-    { spellID = 1254563, short = "NPX", dungeonID = 3056, names = { "nexus-point xenas", "нексус-пойнт ксенас", "нексус-поинт ксенас" } },
-    { spellID = 1254559, short = "MC",  dungeonID = 3097, names = { "maisara caverns", "пещеры майсара" } },
-    { spellID = 159898,  short = "SR",  dungeonID = 779,  altSpellIDs = { 1254557 }, names = { "skyreach", "небесный путь" } },
-    { spellID = 1254555, short = "PoS", dungeonID = 3113, names = { "pit of saron", "яма сарона" } },
-    { spellID = 1254551, short = "SoT", dungeonID = 3118, names = { "seat of the triumvirate", "престол триумвирата" } },
-    { spellID = 393273,  short = "AA",  dungeonID = 2366, names = { "algeth'ar academy", "академия алгет'ар", "академия алгетар" } },
+    { spellID = 1286801, short = "BV",  dungeonID = 3102, names = { "the blinding vale", "blinding vale", "слепящая долина" } },
+    { spellID = 1286804, short = "VA",  dungeonID = 3106, names = { "voidscar arena", "арена шрама бездны" } },
+    { spellID = 1286807, short = "DoN", dungeonID = 3051, names = { "den of nalorakk", "den of nalorak", "берлога налоракка" } },
+    { spellID = 1286809, short = "MR",  dungeonID = 3090, names = { "murder row", "закоулок душегубов" } },
+    { spellID = 1286812, short = "AoF", dungeonID = 3191, names = { "altar of fangs", "алтарь клыков" } },
+    { spellID = 393256,  short = "RLP", dungeonID = 2361, names = { "ruby life pools", "рубиновые омуты жизни" } },
+    { spellID = 1286828, short = "ToS", dungeonID = 1694, names = { "temple of sethraliss", "храм сетралисс" } },
+    { spellID = 1286831, short = "KR",  dungeonID = 1785, names = { "kings' rest", "king's rest", "гробница королей" } },
 }
 
 local ADDON_ROSTER = {
@@ -5621,7 +5621,9 @@ EllesmereUI._rowCounters     = rowCounters
 --    setHeight  (function(key, h))  set element height and rebuild
 --    isHidden   (function(key)) -> bool  true if element is disabled/hidden
 --    isAnchored (function(key)) -> bool  true if anchored to another element
---    onLiveMove (function(key))  called each frame during drag
+--    onLiveMove (function(key))  called after every mover-driven placement of
+--               the frame: drag start, each drag frame, drag stop, arrow/cog
+--               nudge. Runs before the anchor chain reads the frame's rect.
 --    linkedKeys (table)  list of element keys that move with this one
 --    noResize   (boolean) true for Blizzard elements that cannot be resized
 -------------------------------------------------------------------------------
@@ -11250,7 +11252,7 @@ end
 -------------------------------------------------------------------------------
 --  Slash commands
 -------------------------------------------------------------------------------
-EllesmereUI.VERSION = "8.9.1"
+EllesmereUI.VERSION = "8.9.6"
 
 -- Register this addon's version into a shared global table (taint-free at load time)
 if not _G._EUI_AddonVersions then _G._EUI_AddonVersions = {} end
@@ -12597,15 +12599,19 @@ EllesmereUI.VIS_VALUES_CDM = {
 }
 EllesmereUI.VIS_ORDER_CDM = { "never", "always", "in_combat", "out_of_combat", "---", "in_raid", "in_party", "solo" }
 
--- Checkbox dropdown 2: Visibility Options (keys match DB fields). NOTE: VIS_OPT_ITEMS_RESOURCE_BARS
--- below is a load-time COPY of this list (plus its own extra entries). Items added here appear
--- there automatically, but only because the copy loop runs after this table -- keep the copy loop directly below, and update its visHideMounted insert anchor if that key is ever renamed.
+-- Checkbox dropdown 2: Visibility Options (keys match DB fields). Every entry is
+-- evaluated by CheckVisibilityOptions below, so any module using that evaluator
+-- may offer the whole list; the skyriding edge (PLAYER_CAN_GLIDE_CHANGED /
+-- PLAYER_IS_GLIDING_CHANGED) is registered by the dispatcher and by every
+-- self-evaluating module already.
 EllesmereUI.VIS_OPT_ITEMS = {
     { key = "visOnlyInstances",    label = "Only Show in Instances" },
     { key = "visHideHousing",      label = "Hide in Housing" },
     { key = "visOnlyHousing",      label = "Only Show in Housing",
       tooltip = "This element will only show while you are inside a house or plot" },
     { key = "visHideMounted",      label = "Hide when Mounted" },
+    { key = "visHideDragonriding", label = "Hide when Skyriding Mounted",
+      tooltip = "Hides this element while you are on a skyriding (glide-capable) mount, where Blizzard shows its vigor HUD." },
     { key = "visOnlyMounted",      label = "Only Show when Mounted",
       tooltip = "This element will only show while you are mounted" },
     { key = "visHideNoTarget",     label = "Hide without Target",
@@ -12613,19 +12619,6 @@ EllesmereUI.VIS_OPT_ITEMS = {
     { key = "visHideNoEnemy",      label = "Hide without Enemy Target",
       tooltip = "This bar will only show if you have an enemy targeted" },
 }
-
--- Resource Bars variant: same items plus skyriding (kept out of the global
--- list so other modules don't grow an option their code never evaluates).
-EllesmereUI.VIS_OPT_ITEMS_RESOURCE_BARS = {}
-for _, item in ipairs(EllesmereUI.VIS_OPT_ITEMS) do
-    EllesmereUI.VIS_OPT_ITEMS_RESOURCE_BARS[#EllesmereUI.VIS_OPT_ITEMS_RESOURCE_BARS + 1] = item
-    if item.key == "visHideMounted" then
-        EllesmereUI.VIS_OPT_ITEMS_RESOURCE_BARS[#EllesmereUI.VIS_OPT_ITEMS_RESOURCE_BARS + 1] = {
-            key = "visHideDragonriding", label = "Hide when Dragonriding",
-            tooltip = "Hides this element while you are on a skyriding (glide-capable) mount, where Blizzard shows its vigor HUD.",
-        }
-    end
-end
 
 -- Cache player class once at load time (never changes).
 local _, _playerClass = UnitClass("player")
@@ -12676,7 +12669,7 @@ end
 -- canGlide is already scoped to being on a glide-capable mount or form, so it
 -- needs no mount-shaped prefilter. IsPlayerMountedLike used to gate this and
 -- hard-returns false off DRUID, which silently excluded the non-druid flight
--- forms (Dracthyr Soar, Haranir) from "Hide when Dragonriding". Deliberately
+-- forms (Dracthyr Soar, Haranir) from "Hide when Skyriding Mounted". Deliberately
 -- no IsFlying() term: unlike the show/hide visibility MODES, this option fires
 -- on the ground too, as soon as the skyriding bar is available.
 function EllesmereUI.IsPlayerSkyriding()
