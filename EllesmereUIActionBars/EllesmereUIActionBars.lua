@@ -820,6 +820,12 @@ ns.ResolveBorderThickness = ResolveBorderThickness
 -- Condense keybind text (CTRL-2 C2, Mouse Button 4 M4, etc.)
 local function FormatHotkeyText(text)
     if not text or text == "" then return "" end
+    -- Gamepad binds resolve to glyph markup (no atlas name matches a substitution
+    -- below); keyboard binds keep the raw tokens the substitutions are written against.
+    local resolved = GetBindingText(text, 1)
+    if resolved and resolved:find("|A:", 1, true) then
+        text = resolved
+    end
     text = text:gsub("CTRL%-", "C")
     text = text:gsub("ALT%-", "A")
     text = text:gsub("SHIFT%-", "S")
