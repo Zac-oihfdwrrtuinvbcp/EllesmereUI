@@ -44,6 +44,19 @@ end
 WSkin.GetFFD = GetFFD
 WSkin.FFD = FFD
 
+-- Completion is separate from reentrancy: a failed setup can retry, while
+-- a synchronous hook cannot enter the same control's unfinished setup.
+local setupInProgress = setmetatable({}, { __mode = "k" })
+function WSkin.CompleteSetup(frame, key, apply, ...)
+    local d = GetFFD(frame)
+    if d[key] or setupInProgress[frame] then return end
+    setupInProgress[frame] = true
+    local ok, err = pcall(apply, frame, d, ...)
+    setupInProgress[frame] = nil
+    if not ok then error(err, 0) end
+    d[key] = true
+end
+
 -------------------------------------------------------------------------------
 --  Theme tokens. Matches the dungeons-and-raids reskin so every window reads
 --  as one family. Accent tracks the user's live accent color.
@@ -77,7 +90,14 @@ local function AddBorder(frame, r, g, b, a)
     if GetFFD(frame).border then return end
     local PP = EUI and (EUI.PanelPP or EUI.PP)
     if PP and PP.CreateBorder then
-        PP.CreateBorder(frame, r or Theme.brdR, g or Theme.brdG, b or Theme.brdB, a or Theme.brdA, 1, "OVERLAY", 7)
+        -- BORDER/-7 strips with the container demoted to the skinned frame's own
+        -- level: at equal frame levels regions interleave by draw layer, so text
+        -- and content on the frame render above the border (at the default +1
+        -- container level, frame level beats every layer and the border covers
+        -- bar text -- XP/reputation bar labels). Demotion is window-engine-only
+        -- on purpose: every other CreateBorder consumer keeps the +1 contract.
+        local c = PP.CreateBorder(frame, r or Theme.brdR, g or Theme.brdG, b or Theme.brdB, a or Theme.brdA, 1, "BORDER", -7)
+        if c and c.SetFrameLevel then c:SetFrameLevel(frame:GetFrameLevel()) end
         GetFFD(frame).border = true
     end
 end
@@ -140,14 +160,42 @@ WSkin.FadeNineSlice = FadeNineSlice
 --  texture the engine itself created is protected via the frame's FFD entry.
 -------------------------------------------------------------------------------
 local _restrip = {}
+local _windowRestrips = {}
+local registrationWindow
+
+-- Attribute registrations to a window while running its setup or a late
+-- control callback. Restore the previous owner even when a callback fails.
+function WSkin.WindowCallback(winKey, fn)
+    return function(...)
+        if WSkin.GetStyle(winKey) == "off" then return end
+        local previous = registrationWindow
+        registrationWindow = winKey
+        local ok, err = pcall(fn, ...)
+        registrationWindow = previous
+        if not ok then error(err, 0) end
+    end
+end
+
 local function Register(frame, keep)
-    if frame then _restrip[frame] = keep or true end
+    if not frame then return end
+    _restrip[frame] = keep or true
+    if registrationWindow then
+        local frames = _windowRestrips[registrationWindow]
+        if not frames then
+            frames = {}
+            _windowRestrips[registrationWindow] = frames
+        end
+        frames[frame] = true
+    end
 end
 WSkin.Register = Register
 
 local PROTECT_KEYS = { "bg", "bgOverlay", "modernBg", "hover", "selBar", "rightShade", "fill", "x", "topBar", "bottomBar", "arrow", "caret" }
-local function Restrip()
-    for frame, keep in pairs(_restrip) do
+local function Restrip(winKey)
+    local frames = winKey and _windowRestrips[winKey] or _restrip
+    if winKey and not _windowRestrips[winKey] then return end
+    for frame in pairs(frames) do
+        local keep = _restrip[frame]
         if frame and not frame:IsForbidden() then
             local k = (type(keep) == "table") and keep or nil
             local d = FFD[frame]
@@ -255,8 +303,14 @@ function WSkin.Shell(winKey, frame, opts)
         -- Cover-fit: crop the atlas so it fills the frame without stretching.
         local function UpdateBgTexCoords()
             local fw, fh = frame:GetSize()
+            -- SECRECY TEST FIRST. `fw == 0` is itself a COMPARISON, so on a
+            -- frame whose size is secret (any window sized from widget content
+            -- -- the delve picker and the choice windows both are) it throws
+            -- before the issecretvalue guard below could reject it:
+            --   "attempt to compare local 'fw' (a secret number value)"
+            -- The guard existed but ran one line too late.
+            if issecretvalue and (issecretvalue(fw) or issecretvalue(fh)) then return end
             if not fw or fw == 0 or not fh or fh == 0 then return end
-            if issecretvalue(fw) or issecretvalue(fh) then return end
             local fa = fw / fh
             if fa > BG_ASPECT then
                 local visV = BASE_V * (BG_ASPECT / fa)
@@ -268,9 +322,9 @@ function WSkin.Shell(winKey, frame, opts)
                 bg:SetTexCoord(BASE_L + trimU, BASE_R - trimU, BASE_T, BASE_B)
             end
         end
-        hooksecurefunc(frame, "SetSize", UpdateBgTexCoords)
-        hooksecurefunc(frame, "SetWidth", UpdateBgTexCoords)
-        hooksecurefunc(frame, "SetHeight", UpdateBgTexCoords)
+        -- One script hook instead of three setter hooks: it also fires for
+        -- anchor-driven resizes the setters never saw.
+        frame:HookScript("OnSizeChanged", UpdateBgTexCoords)
         UpdateBgTexCoords()
 
         -- Black top bar behind the window title. Sits above both style backdrops
@@ -398,13 +452,10 @@ end
 
 -- Generic action button -> flat dark block with a subtle white hover.
 -- keepKeys preserves named regions (e.g. {"Icon"}).
-function WSkin.Button(btn, keepKeys)
-    if not btn or btn:IsForbidden() then return end
-    local d = GetFFD(btn)
-    if d.skinned then return end
-    d.skinned = true
-
+local function ApplyButton(btn, d, keepKeys)
     local keep = {}
+    if d.bg then keep[d.bg] = true end
+    if d.hover then keep[d.hover] = true end
     if keepKeys then
         for _, k in ipairs(keepKeys) do
             local r = btn[k]; if r then keep[r] = true end
@@ -420,17 +471,30 @@ function WSkin.Button(btn, keepKeys)
         local r = btn[k]; if r and not keep[r] and r.SetAlpha then r:SetAlpha(0) end
     end
 
-    local fill = SolidTex(btn, "BACKGROUND", Theme.bgR, Theme.bgG, Theme.bgB, Theme.bgA)
+    local fill = d.bg
+    if not fill then
+        fill = btn:CreateTexture(nil, "BACKGROUND")
+        d.bg = fill
+    end
+    fill:SetColorTexture(Theme.bgR, Theme.bgG, Theme.bgB, Theme.bgA)
     fill:SetAllPoints(btn)
-    d.bg = fill
     AddBorder(btn)
 
-    local hover = SolidTex(btn, "HIGHLIGHT", 1, 1, 1, 0.1)
+    local hover = d.hover
+    if not hover then
+        hover = btn:CreateTexture(nil, "HIGHLIGHT")
+        d.hover = hover
+    end
+    hover:SetColorTexture(1, 1, 1, 0.1)
     hover:SetAllPoints(btn)
-    d.hover = hover
 
     -- Label font stays Blizzard's (color-only text policy).
     Register(btn, keep)
+end
+
+function WSkin.Button(btn, keepKeys)
+    if not btn or btn:IsForbidden() then return end
+    WSkin.CompleteSetup(btn, "skinned", ApplyButton, keepKeys)
 end
 
 -- Force a button's label white (color only, font untouched). Many action
@@ -628,16 +692,20 @@ end
 
 -- MinimalScrollBar -> strip track/arrows; the thumb becomes a slim 5px white
 -- strip centered in the thumb's hit area (the house scrollbar look).
-function WSkin.ScrollBar(sb)
+-- keepSteppers leaves the up/down arrows as Blizzard draws them; only the
+-- track art and the thumb change, in place.
+function WSkin.ScrollBar(sb, keepSteppers)
     if not sb or sb:IsForbidden() then return end
     local d = GetFFD(sb)
     if d.skinned then return end
     d.skinned = true
-    for _, k in ipairs({ "Back", "Forward" }) do
-        local b = sb[k]
-        if b then
-            FadeRegions(b)
-            if b.Texture then b.Texture:SetAlpha(0) end
+    if not keepSteppers then
+        for _, k in ipairs({ "Back", "Forward" }) do
+            local b = sb[k]
+            if b then
+                FadeRegions(b)
+                if b.Texture then b.Texture:SetAlpha(0) end
+            end
         end
     end
     local track = sb.Track
@@ -765,16 +833,263 @@ function WSkin.BorderRegion(parent, region)
     r:SetPoint("TOPRIGHT", region, "TOPRIGHT", 1, 1);       r:SetPoint("BOTTOMRIGHT", region, "BOTTOMRIGHT", 1, -1); r:SetWidth(1)
 end
 
+-------------------------------------------------------------------------------
+--  SQUARE QUALITY BORDERS for item tiles.
+--
+--  Blizzard's own quality ring, `IconBorder`, is ROUNDED. Every pack that
+--  squares an icon therefore strips it -- it defeats the square crop
+--  underneath and reads as the "border that keeps coming back" -- and until
+--  now nothing replaced it, which left reward tiles with no rarity cue at all.
+--
+--  This draws the same 1px square edge the LOOT WINDOW already ships:
+--  PP.CreateBorder, whose strips are integer physical thickness and immune to
+--  pixel snapping, so no side can round away to 0 at a fractional UI scale.
+--  A plain 4-texture border does round away, which is why this does not simply
+--  extend WSkin.BorderRegion above.
+--
+--  The COLOR is read back off Blizzard's ring rather than re-derived from an
+--  itemID. Deriving it would mean C_Item quality lookups on items whose data
+--  may not be cached yet -- an async load, a second source of truth, and a
+--  guaranteed drift from whatever Blizzard decided. The ring already holds the
+--  answer: shown iff the quality has a color, vertex-colored to it.
+-------------------------------------------------------------------------------
+
+-- Uncommon and up ONLY, matched to what the loot window already shipped so the
+-- surfaces cannot drift apart. Poor and common rings are achromatic (grey,
+-- white) while every quality from green up is saturated, so a CHROMA test
+-- sorts them with no item-quality lookup at all. Returns nil for "no rarity to
+-- show", which the caller renders as the ordinary black edge.
+local QUALITY_CHROMA = 0.1
+function WSkin.RingQuality(ring)
+    if not (ring and ring.IsShown and ring.GetVertexColor) then return end
+    -- SHOWN, not alpha: the packs alpha these rings to 0 to hide the rounded
+    -- art, and Blizzard drives visibility with SetShown. Testing alpha here
+    -- would read our own edit and call every item common.
+    if not ring:IsShown() then return end
+    local r, g, b = ring:GetVertexColor()
+    if type(r) ~= "number" or type(g) ~= "number" or type(b) ~= "number" then return end
+    if (math.max(r, g, b) - math.min(r, g, b)) <= QUALITY_CHROMA then return end
+    return r, g, b
+end
+
+-- Tiles whose border follows Blizzard's ring, so the hook below knows which
+-- buttons are its business. Weak: a pooled tile going away takes its entry.
+local _qTiles = setmetatable({}, { __mode = "k" })
+local _qHooked = false
+
+local function PaintQuality(btn)
+    local host = _qTiles[btn]
+    if not host then return end
+    local PP = EUI and (EUI.PanelPP or EUI.PP)
+    if not (PP and PP.SetBorderColor) then return end
+    -- The border stays up on an EMPTY slot, black, and that is deliberate.
+    --
+    -- It was briefly hidden when the icon was (Blizzard hides an item button's
+    -- icon when the slot is empty), on the theory that a grid of empty outlined
+    -- boxes looked broken. The opposite turned out to be true in game: those
+    -- boxes ARE the slot -- they show where an item can be dropped -- and with
+    -- them gone the trade window read as having no item slots at all. Empty is
+    -- black, filled is the rarity.
+    local r, g, b = WSkin.RingQuality(btn.IconBorder)
+    -- No rarity -> BLACK, not hidden: every other icon in the suite carries a
+    -- 1px black edge, so a common drop should look like the rest of them
+    -- rather than like a tile that lost its border.
+    PP.SetBorderColor(host, r or 0, g or 0, b or 0, 1)
+end
+
+-- Runs inside Blizzard's call stack, from bag and bank updates as well as ours.
+-- The registry test comes FIRST so an unrelated item button costs one weak
+-- table lookup and nothing else, and the paint is pcall'd so a throw here can
+-- never surface as an error inside their update.
+--
+-- Painting immediately is correct, unlike the widget-bar covers: hooksecurefunc
+-- runs AFTER the original, and SetItemButtonQuality has already shown and
+-- vertex-colored the ring by the time it returns, so there is nothing to wait
+-- for.
+local function OnItemButtonQuality(btn)
+    if not _qTiles[btn] then return end
+    pcall(PaintQuality, btn)
+end
+
+-- Give `icon` a square 1px border on `owner`, colored by item quality.
+--
+-- With no explicit color the border FOLLOWS Blizzard's ring, repainting
+-- whenever SetItemButtonQuality touches the button -- which is what makes
+-- pooled tiles correct without any pack having to guess when Blizzard
+-- repopulates them. Pass r,g,b for surfaces that have no ring to read
+-- (the loot roll popups carry quality in an ATLAS NAME instead).
+function WSkin.QualityBorder(owner, icon, r, g, b)
+    if not (owner and icon) then return end
+    -- Same hazard as every other frame-creating helper here: CreateFrame on a
+    -- forbidden owner THROWS, and callers are pcall-isolated per WINDOW, so an
+    -- unguarded throw takes out the rest of that window's pass rather than one
+    -- icon's border.
+    if owner.IsForbidden and owner:IsForbidden() then return end
+    if icon.IsForbidden and icon:IsForbidden() then return end
+    local PP = EUI and (EUI.PanelPP or EUI.PP)
+    if not (PP and PP.CreateBorder) then
+        -- Older EllesmereUI without the pixel-perfect border API: fall back to
+        -- the plain black edge rather than leaving the tile with nothing.
+        WSkin.BorderRegion(owner, icon)
+        return
+    end
+    local d = GetFFD(owner)
+    local host = d.qBorder
+    if not host then
+        -- Its OWN frame, anchored to the ICON rather than the button: the
+        -- button rect is larger than its icon on most of these templates, and
+        -- PP.CreateBorder spans whatever frame it is handed.
+        host = CreateFrame("Frame", nil, owner)
+        -- ONE PIXEL OUTSIDE the icon, not on its edge. Sitting exactly on the
+        -- rect put the strips on the same pixels the icon draws, so the icon
+        -- won and the border looked like it was being clipped through --
+        -- visible on any icon with light content at the edge. Outset by 1 it
+        -- rings the icon and nothing can overlap it.
+        host:SetPoint("TOPLEFT", icon, "TOPLEFT", -1, 1)
+        host:SetPoint("BOTTOMRIGHT", icon, "BOTTOMRIGHT", 1, -1)
+        -- ...and well clear of the button's own layers. Item buttons stack
+        -- icon, overlays, quest markers and an alert frame, and some templates
+        -- raise their own level (trade calls RaiseFrameLevelByTwo).
+        if owner.GetFrameLevel then
+            host:SetFrameLevel(owner:GetFrameLevel() + 6)
+        end
+        PP.CreateBorder(host, 0, 0, 0, 1, 1, "OVERLAY", 7)
+        d.qBorder = host
+    end
+    if r then
+        _qTiles[owner] = nil
+        if PP.SetBorderColor then PP.SetBorderColor(host, r, g, b, 1) end
+        return
+    end
+    _qTiles[owner] = host
+
+    -- TWO ways Blizzard sets a quality, and one of them the global hook below
+    -- cannot see.
+    --
+    -- The global SetItemButtonQuality delegates to `button:SetItemButtonQuality`
+    -- whenever the button has that method -- so a caller that invokes the
+    -- METHOD directly never passes through the global at all. MerchantFrame is
+    -- exactly that caller (`self.ItemButton:SetItemButtonQuality(...)`), which
+    -- is why a vendor tile would otherwise sit on a stale color forever while
+    -- quest rewards and loot worked fine.
+    --
+    -- Hooking the instance covers both routes at once: the global's own
+    -- delegation lands here too. Marked in FFD, since a pooled tile is
+    -- re-skinned on every pass and must not stack hooks.
+    if type(owner.SetItemButtonQuality) == "function" and not d.qMethodHook then
+        d.qMethodHook = true
+        pcall(hooksecurefunc, owner, "SetItemButtonQuality", OnItemButtonQuality)
+    end
+    -- Still needed for buttons with NO method, where the global does the work
+    -- itself (SetItemButtonQuality_Base).
+    if not _qHooked and type(_G.SetItemButtonQuality) == "function" then
+        _qHooked = true
+        hooksecurefunc("SetItemButtonQuality", OnItemButtonQuality)
+    end
+    PaintQuality(owner)
+end
+
+-- One quest-style reward tile: drop the parchment name plate and every ring
+-- stacked on the icon, white the name, square the icon and give it the rarity
+-- border.
+--
+-- Lives here rather than in a pack because THREE places need the identical
+-- treatment -- the NPC quest window, the map/quest-log rewards frame, and the
+-- lazy-creation hook on QuestInfo_GetRewardButton -- and WindowPacks has no
+-- headroom for another file-scope local.
+--
+-- NameFrame is the box round the name; IconBorder is the ROUNDED quality ring,
+-- stripped because it defeats the square crop, with its colour read back onto
+-- the square border by SquareIcon's `quality` flag.
+local REWARD_TILE_ART = { "NameFrame", "IconBorder", "IconOverlay",
+                          "IconOverlay2", "IconBorder2" }
+function WSkin.QuestRewardTile(btn)
+    if not btn or (btn.IsForbidden and btn:IsForbidden()) then return end
+    -- parentKey OR global name. LargeItemButtonTemplate declares these with
+    -- both (`name="$parentNameFrame" parentKey="NameFrame"`), but the small
+    -- quest template and the trade window's own tiles declare the same art
+    -- with NO parentKey -- and a lookup that only tries the key silently finds
+    -- nothing and leaves the plate up.
+    local n = btn.GetName and btn:GetName()
+    for i = 1, #REWARD_TILE_ART do
+        local k = REWARD_TILE_ART[i]
+        local t = btn[k] or (n and _G[n .. k])
+        if t and t.SetAlpha and t.IsObjectType and t:IsObjectType("Texture") then
+            t:SetAlpha(0)
+        end
+    end
+    if btn.Name and btn.Name.SetTextColor then btn.Name:SetTextColor(1, 1, 1) end
+    WSkin.SquareIcon(btn.Icon, btn, true)
+end
+
+-- Every reward tile under `frame`, named or not.
+--
+-- RewardButtons alone is NOT enough. A /framestack over the "may have
+-- additional rewards" tile shows it as `MapQuestInfoRewardsFrame.<hex>` -- an
+-- ANONYMOUS child. QuestInfo_GetRewardButton NAMES the buttons it creates
+-- ($parentQuestInfoItem1...), so an unnamed tile did not come from there and
+-- is never in RewardButtons; it comes from one of the frame's own pools.
+--
+-- So the named list is walked first and then the CHILDREN, with anything
+-- carrying a reward tile's shape treated as one. Every probe is pcall'd: a
+-- quest rewards frame can hold widget-backed children whose field access
+-- throws, and one of those must not take the pass down.
+local function LooksLikeRewardTile(f)
+    return (f.NameFrame ~= nil) or (f.Icon ~= nil)
+end
+-- Children as a TABLE, passed BY ARGUMENT to pcall. The obvious spelling,
+-- pcall(function() return { f:GetChildren() } end), allocates a fresh CLOSURE
+-- on every call -- the exact thing this file's own KidsOf helpers exist to
+-- avoid, and this runs on every quest display.
+local function RewardKids(f)
+    return { f:GetChildren() }
+end
+function WSkin.QuestRewardTiles(frame)
+    if not frame or (frame.IsForbidden and frame:IsForbidden()) then return end
+    local rb = frame.RewardButtons
+    if rb then
+        for i = 1, #rb do WSkin.QuestRewardTile(rb[i]) end
+    end
+    if not frame.GetChildren then return end
+    local okKids, kids = pcall(RewardKids, frame)
+    if not okKids or not kids then return end
+    for i = 1, #kids do
+        local ch = kids[i]
+        local okShape, isTile = pcall(LooksLikeRewardTile, ch)
+        if okShape and isTile then WSkin.QuestRewardTile(ch) end
+    end
+end
+
 -- Square an icon texture (crop the baked bevel) and optionally border it.
-function WSkin.SquareIcon(icon, parent)
+--
+-- `quality` true asks for the rarity-colored border above instead of the plain
+-- black one. Routed through here rather than called alongside it so the MASK
+-- GUARDS below stay the single authority: a masked icon renders as a shape,
+-- and a square border drawn round it is exactly as wrong as a square crop.
+--
+-- Returns true when the crop actually happened, so a caller that needs to
+-- border a masked-icon surface itself can tell whether it may.
+function WSkin.SquareIcon(icon, parent, quality)
     if not icon or not icon.SetTexCoord then return end
     -- A texture with a MaskTexture rejects SetTexCoord outright (hard Lua
     -- error, e.g. the special first-catch loot toast masks its icon). Leave
     -- masked icons fully native -- no crop, and no square border drawn
     -- around what the mask renders as a shape.
     if icon.GetNumMaskTextures and icon:GetNumMaskTextures() > 0 then return end
-    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
-    if parent then WSkin.BorderRegion(parent, icon) end
+    -- The count sees only AddMaskTexture masks; a legacy SetMask() mask is
+    -- invisible to it and still rejects SetTexCoord (field: fishing loot
+    -- toast on a build that already carried the count guard). The call
+    -- itself is the only reliable probe -- on rejection the icon stays
+    -- native, same as the counted case.
+    if not pcall(icon.SetTexCoord, icon, 0.08, 0.92, 0.08, 0.92) then return end
+    if parent then
+        if quality then
+            WSkin.QualityBorder(parent, icon)
+        else
+            WSkin.BorderRegion(parent, icon)
+        end
+    end
+    return true
 end
 
 -- Remove a PortraitFrameTemplate's corner portrait.
@@ -880,9 +1195,10 @@ function WSkin.Tab(tab, opts)
             hooksecurefunc(sys, "SetTabVisuallySelected", UpdateAllTabs)
         end
     end
+    -- Icon tabs carry their label in Icon; retain its clipping mask as well.
     for j = 1, select("#", tab:GetRegions()) do
         local r = select(j, tab:GetRegions())
-        if r and r:IsObjectType("Texture") then
+        if r and r ~= tab.Icon and r ~= tab.IconMask and r:IsObjectType("Texture") then
             r:SetTexture("")
             if r.SetAtlas then r:SetAtlas("") end
         end
@@ -990,7 +1306,9 @@ function WSkin.NormalizeTabRow(tabs)
             if prev then
                 local gap = (PP and PP.mult) or 1
                 local es = t.GetEffectiveScale and t:GetEffectiveScale()
-                if PP and PP.perfect and es and es > 0 then
+                -- Bound-check es: a corrupted near-zero scale (left behind by
+                -- another addon) would blow this up into a huge, wrong gap.
+                if PP and PP.perfect and es and es > 0.1 and es < 10 then
                     gap = PP.perfect / es
                 end
                 t:ClearAllPoints()
@@ -1285,7 +1603,7 @@ end
 
 -- Common chrome for a framed panel: close button, search/filter controls,
 -- page nav, scroll bars.
-function WSkin.CommonChrome(frame, prefix)
+function WSkin.CommonChrome(frame, prefix, explicitControls)
     if frame.CloseButton then WSkin.CloseButton(frame.CloseButton) end
     -- Newer templates hang the X off the title bar (or name it ClosePanelButton)
     -- instead of putting it on the frame -- the loot window is one of them, and
@@ -1298,9 +1616,11 @@ function WSkin.CommonChrome(frame, prefix)
         local cb = _G[prefix .. "CloseButton"]
         if cb then WSkin.CloseButton(cb) end
     end
-    WSkin.ControlsIn(frame)
-    WSkin.PagingIn(frame)
-    WSkin.ScrollBarsIn(frame)
+    if not explicitControls then
+        WSkin.ControlsIn(frame)
+        WSkin.PagingIn(frame)
+        WSkin.ScrollBarsIn(frame)
+    end
     -- Re-center the title: PortraitFrameTemplate anchors it relative to the
     -- (removed) portrait + close button, so it lands a few px off the frame's
     -- true center. Center it on the shell top bar instead. One-shot.
@@ -1328,6 +1648,7 @@ end
 
 -- Debounce: collapse many hook fires in one frame into a single pass.
 function WSkin.Debounce(fn)
+    if registrationWindow then fn = WSkin.WindowCallback(registrationWindow, fn) end
     local pending = false
     return function()
         if pending then return end

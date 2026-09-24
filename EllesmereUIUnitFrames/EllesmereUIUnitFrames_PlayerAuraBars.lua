@@ -64,7 +64,21 @@ local CLASS_LABELS = {
     DispelTyped       = { "Dispels", "Shows any debuff with a dispel type (Magic, Curse, Disease, Poison, Bleed), even if you cannot remove it" },
     Raid              = { "Raid",            "Shows only debuffs from Blizzard's curated raid-frame debuff set" },
     RaidInCombat      = { "Raid In Combat",  "Shows only the stricter in-combat subset of the raid set" },
+    -- Less common filters (below the divider in the Filters dropdown).
+    CastByMe          = { "Cast By You",     "Debuffs applied by you or your pet" },
+    AnyPlayer         = { "From Any Player", "Debuffs caused by any player or player pet. The opposite of Non-Player Auras; checking one clears the other" },
+    DispelMagic       = { "Magic",           "Debuffs with the Magic dispel type" },
+    DispelCurse       = { "Curse",           "Debuffs with the Curse dispel type" },
+    DispelPoison      = { "Poison",          "Debuffs with the Poison dispel type" },
+    DispelDisease     = { "Disease",         "Debuffs with the Disease dispel type" },
+    DispelBleed       = { "Bleed",           "Debuffs with the Bleed dispel type" },
+    CanApply          = { "Can Apply Aura",  "Debuffs your own class is able to apply" },
 }
+
+-- Non-Player Auras and From Any Player share one engine field: checking either
+-- (in either lane) clears the other from both lanes. Keyed by .skey.
+local EXCLUSIVE_SKEY = { NonPlayer = "AnyPlayer", AnyPlayer = "NonPlayer" }
+ns.PAB_ExclusiveSkey = EXCLUSIVE_SKEY
 
 -- Curated debuff filter list: exact vocabulary+order parity with Raid Frames' debuff
 -- filters (EUI_RaidFrames_ManagerPages.lua TILE_FILTER_ITEMS); shared by Base Filters
@@ -74,6 +88,10 @@ local CLASS_LABELS = {
 -- profiles that already set them.
 local DEBUFF_FILTER_ORDER = {
     "nonplayer", "priority", "cc", "bossaura", "roleaura", "raid", "raidcombat", "dispellable", "dispeltyped",
+    -- Divider sentinel (ClassByKey resolves nothing for it; PAB_ClassItems emits a
+    -- header row, PAB_FxClassItems skips it), then the less common filters.
+    "__less",
+    "castbyme", "anyplayer", "magic", "curse", "poison", "disease", "bleed", "canapply",
 }
 
 local function ClassByKey(key)
@@ -91,14 +109,19 @@ function ns.PAB_ClassItems(isBuff)
     if not isBuff then
         local items = {}
         for i = 1, #DEBUFF_FILTER_ORDER do
-            local class = ClassByKey(DEBUFF_FILTER_ORDER[i])
-            if class then
-                local meta = CLASS_LABELS[class.skey]
-                items[#items + 1] = {
-                    key = class.skey,
-                    label = meta and meta[1] or class.skey,
-                    tooltip = meta and meta[2] or nil,
-                }
+            local key = DEBUFF_FILTER_ORDER[i]
+            if key == "__less" then
+                items[#items + 1] = { isHeader = true, label = "Less Common Filters" }
+            else
+                local class = ClassByKey(key)
+                if class then
+                    local meta = CLASS_LABELS[class.skey]
+                    items[#items + 1] = {
+                        key = class.skey,
+                        label = meta and meta[1] or class.skey,
+                        tooltip = meta and meta[2] or nil,
+                    }
+                end
             end
         end
         return items
@@ -138,7 +161,9 @@ end
 --  filters include a button's category wins. PAB's debuff classes are a mutual-
 --  exclusion chain (BuildChain), so every displayed icon belongs to exactly ONE
 --  engine group key (a class .key, or "all"): matching is one dictionary lookup,
---  never a search across overlapping records.
+--  never a search across overlapping records. A Match All group (DebuffChainFor)
+--  stamps a category LIST instead: every member belongs to each listed category,
+--  so the first entry naming any of them wins.
 -------------------------------------------------------------------------------
 
 local function PAB_FxEntryActive(e)
@@ -160,25 +185,46 @@ local function PAB_FxListView(list)
 end
 
 -- First ACTIVE block whose filters include `cat` wins (list is already pre-filtered
--- to active-only blocks by PAB_FxListView/style.fxList).
+-- to active-only blocks by PAB_FxListView/style.fxList). `cat` is one category key,
+-- or a Match All group's category list (any listed category matches).
 local function PAB_FxBlockFor(list, cat)
     if not (list and cat) then return nil end
+    local many = type(cat) == "table"
     for i = 1, #list do
         local f = list[i].filters
-        if f and f[cat] then return list[i] end
+        if f then
+            if many then
+                for j = 1, #cat do
+                    if f[cat[j]] then return list[i] end
+                end
+            elseif f[cat] then
+                return list[i]
+            end
+        end
     end
 end
 
 -- Per-filter Size: first ACTIVE block matching `cat` wins outright (same rule
 -- PAB_ApplyDmFx uses for glow/border) -- a later block's Size never overrides an
--- already-claimed category.
+-- already-claimed category. `cat` takes a category list like PAB_FxBlockFor.
 local function PAB_FxSizeFor(list, cat)
-    if not list then return nil end
+    if not (list and cat) then return nil end
+    local many = type(cat) == "table"
     for i = 1, #list do
         local e = list[i]
         if PAB_FxEntryActive(e) then
             local f = e.filters
-            if f and f[cat] then
+            local hit = false
+            if f then
+                if many then
+                    for j = 1, #cat do
+                        if f[cat[j]] then hit = true; break end
+                    end
+                else
+                    hit = f[cat] and true or false
+                end
+            end
+            if hit then
                 local sz = tonumber(e.size)
                 if sz and sz > 0 then return sz end
                 return nil
@@ -206,12 +252,15 @@ end
 -- present: forcing without a forward-exclusion carrier duplicates every matching debuff
 -- (once via its own group, once via catch-all). Token classes are always safe (BuildChain
 -- negates them "!TOKEN" forward); so is dispel-typed (forwards excludeDispelTypes). The
--- three boolean candidate classes (bossaura/roleaura/priorityaura) have no Blizzard
--- "exclude" counterpart, so their Icon Effects still require Show All Debuffs off plus
--- the matching Base Filter on.
+-- four boolean candidate classes (Boss, Role, Can Apply, Important) have exact false
+-- values that BuildChain carries forward from a shown link, but they are never forced
+-- here: forcing one would add a group beside the catch-all on every Show All bar with
+-- such an Icon Effect, a regrouping this gate leaves out. Their Icon Effects still
+-- require Show All Debuffs off plus the matching Base Filter on.
 local function PAB_FxSafeToForce(class)
     local c = class.cand
-    return not (c and (c.isBossAura ~= nil or c.isRoleAura ~= nil or c.isPriorityAura ~= nil))
+    return not (c and (c.isBossAura ~= nil or c.isRoleAura ~= nil or c.isPriorityAura ~= nil
+        or c.canApplyAura ~= nil))
 end
 
 -- Filter vocabulary for the Icon Effects UI (debuffs only): same curated
@@ -241,6 +290,36 @@ end
 -- glow/border overlay frames even with no matching block -- a small one-time per-button
 -- cost (same trade-off as EllesmereUI_AuraKit.lua's dispelHolder) so a later Icon
 -- Effects change never needs a /reload.
+
+-- Icon-size expansion for a masked shape's overhang beyond its logical iconSize
+-- (mirrors EllesmereUIActionBars.lua's SHAPE_BTN_EXPAND).
+local PAB_SHAPE_EXPAND = 8
+local function PabShapeActive(shape)
+    return shape ~= nil and shape ~= "none"
+end
+
+-- Shape borders only render two visually distinct states at aura-icon sizes, same as
+-- Action Bars' own ns.BORDER_THICKNESS table: thin/normal/heavy all carry shape=0,
+-- only strong carries shape=7. Border Size's 0-4 levels mirror that table 1:1 (see
+-- EUI_PlayerAuraBars_ManagerPages.lua's BORDER_SIZE_LEVELS).
+local function PabShapeBorderSize(v)
+    return ((v or 0) >= 4) and 7 or 0
+end
+local function PabShapedSize(rawSize, shape)
+    if PabShapeActive(shape) then return rawSize + PAB_SHAPE_EXPAND end
+    return rawSize
+end
+
+-- Nearest physical pixel at UIParent scale, for every PAB grid number (icon size,
+-- padding, row gap). Not PP.Scale: it truncates, and the per-icon loss adds up
+-- along a row, so a bar measured a different number of UI units per resolution.
+-- Rounds like EllesmereUIActionBars.lua's ComputeBarLayout, plus the 0.001 tie
+-- guard PP.SnapForES uses, so an exact half pixel cannot flip between sessions.
+local function PabSnap(x)
+    local m = EllesmereUI.PP.mult
+    if x == 0 or m == 1 then return x end
+    return math.floor(x / m + 0.5 + 0.001) * m
+end
 
 local function PAB_ApplyDmFx(button, d, style)
     local cat = d.dmCat
@@ -299,7 +378,9 @@ local function PAB_ApplyDmFx(button, d, style)
         gov:Hide()
     end
 
-    -- Border override: same creation-window pre-make as the glow.
+    -- Border override: same creation-window pre-make as the glow. PP.CreateBorder's
+    -- container is created lazily below (non-shaped branch only) -- a shaped bar
+    -- uses PP.ApplyMaskedShapeBorder instead, which owns its own child texture.
     local bSize = (e and e.borderSize) or 0
     local host = d.pabFxBdr
     if not host and PP then
@@ -309,13 +390,18 @@ local function PAB_ApplyDmFx(button, d, style)
             or (button:GetFrameLevel() + 1)
         host:SetFrameLevel(base + 1)
         host:EnableMouse(false)
-        PP.CreateBorder(host, 0, 0, 0, 1, 1)
         host:Hide()
         d.pabFxBdr = host
     end
     if bSize > 0 and host and PP then
         local bc = e.borderColor or { r = 0, g = 0, b = 0 }
-        PP.UpdateBorder(host, bSize, bc.r or 0, bc.g or 0, bc.b or 0, 1)
+        if style.iconShape and style.iconShape ~= "none" and style.shapeBorderPath and d.shapeMask then
+            PP:ApplyMaskedShapeBorder(host, d.shapeMask, style.shapeBorderPath, PabShapeBorderSize(bSize), bc.r or 0, bc.g or 0, bc.b or 0, 1)
+        else
+            PP:HideMaskedShapeBorder(host)
+            PP.CreateBorder(host, 0, 0, 0, 1, 1)
+            PP.UpdateBorder(host, bSize, bc.r or 0, bc.g or 0, bc.b or 0, 1)
+        end
         host:Show()
     elseif host then
         host:Hide()
@@ -338,10 +424,27 @@ local function ClassEnabled(class, isBuff, cfg)
     -- "Show All Debuffs": bypasses every class toggle without touching saved
     -- classFilters, so turning it back off restores exactly what was configured.
     -- Debuffs only -- buffs never read classFilters. ~= false not == true: nil
-    -- (unconfigured bar) means ON, matching showAllBuffs' "nil == on".
+    -- (unconfigured bar) means ON, matching showAllBuffs' "nil == on". Has
+    -- Duration is a MODIFIER, not a mode: it never bypasses class toggles.
     if not isBuff and cfg.showAllDebuffs ~= false then return false end
     -- playerUnitOnly classes ("nonplayer") always apply: player unit only.
     return cfg.classFilters and cfg.classFilters[class.skey] == true
+end
+
+-- Curated FAMILIES (a primary plus its `alts`: rank/talent ids for one buff, and
+-- multi-state buffs like Aspect of Harmony whose aura swaps spell ID as it advances)
+-- expand at RESOLUTION, as the Raid Frames Buff Manager does in BmIncludeMap. Not at
+-- write time: the Filter Editor and both spell dropdowns collapse a family into ONE
+-- same-named row, so only one member is ever reachable to add, and saved filters hold
+-- that member alone. `blocked` is the owning filter's spell map, where an explicit
+-- `false` wins. Show lane and hide lane both expand, or a hide filter carrying one id
+-- of a family would leak the rest.
+local function ExpandFamily(set, id, blocked)
+    local fam = ns.PAB_SPELL_FAMILY and ns.PAB_SPELL_FAMILY[id]
+    if not fam then return end
+    for i = 1, #fam do
+        if not (blocked and blocked[fam[i]] == false) then set[fam[i]] = true end
+    end
 end
 
 -- BuildChain contract: includeCatchAll (default true) appends "every remaining aura
@@ -355,26 +458,29 @@ end
 -- while the catch-all is included duplicates every matching debuff (same mechanism
 -- RaidFrames' DebuffManager uses via cf.excludeDispelTypes = TYPED_DEBUFFS).
 --
--- Catch-all chain for a buff bar (Show All Buffs, default on). Checked filters SUBTRACT
--- their resolved spells via excludeSpellIDs, re-applied every ApplyGroupConfig pass so
--- edits stay live. ApplyGroupConfig self-zeroes any group falling out of the returned
--- chain, so callers pass this UNGATED; an empty chain is the correct "nothing" case.
+-- Catch-all chain for a buff bar (Show All Buffs, default on). HIDE-lane filters
+-- (cfg.negFilters) SUBTRACT their resolved spells via excludeSpellIDs, re-applied every
+-- ApplyGroupConfig pass so edits stay live. ApplyGroupConfig self-zeroes any group
+-- falling out of the returned chain, so callers pass this UNGATED; an empty chain is
+-- the correct "nothing" case.
 local function BuffBarChain(cfg)
     -- All Buffs and Has Duration are mutually exclusive broad-content modes (options
     -- setters enforce it): either builds the catch-all (Has Duration narrowed to
-    -- duration-carrying buffs via the maxDuration extras merge) and checked filters
-    -- SUBTRACT from it. With neither on, filters ADD through the spells group.
+    -- duration-carrying buffs via the maxDuration extras merge) and hide-lane filters
+    -- SUBTRACT from it. With neither on, show-lane filters ADD through the spells
+    -- group (minus the hide lane, resolved in PAB_ResolveSpells).
     if cfg.showAllBuffs == false and cfg.hasDuration ~= true then return {} end
     local link = { key = "all", tokens = { "HELPFUL" } }
-    if cfg.filters then
+    if cfg.negFilters then
         local ex
-        for filterId in pairs(cfg.filters) do
+        for filterId in pairs(cfg.negFilters) do
             local f = ns.PAB_GetFilter and ns.PAB_GetFilter(filterId)
             if f and f.spells then
                 for id, on in pairs(f.spells) do
                     if on then
                         ex = ex or {}
                         ex[id] = true
+                        ExpandFamily(ex, id, f.spells)
                     end
                 end
             end
@@ -384,45 +490,229 @@ local function BuffBarChain(cfg)
     return { link }
 end
 
--- Unified filter model (debuffs, Raid Frames DM parity): while Show All Debuffs is on,
--- CHECKED classes SUBTRACT from the catch-all instead of adding content. Returns the raw
--- per-class checked test (no Show All bypass) as BuildChain's subtractFn; nil in add
--- mode, where checked classes add groups.
+-- Unified filter model (debuffs, Raid Frames DM parity): HIDE-lane classes
+-- (cfg.negClassFilters) SUBTRACT in BOTH modes -- from the catch-all while Show All
+-- Debuffs is on, from the show-lane class groups in add mode. Returns the per-class
+-- hide-lane test as BuildChain's subtractFn; nil when nothing is hidden.
 local function DebuffSubtractFn(cfg)
-    if cfg.showAllDebuffs == false then return nil end
+    local neg = cfg.negClassFilters
+    if not (neg and next(neg)) then return nil end
     return function(class)
         if class.buffOnly then return false end
-        return cfg.classFilters and cfg.classFilters[class.skey] == true
+        return neg[class.skey] == true
     end
+end
+
+-- Union of two dispel-type sets as a NEW table (the shared vocabulary tables
+-- are never mutated); nil-safe on the accumulator. Several per-type classes
+-- can forward at once, so the carrier accumulates instead of overwriting.
+local function MergeTypes(acc, add)
+    local out = {}
+    if acc then for k, v in pairs(acc) do out[k] = v end end
+    for k, v in pairs(add) do out[k] = v end
+    return out
 end
 
 local function BuildChain(base, classEnabledFn, includeCatchAll, subtractFn)
     local chain, negations = {}, {}
-    local excludeDispelTypes, npOwned
+    local excludeDispelTypes, npOwned, anyOwned, prOwned, boolOwned, subCand
     local tokenClasses = VisibleTokenClasses()
     local candidateClasses = VisibleCandidateClasses()
     if not (tokenClasses and candidateClasses) then return chain end
+    -- TWO structures, picked by mode. BROAD mode (catch-all included) keeps the
+    -- LEGACY single interleaved pass bit-for-bit: hidden and fx-forced links emit
+    -- in vocabulary order, an fx-forced class sees only earlier-vocab negations,
+    -- and subCand lands ONLY on the catch-all -- pre-lanes configs (Show All +
+    -- subtractions + Icon Effects) must keep their exact link shapes. ADD mode
+    -- (no catch-all, hide lane possible only post-lanes) runs the HIDDEN PASS
+    -- FIRST so every hidden class's negations/forward excludes/inverted booleans
+    -- reach every positive link -- there is nothing legacy to preserve there.
+    local addMode = includeCatchAll == false
+
+    -- Boss / Role / Can Apply: the engine field a link of one of those classes
+    -- owns, else nil. Each is an exact NOT when set false (like isPriorityAura).
+    local function OwnedBool(cc)
+        if cc.isBossAura == true then return "isBossAura" end
+        if cc.isRoleAura == true then return "isRoleAura" end
+        if cc.canApplyAura == true then return "canApplyAura" end
+    end
+
+    -- One linear owner order, each shown class carrying its complement onto every
+    -- later link (see ExtraCand): Non-Player / From Any Player > Boss > Role >
+    -- Can Apply > shown types > Important > Dispels. Important owns its overlap
+    -- with Non-Player (the Raid Frames owner too), and Non-Player sits FIRST in
+    -- the vocabulary, so the pair is pre-scanned: while both are shown (npFlip)
+    -- every class ranked above Important must rank above Non-Player too, or the
+    -- order cycles (an NPC Important debuff of a shown type, or an NPC Boss
+    -- debuff that is Important, would match no link at all). So Boss, Role, Can
+    -- Apply, the per-type rows and Important skip the Non-Player handoff, and the
+    -- Non-Player link carries their complements instead: isPriorityAura = false,
+    -- the shown types' exclude, and false for each shown Boss / Role / Can Apply.
+    -- Flip order: Boss > Role > Can Apply > shown types > Important > Non-Player
+    -- > Dispels. Nothing changes unless both are shown.
+    local npFlip, flipTypes, flipBools
+    do
+        local npShown, prShown, types, bools
+        for i = 1, #candidateClasses do
+            local class = candidateClasses[i]
+            local cc = class.cand
+            if cc and classEnabledFn(class) then
+                local bk = OwnedBool(cc)
+                if cc.isFromPlayerOrPlayerPet == false then npShown = true
+                elseif cc.isPriorityAura == true then prShown = true
+                elseif bk then
+                    bools = bools or {}
+                    bools[bk] = false
+                elseif cc.includeDispelTypes and not prShown then
+                    types = MergeTypes(types, cc.includeDispelTypes)
+                end
+            end
+        end
+        if npShown and prShown then npFlip, flipTypes, flipBools = true, types, bools end
+    end
 
     -- Forward-carried candidate exclusions: candidate classes have no string token
     -- to negate with, so exclusivity rides complementary candidate filters on every
-    -- link built AFTER the trigger. Two carriers: excludeDispelTypes, and the
-    -- Non-Player handoff (once nonplayer -- isFromPlayerOrPlayerPet = false -- is in
-    -- the chain, later links incl. the catch-all carry the complementary TRUE so the
-    -- two sides partition instead of double-displaying).
-    local function ExtraCand()
-        if not (excludeDispelTypes or npOwned) then return nil end
+    -- link built AFTER the trigger. Carriers: excludeDispelTypes, the Non-Player
+    -- handoff (once nonplayer -- isFromPlayerOrPlayerPet = false -- is in the
+    -- chain, later links incl. the catch-all carry the complementary TRUE so the
+    -- two sides partition instead of double-displaying), a shown Important
+    -- (isPriorityAura = false on every later link), a shown Boss / Role / Can
+    -- Apply (its field false on every later link, boolOwned), and -- ADD MODE
+    -- ONLY -- subCand (inverted booleans of hidden pure-boolean classes; in broad
+    -- mode subCand stays a catch-all-only payload, legacy parity). skipNp drops
+    -- the Non-Player handoff for the links that outrank Non-Player (see npFlip);
+    -- noBools drops the Boss / Role / Can Apply carry (a link that matches
+    -- nothing keeps its payload and key).
+    local function ExtraCand(skipNp, noBools)
+        local withSub = addMode and subCand or nil
+        local np = npOwned and not skipNp
+        local bo = (not noBools) and boolOwned or nil
+        if not (excludeDispelTypes or np or anyOwned or prOwned or bo or withSub) then return nil end
         local t = {}
         if excludeDispelTypes then t.excludeDispelTypes = excludeDispelTypes end
-        if npOwned then t.isFromPlayerOrPlayerPet = true end
+        -- Non-Player and From Any Player are the same field; the options
+        -- setters keep them exclusive, nonplayer wins if stale data disagrees.
+        if npOwned then
+            if np then t.isFromPlayerOrPlayerPet = true end
+        elseif anyOwned then t.isFromPlayerOrPlayerPet = false end
+        if prOwned then t.isPriorityAura = false end
+        if bo then
+            for k, v in pairs(bo) do t[k] = v end
+        end
+        if withSub then
+            for k, v in pairs(withSub) do t[k] = v end
+        end
         return t
     end
 
-    -- Subtracted classes (subtractFn checked, not otherwise enabled) join as HIDDEN
-    -- links: group parks at 0 frames while its negations/forward excludes still remove
-    -- it from the catch-all. Group filter strings are declaration-fixed, so subtraction
-    -- must ride the same negation machinery enabling a class does, never a re-tokened
-    -- catch-all. An fx-forced class stays visible (effect wins).
-    local subCand
+    -- excludeCand for a SHOWN candidate link: ExtraCand plus the npFlip ownership.
+    -- A dispel-type link whose every type the forwarded exclude already drops
+    -- (Dispels hidden) matches nothing: it takes no Boss / Role / Can Apply carry.
+    local function ShownCand(cc)
+        local dead = cc.includeDispelTypes ~= nil and excludeDispelTypes ~= nil
+        if dead then
+            for k in pairs(cc.includeDispelTypes) do
+                if not excludeDispelTypes[k] then dead = false; break end
+            end
+        end
+        if not npFlip then return ExtraCand(nil, dead) end
+        local ex = ExtraCand(cc.isPriorityAura == true or OwnedBool(cc) ~= nil
+            or (cc.includeDispelTypes ~= nil and not prOwned), dead)
+        if cc.isFromPlayerOrPlayerPet == false then
+            ex = ex or {}
+            ex.isPriorityAura = false
+            if flipTypes then ex.excludeDispelTypes = MergeTypes(ex.excludeDispelTypes, flipTypes) end
+            if flipBools then
+                for k, v in pairs(flipBools) do ex[k] = v end
+            end
+        end
+        return ex
+    end
+
+    local function CollectSub(cc)
+        subCand = subCand or {}
+        for k, v in pairs(cc) do
+            if type(v) == "boolean" then subCand[k] = not v end
+        end
+    end
+
+    if addMode and subtractFn then
+        -- HIDDEN PASS -- subtracted classes join FIRST as parked links: group
+        -- filter strings are declaration-fixed, so subtraction must ride the same
+        -- negation machinery enabling a class does, never a re-tokened catch-all.
+        -- An fx-forced class stays visible (effect wins) and is emitted by the
+        -- positive pass instead.
+        for i = 1, #tokenClasses do
+            local class = tokenClasses[i]
+            if subtractFn(class) and not classEnabledFn(class) then
+                local tokens = { base, class.token }
+                for n = 1, #negations do tokens[#tokens + 1] = negations[n] end
+                chain[#chain + 1] = { key = class.key, tokens = tokens, excludeCand = ExtraCand(),
+                    hidden = true }
+                negations[#negations + 1] = class.neg or ("!" .. class.token)
+            end
+        end
+        for i = 1, #candidateClasses do
+            local class = candidateClasses[i]
+            local cc = class.cand
+            if cc and subtractFn(class) and not classEnabledFn(class) then
+                -- Forward-capable candidate classes (dispeltyped's include map,
+                -- nonplayer's complementary boolean) subtract through the hidden-
+                -- link + forward-exclude route; pure boolean classes (bossaura/
+                -- roleaura/priority) invert onto subCand instead.
+                local forward = cc.includeDispelTypes ~= nil or cc.isFromPlayerOrPlayerPet ~= nil
+                if forward then
+                    local tokens = { base }
+                    for n = 1, #negations do tokens[#tokens + 1] = negations[n] end
+                    chain[#chain + 1] = { key = class.key, tokens = tokens, cand = cc, excludeCand = ExtraCand(),
+                        hidden = true }
+                    if cc.includeDispelTypes then excludeDispelTypes = MergeTypes(excludeDispelTypes, cc.includeDispelTypes) end
+                    if cc.isFromPlayerOrPlayerPet == false then npOwned = true
+                    elseif cc.isFromPlayerOrPlayerPet == true then anyOwned = true end
+                else
+                    CollectSub(cc)
+                end
+            end
+        end
+        -- POSITIVE PASS -- the legacy loop shape; negations arrive pre-seeded.
+        for i = 1, #tokenClasses do
+            local class = tokenClasses[i]
+            if classEnabledFn(class) then
+                local tokens = { base, class.token }
+                for n = 1, #negations do tokens[#tokens + 1] = negations[n] end
+                chain[#chain + 1] = { key = class.key, tokens = tokens, excludeCand = ExtraCand() }
+                negations[#negations + 1] = class.neg or ("!" .. class.token)
+            end
+        end
+        for i = 1, #candidateClasses do
+            local class = candidateClasses[i]
+            local cc = class.cand
+            if cc and classEnabledFn(class) then
+                local tokens = { base }
+                for n = 1, #negations do tokens[#tokens + 1] = negations[n] end
+                -- class.cand is a candidate-filter TABLE; the shared vocabulary
+                -- carries set-valued filters (includeDispelTypes) directly in it.
+                chain[#chain + 1] = { key = class.key, tokens = tokens, cand = cc, excludeCand = ShownCand(cc) }
+                if cc.includeDispelTypes then excludeDispelTypes = MergeTypes(excludeDispelTypes, cc.includeDispelTypes) end
+                if cc.isFromPlayerOrPlayerPet == false then npOwned = true
+                elseif cc.isFromPlayerOrPlayerPet == true then anyOwned = true end
+                if cc.isPriorityAura == true then prOwned = true end
+                local bk = OwnedBool(cc)
+                if bk then
+                    boolOwned = boolOwned or {}
+                    boolOwned[bk] = false
+                end
+            end
+        end
+        return chain
+    end
+
+    -- BROAD mode (and add mode with an empty hide lane): the legacy single
+    -- interleaved pass, verbatim. Subtracted classes (subtractFn checked, not
+    -- otherwise enabled) join as HIDDEN links in vocabulary order: the group
+    -- parks at 0 frames while its negations/forward excludes still remove it
+    -- from the catch-all. An fx-forced class stays visible (effect wins).
     for i = 1, #tokenClasses do
         local class = tokenClasses[i]
         local en = classEnabledFn(class)
@@ -451,16 +741,23 @@ local function BuildChain(base, classEnabledFn, includeCatchAll, subtractFn)
                 local tokens = { base }
                 for n = 1, #negations do tokens[#tokens + 1] = negations[n] end
                 -- class.cand is a candidate-filter TABLE; the shared vocabulary carries
-                -- set-valued filters (includeDispelTypes) directly in it.
-                chain[#chain + 1] = { key = class.key, tokens = tokens, cand = cc, excludeCand = ExtraCand(),
+                -- set-valued filters (includeDispelTypes) directly in it. ShownCand
+                -- may return nil on purpose, so no and/or shortcut here.
+                local ex
+                if en then ex = ShownCand(cc) else ex = ExtraCand() end
+                chain[#chain + 1] = { key = class.key, tokens = tokens, cand = cc, excludeCand = ex,
                     hidden = (sub and not en) or nil }
-                if cc.includeDispelTypes then excludeDispelTypes = cc.includeDispelTypes end
-                if cc.isFromPlayerOrPlayerPet == false then npOwned = true end
-            else
-                subCand = subCand or {}
-                for k, v in pairs(cc) do
-                    if type(v) == "boolean" then subCand[k] = not v end
+                if cc.includeDispelTypes then excludeDispelTypes = MergeTypes(excludeDispelTypes, cc.includeDispelTypes) end
+                if cc.isFromPlayerOrPlayerPet == false then npOwned = true
+                elseif cc.isFromPlayerOrPlayerPet == true then anyOwned = true end
+                if en and cc.isPriorityAura == true then prOwned = true end
+                local bk = en and OwnedBool(cc)
+                if bk then
+                    boolOwned = boolOwned or {}
+                    boolOwned[bk] = false
                 end
+            else
+                CollectSub(cc)
             end
         end
     end
@@ -474,7 +771,9 @@ local function BuildChain(base, classEnabledFn, includeCatchAll, subtractFn)
         local ex = ExtraCand()
         if subCand then
             ex = ex or {}
-            for k, v in pairs(subCand) do ex[k] = v end
+            for k, v in pairs(subCand) do
+                if ex[k] == nil then ex[k] = v end
+            end
         end
         chain[#chain + 1] = { key = "all", tokens = allTokens, excludeCand = ex }
     end
@@ -505,12 +804,16 @@ local STYLE_DEBUFFS = "playerAuraBars_debuffs"
 -- stackTextSize/stackPosition/stackOffsetX/Y; stackColorR/G/B (same nil=white rule).
 -- Buff/debuff bars additionally: iconZoom (default 0.07, AK's fallback);
 -- borderSize/borderR/G/B/A (base border color, per-dispel-type override is separate);
+-- borderTexture ("solid" or a built-in/LibSharedMedia key), optional
+-- borderTextureOffset/OffsetY/ShiftX/ShiftY, and borderBehind;
 -- padding (single scalar -> all 4 sides); rowSpacing (optional row gap: feeds
--- lineSpacing/groupLineSpacing only, nil falls back to `padding`; elementSpacing/
--- groupSpacing, icon-to-icon within a row, always stay tied to `padding`); maxTotal
--- (overall icon cap); iconsPerRow (row width in columns); maxRows (row cap; with
--- iconsPerRow also bounds maxTotal, see ComputeGrid()); growDirection ("LEFT"/"RIGHT",
--- default LEFT, a TOPRIGHT anchor growing inward like Blizzard's own BuffFrame).
+-- lineSpacing/groupLineSpacing only, nil falls back to `padding`; elementSpacing,
+-- icon-to-icon within a row AND across a group seam, stays tied to `padding`
+-- while groupSpacing is held at 0, see BuildGroupLayout); maxTotal
+-- (overall icon cap, weapon-enchant cells included while that row is on);
+-- iconsPerRow (row width in columns); maxRows (row cap; with
+-- iconsPerRow also bounds maxTotal, see ComputeGrid()); growDirection ("LEFT"/"RIGHT"/
+-- "CENTER_HORIZONTAL"/"CENTER_VERTICAL"/"UP"/"DOWN", default LEFT).
 -- Buff bars (default AND custom, one model): filters ([filterId]=true, shared PAB
 -- Filters registry); spells ({spellID,...}, direct/"Extra Spells"); showAllBuffs
 -- (default bar ONLY, custom buff bars never read it; defaults true, else an
@@ -539,6 +842,23 @@ local DISPEL_SLOTS = {
     { token = "Bleed",   colorKey = "dispelColorBleed",   fallback = { 0.75, 0.15, 0.15 } },
 }
 
+-- Dispel-type indicator icon: preview-only atlas/point maps. The LIVE icon is
+-- engine-rendered (AK's one-hot dispel-texture channel, style.dispelTypeIcon);
+-- these exist so the options preview can paint the same art from the fake
+-- entries' plain dispel tokens.
+local PV_DISPEL_ICON_ATLAS = {
+    Magic   = "RaidFrame-Icon-DebuffMagic",
+    Curse   = "RaidFrame-Icon-DebuffCurse",
+    Disease = "RaidFrame-Icon-DebuffDisease",
+    Poison  = "RaidFrame-Icon-DebuffPoison",
+    Bleed   = "RaidFrame-Icon-DebuffBleed",
+}
+local PV_DISPEL_ICON_POINTS = {
+    topleft = "TOPLEFT", top = "TOP", topright = "TOPRIGHT",
+    left = "LEFT", center = "CENTER", right = "RIGHT",
+    bottomleft = "BOTTOMLEFT", bottom = "BOTTOM", bottomright = "BOTTOMRIGHT",
+}
+
 -- Same shape as RaidFrames' ns.RFC_DispelBorderColorMap: a customDispelColorMap
 -- (dispelName -> Color) for AK's engine-driven border, plus a fingerprint so a
 -- palette edit re-registers the border options (style.dispelColorFP).
@@ -565,6 +885,12 @@ local OPPOSITE_POINT = {
     BOTTOMLEFT = "TOPRIGHT", BOTTOMRIGHT = "TOPLEFT",
     CENTER = "CENTER",
 }
+
+local function SetTexturePixelSnap(texture, enabled)
+    if not (texture and texture.SetSnapToPixelGrid) then return end
+    texture:SetSnapToPixelGrid(enabled)
+    texture:SetTexelSnappingBias(0)
+end
 
 -- Secondary text-styling pass: AK calls style.applyExtra as (button, d, style), where
 -- d.duration/d.stack are the FontStrings AK's own initializer creates. Adds what AK has
@@ -606,15 +932,15 @@ local function PAB_ApplyExtraText(button, d, style)
         -- BmRebindDurationCurve rule: a denied registration under the
         -- secret-aura button restriction must leave the stamp unchanged so
         -- the next restyle retries.
-        local wantS = style.durationShowSeconds and true or false
-        if d.durationFmtS ~= nil and d.durationFmtS ~= wantS then
+        local wantFmt = (style.durationShowSeconds and "s" or "b") .. tostring(style.durationPrecisionThreshold or 0)
+        if d.durationFmtS ~= nil and d.durationFmtS ~= wantFmt then
             local AK = EllesmereUI.AuraKit
             local durationOpts = AK.BuildDurationTextOpts(
-                AK.GetDurationFormatter(style.durationShowSeconds),
+                AK.GetDurationFormatter(style.durationShowSeconds, style.durationPrecisionThreshold),
                 style.durationColorCurve, style.durationUpdateInterval)
             local ok, full = AK.SetDurationTextSafe(button, d.duration, durationOpts)
             if ok and (full or not style.durationColorCurve) then
-                d.durationFmtS = wantS
+                d.durationFmtS = wantFmt
             end
         end
     end
@@ -651,7 +977,11 @@ local function PAB_ApplyExtraText(button, d, style)
     --      (post-instance-change re-shows do this).
     if d.cooldown then
         d.pabHideSwipe = style.hideSwipe == true
-        if not d._pabSwipeHooked then
+        -- Install lazily on the first apply that actually hides the swipe. The
+        -- hook reads the live flag, so a later toggle back on still works, and a
+        -- user who never turns the setting off never gets a closure or a secure
+        -- hook on this cooldown's Show at all.
+        if d.pabHideSwipe and not d._pabSwipeHooked then
             d._pabSwipeHooked = true
             hooksecurefunc(d.cooldown, "Show", function()
                 if d.pabHideSwipe then d.cooldown:Hide() end
@@ -668,6 +998,36 @@ local function PAB_ApplyExtraText(button, d, style)
     -- carry style.fxList or fx overlay frames, pay zero cost.
     if style.fxList or d.pabFxGlow or d.pabFxBdr then
         PAB_ApplyDmFx(button, d, style)
+    end
+
+    -- Centered runs can have an odd content width/height, whose CENTER anchor is a
+    -- half pixel. Let textures use Blizzard's normal pixel snapping so
+    -- icon art cannot bleed over PP's one-pixel border. Edge-growing bars keep EUI's
+    -- usual unsnapped rendering.
+    d.pabCenteredSnap = style.centeredGrowth == true
+    -- Lazy install on the first centered apply: bars that never use centered
+    -- growth never pay the closure. Once installed the hook reads the live
+    -- flag, so switching back to edge growth costs one boolean per SetTexture.
+    if d.pabCenteredSnap and d.icon and not d.pabIconSnapHooked then
+        d.pabIconSnapHooked = true
+        hooksecurefunc(d.icon, "SetTexture", function(texture)
+            if d.pabCenteredSnap then SetTexturePixelSnap(texture, true) end
+        end)
+    end
+    SetTexturePixelSnap(d.icon, d.pabCenteredSnap)
+    local border = d.borderHost and EllesmereUI.PP.GetBorders(d.borderHost)
+    if border then
+        SetTexturePixelSnap(border._top, d.pabCenteredSnap)
+        SetTexturePixelSnap(border._bottom, d.pabCenteredSnap)
+        SetTexturePixelSnap(border._left, d.pabCenteredSnap)
+        SetTexturePixelSnap(border._right, d.pabCenteredSnap)
+    end
+    -- Textured borders use the secret-safe eight-slice renderer rather than PP.
+    -- Keep its edge art on the same centered-growth snapping policy.
+    if d._secretBorderEdges then
+        for _, tex in pairs(d._secretBorderEdges) do
+            SetTexturePixelSnap(tex, d.pabCenteredSnap)
+        end
     end
 end
 
@@ -688,6 +1048,9 @@ end
 
 local function BuildStyle(isBuff, cfg)
     local iconZoom = cfg.iconZoom
+    -- Blizzard Style: zoom 0 -- the stock buff frame draws the whole icon,
+    -- and the icon art's own dark edge is the border a stock buff shows.
+    if ns.PAB_Blizz() then iconZoom = 0 end
     local borderSize = cfg.borderSize or 1
     local borderR = cfg.borderR or 0
     local borderG = cfg.borderG or 0
@@ -696,9 +1059,43 @@ local function BuildStyle(isBuff, cfg)
 
     -- size 0 = no border; no separate "Hide Border" toggle.
     local border
+    -- The exact solid size (the borderSizePx companion) when one is set: the
+    -- dispel ring strips follow it the way they follow borderSize, so the base
+    -- ring and the dispel ring stay one width.
+    local solidPx
     if borderSize > 0 then
         border = { borderR, borderG, borderB, borderA, size = borderSize }
+        -- Texture fields ride only on a textured pick: a border table with a
+        -- texture key sends AuraKit down its explicit-size eight-slice lane,
+        -- and Solid must keep the plain PP path it always had.
+        local texture = cfg.borderTexture
+        if texture and texture ~= "" and texture ~= "solid" then
+            local textureSize = cfg.borderTextureSizeOverride or borderSize
+            border.texture = texture
+            border.textureSize = textureSize
+            border.offsetX = cfg.borderTextureOffset
+            border.offsetY = cfg.borderTextureOffsetY
+            border.shiftX = cfg.borderTextureShiftX
+            border.shiftY = cfg.borderTextureShiftY
+            border.behind = cfg.borderBehind == true
+            border.addonKey = "unitframes"
+            border.sizeKey = textureSize
+            border.edgeScale = cfg.borderTextureScaleOverride
+            -- Exact edge in pixels (EllesmereUI.BorderPx over the borderSizePx
+            -- companion; nil = the legacy EDGE_MAP step). The preview resolves it
+            -- against the raw step itself (borderPxOverride) since its borderSize
+            -- is scale-compensated and could never pair.
+            border.edgePx = cfg.borderPxOverride
+                or EllesmereUI.BorderPx(cfg.borderSizePx, textureSize, texture)
+        else
+            solidPx = cfg.borderPxOverride
+                or EllesmereUI.BorderPx(cfg.borderSizePx, borderSize, texture)
+            border.edgePx = solidPx
+        end
     end
+    -- Blizzard Style: no EUI ring on any bar -- buffs go borderless like the
+    -- stock buff frame, debuffs take the engine-stamped stock border below.
+    if ns.PAB_Blizz() then border = nil end
 
     -- Positions may arrive mixed-case ("Bottom") rather than the uppercase anchor
     -- constants SetPoint expects; normalized here so a mismatched-case default or
@@ -709,12 +1106,12 @@ local function BuildStyle(isBuff, cfg)
     -- Snapped to the physical pixel grid (like MaxIconSizeFor and ApplyGroupConfig's
     -- gap snap) so the rendered size agrees with the container's cross-axis extent
     -- math at any UIParent scale.
-    local PP = EllesmereUI.PP
-    local iconSize = PP.Scale(cfg.iconSize or 32)
+    local iconSize = PabSnap(PabShapedSize(cfg.iconSize or 32, cfg.iconShape))
 
     local style = {
         width = iconSize,
         height = iconSize,
+        centeredGrowth = cfg.growDirection == "CENTER_HORIZONTAL" or cfg.growDirection == "CENTER_VERTICAL",
         iconCrop = true,
         iconZoom = iconZoom or 0.055,
 
@@ -738,6 +1135,21 @@ local function BuildStyle(isBuff, cfg)
         -- passes straight to the world. Hover is deliberately untouched:
         -- click and motion are separate mouse channels, so tooltips keep
         -- following Show Tooltips below either way.
+        -- UP phase, matching Blizzard's own AuraButtonMixin ("LeftButtonUp",
+        -- "RightButtonUp"). Known limitation, field-reported 2026-08-12: for some
+        -- players the right-button PRESS falls through to WorldFrame, which starts
+        -- camera mouselook and captures the mouse, so the matching ButtonUp ends the
+        -- mouselook instead of reaching the button and the buff survives. Blizzard's
+        -- legacy icons consume that press; the engine's intrinsic AuraButton denies
+        -- tainted (addon) code the input aspects that would do the same
+        -- (Blizzard_AuraButton.xml: ForbiddenAspect AlwaysPropagateInput /
+        -- ScriptedInput), and no API re-grants a denied aspect. "RightButtonDown"
+        -- works around it but was rejected deliberately: a right-click-drag starting
+        -- on an icon would then cancel that buff on press. Do not "fix" this by
+        -- registering BOTH phases either -- Blizzard's CanCancelAuraOnClick matches
+        -- any registered token, so OnClick fires twice and the engine may have
+        -- re-assigned this button's aura instance in between, cancelling a DIFFERENT
+        -- aura on the up edge.
         cancelButtons = (isBuff and cfg.rightClickCancel ~= false) and "RightButtonUp" or nil,
 
         hideDurationText = cfg.durationShow == false,
@@ -745,6 +1157,7 @@ local function BuildStyle(isBuff, cfg)
         -- readings keep their unit ("10s"); selects AK's s-variant duration
         -- formatter at creation, PAB_ApplyExtraText rebinds live.
         durationShowSeconds = cfg.durationShowSeconds == true,
+        durationPrecisionThreshold = tonumber(cfg.durationPrecisionThreshold),
         -- Show Tooltips (per-bar, default on): AK's noTooltips path kills
         -- hover on this style's buttons; the flip-back handles re-enables.
         noTooltips = (cfg.showTooltips == false) or nil,
@@ -774,19 +1187,56 @@ local function BuildStyle(isBuff, cfg)
         applyExtra = PAB_ApplyExtraText,
 
         border = border,
+        -- Weapon enchant buttons mirror this style: the stock purple ring.
+        blizzEnchant = ns.PAB_Blizz() or nil,
     }
+
+    -- Custom icon shape (Square/Circle/Hexagon/etc, same media set as Action Bars
+    -- and Unit Frames' detached portraits). ns.PORTRAIT_MASKS/BORDERS/MASK_INSETS are
+    -- exposed by EllesmereUIUnitFrames.lua (same addon/ns); AuraKit itself lives in a
+    -- separate TOC and never touches ns, so resolved paths travel through style.*.
+    local shape = cfg.iconShape
+    if PabShapeActive(shape) then
+        style.iconShape       = shape
+        style.shapeMaskPath   = ns.PORTRAIT_MASKS and ns.PORTRAIT_MASKS[shape]
+        style.shapeBorderPath = ns.PORTRAIT_BORDERS and ns.PORTRAIT_BORDERS[shape]
+        style.shapeInsetPx    = ns.MASK_INSETS and ns.MASK_INSETS[shape]
+        style.shapeBorderSize = cfg.shapeBorderSizeOverride or PabShapeBorderSize(borderSize)
+    end
 
     -- Engine dispel-type border, debuffs only (buffs have no dispel type). AK's gate
     -- (ApplyStyleToRegions) only activates it when `border` above is ALSO non-nil, so
     -- borderSize = 0 disables dispel-type coloring too, not just the static ring --
-    -- engine behavior, not a choice made here. borderSize drives BOTH ring widths; a
-    -- distinct dispel-ring width would need its own setting split back out.
+    -- engine behavior, not a choice made here. borderSize (or the exact solid size
+    -- above) drives BOTH ring widths; a distinct dispel-ring width would need its
+    -- own setting split back out.
     if not isBuff then
-        local dcMap, dcFP = BuildDispelColorMap(cfg)
-        style.dispelBorder = true
-        style.dispelBorderPx = borderSize
-        style.dispelColorMap = dcMap
-        style.dispelColorFP = dcFP
+        if ns.PAB_Blizz() then
+            -- Blizzard Style: the engine stamps Blizzard's own per-dispel-type
+            -- debuff border art (red for untyped) -- no ring size, no palette.
+            style.dispelBorder = true
+            style.blizzBorder = true
+        else
+            local dcMap, dcFP = BuildDispelColorMap(cfg)
+            style.dispelBorder = true
+            style.dispelBorderPx = solidPx or borderSize
+            style.dispelColorMap = dcMap
+            style.dispelColorFP = dcFP
+        end
+
+        -- Dispel-type indicator icon (AK's one-hot engine channel; default off).
+        -- Independent of borderSize: the icon renders with or without a ring.
+        local dip = cfg.dispelIconPosition
+        if dip and dip ~= "none" then
+            style.dispelTypeIcon = {
+                pos = dip,
+                -- Scaled like iconSize (button-geometry class); offsets stay raw
+                -- like durationX (fine-tune class).
+                size = PabSnap(cfg.dispelIconSize or 16),
+                offX = cfg.dispelIconOffsetX or 0,
+                offY = cfg.dispelIconOffsetY or 0,
+            }
+        end
 
         -- Icon Effects Per-Filter: debuffs only (buffs never get style.fxList, so
         -- PAB_ApplyDmFx's gate in PAB_ApplyExtraText stays a cheap no-op).
@@ -845,6 +1295,315 @@ local function BuffCandidateExtras(cfg)
         out.excludeSpellIDs = ex
     end
     return out
+end
+
+-- Debuff-side twin of BuffCandidateExtras: "Has Duration" narrows every debuff
+-- group (class groups AND the catch-all, via the same extras merge) to
+-- duration-carrying debuffs with the native maxDuration check. math.huge never
+-- trips the `>` half, so this excludes exactly the permanent (duration = 0)
+-- debuffs. The inverse ("permanents only") is NOT expressible -- maxDuration is
+-- the engine's only duration filter (Blizzard_AuraContainerUtil), so Has
+-- Duration exists as a show-side AND-modifier only, never a hide-lane entry.
+local function DebuffCandidateExtras(cfg)
+    if not cfg then return nil end
+    -- Max Duration (seconds) is the same gate with a real cap and implies Has
+    -- Duration; nil = Unlimited = no extras at all (the candidate fingerprint
+    -- sees the cap value, so edits re-declare like any payload change).
+    local cap = cfg.maxDurSec or (cfg.hasDuration and math.huge) or nil
+    if cap then
+        return { maxDuration = cap }
+    end
+    return nil
+end
+
+-- Has Duration is an AND-MODIFIER (user directive 2026-08-16), not a broad
+-- mode: it rides every chain link via DebuffCandidateExtras, so with class
+-- filters checked it narrows exactly those. The catch-all only joins when
+-- nothing narrower is selected -- All Debuffs on, or Has Duration checked with
+-- no class filters picked (alone = every timed debuff).
+local function DebuffCatchAllOn(cfg)
+    if cfg.showAllDebuffs ~= false then return true end
+    if cfg.hasDuration ~= true then return false end
+    local cf = cfg.classFilters
+    if cf then
+        for _, v in pairs(cf) do
+            if v == true then return false end
+        end
+    end
+    return true
+end
+
+-------------------------------------------------------------------------------
+--  Debuff Match Mode (cfg.debuffMatch: nil = Match Any, "all" = Match All)
+--
+--  Match Any is the BuildChain union, untouched. Match All ANDs every Show pick into
+--  ONE group: HARMFUL + every shown token + every shown candidate field, with the
+--  Hide lane as a plain veto (!TOKEN, the opposite boolean, excludeDispelTypes), so
+--  a debuff renders at most once. The dispel types stay one OR'd axis (a debuff has
+--  one type: Magic + Curse = either; Dispels beside a type adds nothing). Runs only
+--  with All Debuffs off and at least two Show picks; anything less builds today's
+--  chain. Only rows the Filters dropdown lists take part, so a retired row's stale
+--  key cannot silently empty the bar.
+--
+--  Icon Effects only PAINT here (they never add content, and Hide beats them): a
+--  block naming a category every member already belongs to paints the whole group;
+--  a block naming another category X splits it into (group AND X, painted) and
+--  (group AND NOT X) -- exact, never duplicating (every category has an exact
+--  complement: the negated token, the opposite boolean, or the remaining dispel
+--  types; Boss, Role and Can Apply split like Important). Buttons stamp the
+--  group's category LIST (link.cats) and the key names that list, since a
+--  button's category is stamped once at creation. Settings-apply time only.
+-------------------------------------------------------------------------------
+local DebuffChainFor
+do
+    local LISTED = {}
+    for i = 1, #DEBUFF_FILTER_ORDER do LISTED[DEBUFF_FILTER_ORDER[i]] = true end
+
+    -- Types of `a` also in / not in `b`, as a fresh set; nil when none are left.
+    local function TypesAnd(a, b)
+        local out
+        for k in pairs(a) do
+            if b[k] then out = out or {}; out[k] = true end
+        end
+        return out
+    end
+    local function TypesMinus(a, b)
+        local out
+        for k in pairs(a) do
+            if not (b and b[k]) then out = out or {}; out[k] = true end
+        end
+        return out
+    end
+
+    local function CopyPart(p)
+        local t, c = {}, {}
+        for i = 1, #p.tokens do t[i] = p.tokens[i] end
+        for k, v in pairs(p.cand) do c[k] = v end
+        return { tokens = t, cand = c }
+    end
+
+    local function HasToken(p, tok)
+        for i = 1, #p.tokens do
+            if p.tokens[i] == tok then return true end
+        end
+        return false
+    end
+
+    -- The group. nil = Match All does not apply; false = the picks can never match
+    -- together (Non-Player with Cast By You, Cast By You with From Any Player hidden,
+    -- a dispel type with Dispels hidden); else the part and the categories every
+    -- member belongs to.
+    local function MatchBase(cfg)
+        if cfg.debuffMatch ~= "all" or cfg.showAllDebuffs ~= false then return nil end
+        local tokenClasses, candidateClasses = VisibleTokenClasses(), VisibleCandidateClasses()
+        if not (tokenClasses and candidateClasses) then return nil end
+        local neg = cfg.negClassFilters
+        local tokens, cand, cats = { "HARMFUL" }, {}, {}
+        local picks, nTypes, clash = 0, 0, false
+        local inc, anyType, exc, typeKey, playerTok, hideBool, dispTok
+        for i = 1, #tokenClasses do
+            local class = tokenClasses[i]
+            if LISTED[class.key] then
+                if ClassEnabled(class, false, cfg) then
+                    picks = picks + 1
+                    tokens[#tokens + 1] = class.token
+                    cats[#cats + 1] = class.key
+                    if class.key == "castbyme" then playerTok = true end
+                    if class.key == "dispellable" then dispTok = true end
+                elseif neg and neg[class.skey] == true then
+                    tokens[#tokens + 1] = class.neg or ("!" .. class.token)
+                end
+            end
+        end
+        for i = 1, #candidateClasses do
+            local class = candidateClasses[i]
+            local cc = class.cand
+            if cc and LISTED[class.key] then
+                if ClassEnabled(class, false, cfg) then
+                    picks = picks + 1
+                    if class.key == "dispeltyped" then
+                        anyType = cc.includeDispelTypes
+                        cats[#cats + 1] = class.key
+                    elseif cc.includeDispelTypes then
+                        inc = MergeTypes(inc, cc.includeDispelTypes)
+                        nTypes, typeKey = nTypes + 1, class.key
+                    else
+                        for k, v in pairs(cc) do
+                            -- Two picks on one field (stale data only: the setters keep
+                            -- Non-Player and From Any Player exclusive) never match.
+                            if cand[k] ~= nil and cand[k] ~= v then clash = true end
+                            cand[k] = v
+                        end
+                        cats[#cats + 1] = class.key
+                    end
+                elseif neg and neg[class.skey] == true then
+                    if cc.includeDispelTypes then
+                        exc = MergeTypes(exc, cc.includeDispelTypes)
+                    else
+                        hideBool = hideBool or {}
+                        for k, v in pairs(cc) do
+                            if type(v) == "boolean" then hideBool[k] = not v end
+                        end
+                    end
+                end
+            end
+        end
+        if picks < 2 then return nil end
+        -- A Show pick owns its field; the Hide lane vetoes only what is left open.
+        if hideBool then
+            for k, v in pairs(hideBool) do
+                if cand[k] == nil then cand[k] = v end
+            end
+        end
+        -- Every per-type set sits inside Dispels' any-type set, so Dispels ANDed onto
+        -- shown types changes nothing. Always a fresh set (never a vocabulary table).
+        local typed = inc or anyType
+        if typed then
+            typed = TypesMinus(typed, exc)
+            if not typed then clash = true end
+            cand.includeDispelTypes = typed
+            -- One shown type: every member carries it (with two, neither is certain).
+            if nTypes == 1 then cats[#cats + 1] = typeKey end
+        elseif exc then
+            cand.excludeDispelTypes = exc
+            -- Dispellable By You passes only debuffs of a dispellable type, so
+            -- hiding all five leaves it nothing.
+            if dispTok and exc.Magic and exc.Curse and exc.Disease and exc.Poison and exc.Bleed then
+                clash = true
+            end
+        end
+        -- PLAYER (Cast By You: you, your pet or vehicle) inside isFromPlayerOrPlayerPet
+        -- = false (a shown Non-Player, or a hidden From Any Player) is always empty.
+        if playerTok and cand.isFromPlayerOrPlayerPet == false then clash = true end
+        if clash then return false end
+        return { tokens = tokens, cand = cand }, cats
+    end
+
+    -- How category `class` relates to part p: "in" when every member belongs to it;
+    -- nil when no member can; else "split" under `probe`, or the (p AND class,
+    -- p AND NOT class) parts.
+    local function Relate(p, class, probe)
+        if class.token then
+            if HasToken(p, class.token) then return "in" end
+            local negTok = class.neg or ("!" .. class.token)
+            if HasToken(p, negTok) then return nil end
+            if probe then return "split" end
+            local a, b = CopyPart(p), CopyPart(p)
+            a.tokens[#a.tokens + 1] = class.token
+            b.tokens[#b.tokens + 1] = negTok
+            return a, b
+        end
+        local cc = class.cand
+        if not cc then return nil end
+        local set = cc.includeDispelTypes
+        if set then
+            local inc, exc = p.cand.includeDispelTypes, p.cand.excludeDispelTypes
+            if inc and not TypesMinus(inc, set) then return "in" end
+            local pos
+            if inc then pos = TypesAnd(inc, set) else pos = set end
+            if pos then pos = TypesMinus(pos, exc) end
+            if not pos then return nil end
+            if probe then return "split" end
+            local a, b = CopyPart(p), CopyPart(p)
+            a.cand.includeDispelTypes = pos
+            a.cand.excludeDispelTypes = nil
+            if inc then
+                b.cand.includeDispelTypes = TypesMinus(inc, set)
+            else
+                b.cand.excludeDispelTypes = MergeTypes(exc, set)
+            end
+            return a, b
+        end
+        local k, v = next(cc)
+        if p.cand[k] ~= nil then
+            if p.cand[k] == v then return "in" end
+            return nil
+        end
+        if probe then return "split" end
+        local a, b = CopyPart(p), CopyPart(p)
+        a.cand[k] = v
+        b.cand[k] = not v
+        return a, b
+    end
+
+    local function MatchLink(p, cats)
+        local sorted = {}
+        for i = 1, #cats do sorted[i] = cats[i] end
+        table.sort(sorted)
+        return { key = "and:" .. table.concat(sorted, "+"), tokens = p.tokens,
+            cand = next(p.cand) and p.cand or nil, cats = sorted }
+    end
+
+    -- nil when Match All does not apply; empty when its picks can never match; else
+    -- the painted splits (block order) followed by the rest of the group.
+    local function MatchAllChain(cfg)
+        local rest, cats = MatchBase(cfg)
+        if rest == nil then return nil end
+        if not rest then return {} end
+        local chain = {}
+        local list = cfg.fxList
+        if list then
+            local inSet, seen = {}, {}
+            for i = 1, #cats do inSet[cats[i]] = true end
+            for i = 1, #list do
+                local e = list[i]
+                local f = e.filters
+                if f and PAB_FxEntryActive(e) then
+                    -- First block wins: one naming a category the rest already
+                    -- belongs to paints all of it, and no later block reaches it.
+                    local hit = false
+                    for j = 1, #DEBUFF_FILTER_ORDER do
+                        local key = DEBUFF_FILTER_ORDER[j]
+                        if f[key] then
+                            if inSet[key] then
+                                hit = true
+                            else
+                                local class = ClassByKey(key)
+                                if class and Relate(rest, class, true) == "in" then
+                                    inSet[key] = true
+                                    cats[#cats + 1] = key
+                                    hit = true
+                                end
+                            end
+                        end
+                    end
+                    if hit then break end
+                    for j = 1, #DEBUFF_FILTER_ORDER do
+                        local key = DEBUFF_FILTER_ORDER[j]
+                        if f[key] and not seen[key] then
+                            seen[key] = true
+                            local class = ClassByKey(key)
+                            local a, b
+                            if class then a, b = Relate(rest, class) end
+                            if type(a) == "table" then
+                                local pc = {}
+                                for n = 1, #cats do pc[n] = cats[n] end
+                                pc[#pc + 1] = key
+                                chain[#chain + 1] = MatchLink(a, pc)
+                                rest = b
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        chain[#chain + 1] = MatchLink(rest, cats)
+        return chain
+    end
+
+    -- The debuff chain for a bar: Match All when it applies, else the union.
+    DebuffChainFor = function(cfg)
+        local chain = MatchAllChain(cfg)
+        if chain then return chain end
+        return BuildChain("HARMFUL", function(class) return ClassEnabled(class, false, cfg) or (PAB_FxSafeToForce(class) and PAB_FxWantsCategory(cfg.fxList, class.key)) end, DebuffCatchAllOn(cfg), DebuffSubtractFn(cfg))
+    end
+
+    -- Options-page empty warning: Match All picks that can never match together.
+    -- The builder's own test, so the two never disagree. ns.PAB_DebuffBarHasContent
+    -- stays as it is (the one-shot EnsureBarEnable migration reads it).
+    function ns.PAB_DebuffMatchEmpty(cfg)
+        return cfg ~= nil and MatchBase(cfg) == false
+    end
 end
 
 -- MergeCandidateFilters (below) merges `extra` onto a copy of `base`, nil-safe both
@@ -927,7 +1686,7 @@ end
 -- same size share one variant, everything else riding along via the shallow copy.
 -- Rebuilt unconditionally every pass (settings-apply frequency) rather than
 -- fingerprint-cached.
-local function EnsurePabSizedStyle(baseKey, size)
+local function EnsurePabSizedStyle(baseKey, size, shape)
     local base = AK.styles[baseKey]
     if not base then return baseKey end
     local variantKey = baseKey .. ":sz" .. tostring(size)
@@ -935,54 +1694,62 @@ local function EnsurePabSizedStyle(baseKey, size)
     for k, val in pairs(base) do v[k] = val end
     -- Snapped like BuildStyle's own width/height (same button SetSize path, so a raw
     -- value reintroduces the 1px border/icon disagreement); the variant KEY stays
-    -- keyed by the raw size.
-    local PP = EllesmereUI.PP
-    v.width = PP.Scale(size)
-    v.height = PP.Scale(size)
+    -- keyed by the raw size. Shape-expand applies the same as BuildStyle's own
+    -- iconSize -- base already carries iconShape/shapeMaskPath/etc via the shallow
+    -- copy above, only width/height need recomputing for this variant's own size.
+    v.width = PabSnap(PabShapedSize(size, shape))
+    v.height = PabSnap(PabShapedSize(size, shape))
     AK.styles[variantKey] = v
     AK.RestyleSoon(variantKey)
     return variantKey
 end
 
+local function BuildGroupLayout(cfg, gap, rowGap, size)
+    rowGap = rowGap or gap
+    size = PabSnap(PabShapedSize(size or cfg.iconSize or 32, cfg.iconShape))
+    gap = PabSnap(gap)
+    rowGap = PabSnap(rowGap)
+    return {
+        elementWidth = size,
+        elementHeight = size,
+        elementSpacing = gap,
+        lineSpacing = rowGap,
+        -- ZERO on purpose: the engine's flow layout advances the cursor by
+        -- elementSpacing AFTER every element, the last one of a group
+        -- included, so a group boundary already carries one `gap`. Adding
+        -- groupSpacing on top doubled it -- visible as a wider seam between
+        -- the weapon-enchant cells and the first buff, and between the
+        -- catch-all and spells groups.
+        groupSpacing = 0,
+        groupLineSpacing = rowGap,
+    }
+end
+
 local function ApplyGroupConfig(container, chain, declaredSet, styleKey, effectiveMax, gap, rowGap, cfg, extraCand)
     local sortMethod = ResolveSortMethod(cfg)
     local sortDirection = ResolveSortDirection(cfg)
-    -- elementSpacing = icon-to-icon gap in a row; lineSpacing = gap between wrapped
-    -- rows within a group; group*Spacing = gap to the NEXT group on the same
-    -- container. elementSpacing/groupSpacing stay tied to `gap` (padding);
-    -- lineSpacing/groupLineSpacing use `rowGap` (defaults to `gap`) so row-to-row
-    -- distance is overridable independently of icon-to-icon spacing (cfg.rowSpacing in
-    -- the Settings Schema comment). Container-level padding is a THIRD, unrelated
-    -- concept: the OUTER edge inset, fixed at 0 elsewhere and never affected by either.
-    rowGap = rowGap or gap
-    -- Snap both to the physical pixel grid before the native engine's layout math
-    -- (SetAuraGroupLayout below): raw values can land the engine's OWN internal row
-    -- positioning a hair off a pixel boundary at a non-pixel-perfect UIParent scale,
-    -- which the border (independently pixel-perfect via GetEffectiveScale) then
-    -- visibly disagrees with by ~1px.
-    local PP = EllesmereUI.PP
-    gap = PP.Scale(gap)
-    rowGap = PP.Scale(rowGap)
-    local layout = {
-        elementSpacing = gap,
-        lineSpacing = rowGap,
-        groupSpacing = gap,
-        groupLineSpacing = rowGap,
-    }
-
+    -- elementSpacing = icon-to-icon gap in a row, and it also separates two
+    -- groups on one line (see BuildGroupLayout's zero groupSpacing);
+    -- lineSpacing = gap between wrapped rows within a group, tied to `rowGap`
+    -- (defaults to `gap`) so row-to-row distance is overridable independently of
+    -- icon-to-icon spacing (cfg.rowSpacing in the Settings Schema comment).
+    -- Container-level padding is a THIRD, unrelated concept: the OUTER edge inset,
+    -- fixed at 0 elsewhere and never affected by either.
     local active = {}
     for i = 1, #chain do
         local link = chain[i]
         -- Size override, debuffs only: cfg.fxList is nil for buffs, so szOv is always
         -- nil there.
-        local szOv = PAB_FxSizeFor(cfg.fxList, link.key)
+        local szOv = PAB_FxSizeFor(cfg.fxList, link.cats or link.key)
+        local layout = BuildGroupLayout(cfg, gap, rowGap, szOv)
         -- Token strings are declaration-fixed too, so the effective key embeds the
         -- link's token set: a changed negation shape (subtract flips, class-set edits)
         -- declares a fresh variant instead of leaving a stale filter on the old group.
-        -- link.key alone stays the fx CATEGORY identity (d.dmCat / PAB_FxSizeFor).
+        -- link.key alone stays the fx CATEGORY identity (d.dmCat / PAB_FxSizeFor);
+        -- a Match All link carries a category list instead (link.cats, named by its key).
         local effKey = link.key .. "|" .. table.concat(link.tokens, "")
         if szOv then effKey = effKey .. "|sz" end
-        local linkStyleKey = szOv and EnsurePabSizedStyle(styleKey, szOv) or styleKey
+        local linkStyleKey = szOv and EnsurePabSizedStyle(styleKey, szOv, cfg.iconShape) or styleKey
         local candidateFilters
         if link.cand then
             -- link.cand is from the shared class vocabulary -- copy it so the merges
@@ -1014,7 +1781,7 @@ local function ApplyGroupConfig(container, chain, declaredSet, styleKey, effecti
         if variant > 0 then effKey = effKey .. "#" .. variant end
         active[effKey] = true
         if not declaredSet[effKey] then
-            local catKey = link.key
+            local catKey = link.cats or link.key
             AK.AddGroupToContainer(container, {
                 key = effKey,
                 filter = link.tokens,
@@ -1023,6 +1790,7 @@ local function ApplyGroupConfig(container, chain, declaredSet, styleKey, effecti
                 candidateFilters = candidateFilters,
                 sortMethod = sortMethod,
                 sortDirection = sortDirection,
+                layout = layout,
                 -- Icon Effects Per-Filter: stamps this button's category (matched
                 -- against fxList blocks by PAB_ApplyDmFx) and arms the glow/border
                 -- overlay inside the one legal creation window. style.applyExtra runs
@@ -1112,44 +1880,79 @@ local function MaxIconSizeFor(isBuff, cfg)
     end
     -- Snap to the physical pixel grid (same reasoning as ApplyGroupConfig's gap/rowGap
     -- snap): a raw iconSize also feeds the container's cross-axis extent math
-    -- (ComputeGrid) at a non-pixel-perfect UIParent scale.
-    local PP = EllesmereUI.PP
-    return PP.Scale(size)
+    -- (ComputeGrid) at a non-pixel-perfect UIParent scale. Shape-expand applied last so
+    -- the bar frame's footprint (ComputeGrid) always matches the buttons' real size.
+    -- Second value: the unsnapped size, for ComputeGrid's design extent.
+    local shaped = PabShapedSize(size, cfg.iconShape)
+    return PabSnap(shaped), shaped
 end
 
+-- Engine-declared weapon-enchant slots (AuraContainerItemEnchantmentSlot:
+-- main hand, off hand, ranged). Only the first two are reachable in current
+-- retail content, but the engine declares all three, so anything reserving
+-- space for them must tolerate three.
+local ENCH_SLOT_COUNT = 3
+
 local function ComputeGrid(isBuff, cfg)
-    local iconSize = MaxIconSizeFor(isBuff, cfg)
+    local iconSize, rawIconSize = MaxIconSizeFor(isBuff, cfg)
     local pad = cfg.padding or 5
     local rowGap = cfg.rowSpacing or 12
+    local layoutPad = PabSnap(pad)
+    local layoutRowGap = PabSnap(rowGap)
     local cols = math.max(1, cfg.iconsPerRow or (isBuff and 11 or 8))
     local rows = math.max(1, cfg.maxRows or (isBuff and 3 or 2))
     local configuredMax = cfg.maxTotal or (isBuff and 32 or 16)
     local effectiveMax = math.min(configuredMax, rows * cols)
     -- Actual rows needed for the effective cap, never more than the row limit
     local usedRows = math.min(rows, math.max(1, math.ceil(effectiveMax / cols)))
+    -- How many weapon-enchant slots may be DECLARED on this bar. A grid under
+    -- three cells declares only what it can hold (main hand first), so the
+    -- cells can never spill out of it. This is not a budget: an inactive slot
+    -- reserves nothing, only a cell that actually shows costs one (BuffAuraMax).
+    local enchSlots = 0
+    if isBuff and ns.PAB_EnchantsOn(cfg) then
+        enchSlots = math.min(ENCH_SLOT_COUNT, effectiveMax)
+    end
     -- `lineExtent` is the icons' own extent on the line axis (iconsPerRow
     -- icons of iconSize + gaps); `crossExtent` is the other axis (lines actually used).
     -- Horizontal growth: a "line" is a row, so lineExtent -> width. Vertical growth
-    -- (Up/Down): a "line" is a column, so lineExtent -> height -- see
+    -- modes: a "line" is a column, so lineExtent -> height -- see
     -- CornerFor/BuildContainerSpec for the matching growthH/growthV swap.
-    local lineExtent = cols * iconSize + (cols - 1) * pad
-    -- Wrap budget handed to the engine (AK.SetContainerRowWidth / layout.rowWidth),
-    -- deliberately NOT lineExtent: the engine reserves a TRAILING elementSpacing
-    -- after every element (not only between), so a full line needs
-    -- cols * (icon + spacing) or the last icon of every row wraps. lineExtent
-    -- still sizes the bar's own frame, so the drag box measures the icons, not
-    -- the phantom trailing gap (the preview builder models the same and drops
-    -- the trailing gap).
-    local rowWidth = lineExtent + pad
-    local crossExtent = usedRows * iconSize + (usedRows - 1) * rowGap
-    local vertical = (cfg.growDirection == "UP" or cfg.growDirection == "DOWN")
+    local lineExtent = cols * iconSize + (cols - 1) * layoutPad
+    -- Wrap budget handed to the engine. At POSITIVE spacing the engine reserves a
+    -- TRAILING elementSpacing after every element (not only between), so a full
+    -- line needs cols * (icon + spacing) or the last icon of every row wraps --
+    -- field-confirmed twice, most recently 2026-08-14 (11-per-row wrapped at 10
+    -- without the trailing pad). At NEGATIVE spacing that same trailing reserve
+    -- makes the final icon wrap EARLY, so the budget adds nothing there.
+    -- lineExtent still sizes the bar's own frame either way, so the drag box
+    -- measures the icons, not the phantom trailing gap.
+    local rowWidth = math.max(iconSize, lineExtent) + math.max(0, layoutPad)
+    local crossExtent = usedRows * iconSize + (usedRows - 1) * layoutRowGap
+    local vertical = (cfg.growDirection == "UP" or cfg.growDirection == "DOWN" or cfg.growDirection == "CENTER_VERTICAL")
     local width = vertical and crossExtent or lineExtent
     local height = vertical and lineExtent or crossExtent
+    -- Reference boxes for stored positions (see BarAnchorOffset): the design extent
+    -- from the raw config numbers, identical at every resolution, and the legacy
+    -- extent the pre-fix PP.Scale truncation produced at this resolution.
+    local PP = EllesmereUI.PP
+    local legacyIcon, legacyPad, legacyRowGap = PP.Scale(rawIconSize), PP.Scale(pad), PP.Scale(rowGap)
+    local designLine = cols * rawIconSize + (cols - 1) * pad
+    local designCross = usedRows * rawIconSize + (usedRows - 1) * rowGap
+    local legacyLine = cols * legacyIcon + (cols - 1) * legacyPad
+    local legacyCross = usedRows * legacyIcon + (usedRows - 1) * legacyRowGap
     return {
+        -- The bar's WHOLE icon budget (Max Icons), weapon-enchant cells
+        -- included -- BuffAuraMax takes the showing ones off it.
         effectiveMax = effectiveMax,
+        enchSlots = enchSlots,
         rowWidth = rowWidth,
         width = width,
         height = height,
+        designWidth = vertical and designCross or designLine,
+        designHeight = vertical and designLine or designCross,
+        legacyWidth = vertical and legacyCross or legacyLine,
+        legacyHeight = vertical and legacyLine or legacyCross,
         rowGap = rowGap,
     }
 end
@@ -1168,29 +1971,24 @@ end
 ns.PAB_DefaultBuffsCfg = DefaultBuffsCfg
 ns.PAB_DefaultDebuffsCfg = DefaultDebuffsCfg
 
--- True while the default Buffs bar shows NOTHING but weapon enchants: the
--- opt-in is on and neither broad-content mode admits generic buffs. Filters /
--- Extra Spells are deliberately NOT considered -- they resolve to a finite
--- add-set that comes and goes as the user edits it, and letting that flip the
--- bar's name and grid underneath them would be unpredictable.
-function ns.PAB_IsWeaponEnchantsOnly(cfg)
-    return cfg ~= nil and cfg.showWeaponEnchants == true
-        and cfg.showAllBuffs == false and cfg.hasDuration ~= true
+-- Weapon enchants ride the default Buffs bar whenever one of its broad-content
+-- modes (All Buffs or Has Duration) is on: oils and imbues are not auras, so
+-- the catch-all group cannot admit them and the engine's item-enchantment
+-- source stands in for it. No opt-in of their own -- the old "Weapon
+-- Enchants" Filters row only existed while they had to be drawn by hand --
+-- and custom buff bars never carry them.
+function ns.PAB_EnchantsOn(cfg)
+    if not cfg or (cfg.showAllBuffs == false and cfg.hasDuration ~= true) then return false end
+    local s = PAB()
+    return s ~= nil and s.defaultBuffs == cfg
 end
 
--- Default Buffs bar display name, following what the bar actually shows.
--- Weapon enchants are a content source of their own, so they rename the bar
--- outright when nothing else is on and append to it otherwise; Has Duration
--- counts as a broad buff mode here, the bar still leads with generic buffs.
---
--- Returns the RAW English key: unlock mode stores element labels untranslated
--- (EUI_UnlockMode.lua's GetBarLabel hands back elem.label verbatim), and the
--- options page wraps the result in L() itself. Defined here, next to the cfg
--- it reads, so the options page and the unlock element cannot drift apart.
+-- Default Buffs bar display name. Returns the RAW English key: unlock mode
+-- stores element labels untranslated (EUI_UnlockMode.lua's GetBarLabel hands
+-- back elem.label verbatim), and the options page wraps the result in L()
+-- itself. One definition for both callers.
 function ns.PAB_DefaultBuffsName(cfg)
-    if not (cfg and cfg.showWeaponEnchants == true) then return "Buffs" end
-    if ns.PAB_IsWeaponEnchantsOnly(cfg) then return "Weapon Enchants" end
-    return "Buffs & Weapon Enchants"
+    return "Buffs"
 end
 
 -- One-time seed of the default Buffs/Debuffs bars' position/size/grid from Blizzard's
@@ -1266,10 +2064,9 @@ end
 -- SkinAuraButton sized duration AND stack-count font strings from cfg.textSize, NOT
 -- the duration-only/stack-only split the old External Defensives module uses.
 -- noBorderDebuffs -> debuffCfg.borderSize = 0 (debuffs-only override, applied after
--- the shared borderSize above). NOT migrated, no PAB cfg field exists (known gap):
--- borderTexture/borderTextureOffset(Y)/borderTextureShiftX/Y/borderBehind,
--- durationFormat. Old buffIconZoom/debuffIconZoom are also skipped -- PAB has its own
--- per-bar iconZoom.
+-- the shared borderSize above). Border texture/offset/layer fields now map directly;
+-- durationFormat remains unsupported. Old buffIconZoom/debuffIconZoom are skipped --
+-- PAB has its own per-bar iconZoom.
 local function MigratePlayerAuraStyle(buffCfg, debuffCfg)
     local old = ns.db and ns.db.profile and ns.db.profile.playerAuras
     if not (old and old.enabled) then return end
@@ -1280,6 +2077,12 @@ local function MigratePlayerAuraStyle(buffCfg, debuffCfg)
         if old.borderG then cfg.borderG = old.borderG end
         if old.borderB then cfg.borderB = old.borderB end
         if old.borderA then cfg.borderA = old.borderA end
+        if old.borderTexture then cfg.borderTexture = old.borderTexture end
+        if old.borderTextureOffset ~= nil then cfg.borderTextureOffset = old.borderTextureOffset end
+        if old.borderTextureOffsetY ~= nil then cfg.borderTextureOffsetY = old.borderTextureOffsetY end
+        if old.borderTextureShiftX ~= nil then cfg.borderTextureShiftX = old.borderTextureShiftX end
+        if old.borderTextureShiftY ~= nil then cfg.borderTextureShiftY = old.borderTextureShiftY end
+        if old.borderBehind ~= nil then cfg.borderBehind = old.borderBehind end
         if old.showText ~= nil then cfg.durationShow = old.showText end
         if old.textSize then
             cfg.durationTextSize = old.textSize
@@ -1308,6 +2111,138 @@ local function EnsureDebuffFilterV2(s)
         end
     end
 end
+
+-- One-shot lane split (per profile): the filter dropdowns became two-lane (show/hide),
+-- so the single mode-dependent selection splits into cfg.filters/classFilters (SHOW)
+-- and cfg.negFilters/negClassFilters (HIDE). A broad-mode bar's checked entries were
+-- subtracting -- move them to the hide lane so rendering is bit-identical; add-mode
+-- selections already mean SHOW and stay put. Runs after EnsureDebuffFilterV2.
+local function EnsureFilterLanes(s)
+    if s.pabFilterLanesV1 then return end
+    s.pabFilterLanesV1 = true
+    local function SplitBuff(bar)
+        if not bar then return end
+        if (bar.showAllBuffs ~= false or bar.hasDuration == true)
+            and bar.filters and next(bar.filters) then
+            bar.negFilters = bar.filters
+            bar.filters = nil
+        end
+    end
+    local function SplitDebuff(bar)
+        if not bar then return end
+        if bar.showAllDebuffs ~= false and bar.classFilters and next(bar.classFilters) then
+            bar.negClassFilters = bar.classFilters
+            bar.classFilters = nil
+        end
+    end
+    SplitBuff(s.defaultBuffs)
+    if s.customBuffBars then
+        for i = 1, #s.customBuffBars do SplitBuff(s.customBuffBars[i]) end
+    end
+    SplitDebuff(s.defaultDebuffs)
+    if s.customDebuffBars then
+        for i = 1, #s.customDebuffBars do SplitDebuff(s.customDebuffBars[i]) end
+    end
+end
+ns.PAB_EnsureFilterLanes = EnsureFilterLanes
+
+-- Content-source tests for the no-empty-selection rule: a bar always keeps at
+-- least one content source (a broad mode, a Show-lane filter, an Extra
+-- Spell). The hide lane is not a content source, and weapon enchants ride the
+-- broad modes (ns.PAB_EnchantsOn) rather than counting as one. Shared by the
+-- enable migration below and the options dropdowns' guards.
+local function BuffBarHasContent(bar, isDefault)
+    if bar.showAllBuffs ~= false or bar.hasDuration == true then return true end
+    if bar.filters and next(bar.filters) then return true end
+    if bar.spells and #bar.spells > 0 then return true end
+    return false
+end
+-- Debuff content besides the All Debuffs mode: Show-lane classes, or an Icon
+-- Effects block forcing a safe class on ("as if that Base Filter were on" --
+-- the chain builders' fx wrapper renders those categories even in add mode, so
+-- an fx-only bar is NOT empty).
+local function DebuffBarOtherContent(bar)
+    if bar.classFilters and next(bar.classFilters) then return true end
+    if bar.fxList then
+        local function AnyForced(list)
+            if not list then return false end
+            for i = 1, #list do
+                local class = list[i]
+                if PAB_FxSafeToForce(class) and PAB_FxWantsCategory(bar.fxList, class.key) then
+                    return true
+                end
+            end
+            return false
+        end
+        if AnyForced(VisibleTokenClasses()) or AnyForced(VisibleCandidateClasses()) then
+            return true
+        end
+    end
+    return false
+end
+local function DebuffBarHasContent(bar)
+    if bar.showAllDebuffs ~= false or bar.hasDuration == true then return true end
+    return DebuffBarOtherContent(bar)
+end
+ns.PAB_BuffBarHasContent = BuffBarHasContent
+ns.PAB_DebuffBarOtherContent = DebuffBarOtherContent
+ns.PAB_DebuffBarHasContent = DebuffBarHasContent
+
+-- One-shot (per profile), HISTORICAL: written when the phase-2 no-empty rule
+-- held (dropdown guards kept one content source alive). Those guards are gone
+-- (2026-08-15): empty selections are legal again and the options page warns
+-- loudly instead (red dropdown + bubble, AttachEmptyFilterWarn). The mapping
+-- below still runs once for pre-phase-2 profiles: a LEGACY bar with no
+-- content source rendered nothing, so it becomes All + disabled -- the same
+-- nothing on screen, with sensible content on re-enable. Post-stamp empties
+-- created through the dropdown are left exactly as the user set them. Runs
+-- after EnsureFilterLanes (lanes must be split before emptiness is judged;
+-- a broad-mode bar is never empty either way).
+local function EnsureBarEnable(s)
+    EnsureFilterLanes(s)
+    -- One-shot: the "Weapon Enchants" opt-in is gone (the cells follow the
+    -- broad-content modes, ns.PAB_EnchantsOn). An enchants-only bar had its
+    -- grid pinned to 3x1x3 with the user's own grid stashed: put that back
+    -- and turn All Buffs on, so the enchants it showed keep showing.
+    if not s.pabEnchantsAutoV1 then
+        s.pabEnchantsAutoV1 = true
+        local d = s.defaultBuffs
+        if d then
+            local saved = d.enchGridSaved
+            if saved then
+                d.iconsPerRow, d.maxRows, d.maxTotal = saved.iconsPerRow, saved.maxRows, saved.maxTotal
+                d.enchGridSaved = nil
+                d.showAllBuffs = nil
+            end
+            d.showWeaponEnchants = nil
+        end
+    end
+    if s.pabBarEnableV1 then return end
+    s.pabBarEnableV1 = true
+    local function MapBuff(bar, isDefault)
+        if not bar then return end
+        if bar.enabled ~= false and not BuffBarHasContent(bar, isDefault) then
+            bar.showAllBuffs = nil -- All Buffs back on (nil = on)
+            bar.enabled = false
+        end
+    end
+    local function MapDebuff(bar)
+        if not bar then return end
+        if bar.enabled ~= false and not DebuffBarHasContent(bar) then
+            bar.showAllDebuffs = nil
+            bar.enabled = false
+        end
+    end
+    MapBuff(s.defaultBuffs, true)
+    if s.customBuffBars then
+        for i = 1, #s.customBuffBars do MapBuff(s.customBuffBars[i], false) end
+    end
+    MapDebuff(s.defaultDebuffs)
+    if s.customDebuffBars then
+        for i = 1, #s.customDebuffBars do MapDebuff(s.customDebuffBars[i]) end
+    end
+end
+ns.PAB_EnsureBarEnable = EnsureBarEnable
 
 local function SeedDefaultBuffsDebuffsFromLegacySources(s)
     if s.pabEditModeSeeded then return end
@@ -1407,6 +2342,12 @@ local function EnsureExtDefCustomBar(s)
         if from.sortDirection then bar.sortDirection = from.sortDirection end
         if from.borderSize then bar.borderSize = from.borderSize end
         if from.borderR then bar.borderR, bar.borderG, bar.borderB, bar.borderA = from.borderR, from.borderG, from.borderB, from.borderA end
+        if from.borderTexture then bar.borderTexture = from.borderTexture end
+        if from.borderTextureOffset ~= nil then bar.borderTextureOffset = from.borderTextureOffset end
+        if from.borderTextureOffsetY ~= nil then bar.borderTextureOffsetY = from.borderTextureOffsetY end
+        if from.borderTextureShiftX ~= nil then bar.borderTextureShiftX = from.borderTextureShiftX end
+        if from.borderTextureShiftY ~= nil then bar.borderTextureShiftY = from.borderTextureShiftY end
+        if from.borderBehind ~= nil then bar.borderBehind = from.borderBehind end
     end
     local pos = s.extDefPos or (legacy and legacy.unlockPos)
     if pos and pos.point then
@@ -1425,19 +2366,124 @@ local buffsParent, debuffsParent
 -- ApplyGroupConfig): reset only when a container is (re-)created, never on a live
 -- settings change.
 local declared = { buffs = {}, debuffs = {} } -- buffs: only the "Show All Buffs" catch-all key ("all"); debuffs: every class-token chain key
-local lastSize = { buffs = nil, debuffs = nil } -- {w=,h=} last-applied grid size, for CENTER-anchor compensation (see ApplyLiveConfig)
+local lastSize = { buffs = nil, debuffs = nil } -- {w=,h=} last-applied grid size, for fixed-edge compensation (see ApplyLiveConfig)
 local buffsSlotSig -- signature of the default Buffs bar's last-applied resolved spell list (ns.PAB_ResolveSpells), mirrors customBuffSig[barId] for the per-bar slots model
 local RegisterPABUnlock -- forward-declared; defined after CreateBars, called from it
+local SyncCancelCVar -- forward-declared; defined after RestyleBars, called from CreateBars/RestyleBars/ReloadCustomBuffBarImpl
+local vehicleHidden = false -- vehicle ride state (assigned in the recovery section at file bottom); feeds pabSuppressed below
+local pabSuppressed = false -- vehicle ride OR degraded-filter window: SetParentShownSafe dims the parents instead of hiding them (see ApplyVehicleHidden)
+local ClearDegraded -- forward-declared; defined in the recovery section at file bottom, called from PAB_SetEnabled
 -- Last label the Buffs mover was registered under, so ApplyLiveConfig can
 -- re-register on a name change without doing it on every slider drag.
 local lastUnlockBuffLabel
 local ReloadAllCustomBars -- forward-declared; defined after CreateBars (custom bars section), called from it
 local PAB_MaybeRefreshPreview -- forward-declared; assigned in the options-page preview section, called from every live-apply function so an open bar-detail preview box tracks slider drags without those functions knowing it exists
 
+-- Last-applied growDirection per live container (weak keys); written by
+-- ApplyContainerAnchorAndGrowth, read by the restricted-apply gate below.
+local containerDirections = setmetatable({}, { __mode = "k" })
+
+local restrictedApplies = {}
+local restrictionHooked = false
+-- Defers ONLY the direction-change reconfigure (Hide/SetUnit/UpdateAllAuras +
+-- resize) to the restriction lift. Ordinary container-level re-drives are
+-- restriction-legal (they ran mid-combat for weeks pre-centered-growth), and
+-- the cinematic/faction/vehicle recovery lane DEPENDS on them running inside
+-- instanced combat -- a blanket defer would leave restored bars showing
+-- degraded content until the combat edge.
+local function DeferRestrictedApply(key, fn, container, dir)
+    local applied = container and containerDirections[container]
+    if not (applied and applied ~= (dir or "LEFT")) then return false end
+    AK = AK or (EllesmereUI and EllesmereUI.AuraKit)
+    if not (AK and AK.AurasRestricted and AK.AurasRestricted()) then return false end
+    restrictedApplies[key] = fn
+    if not restrictionHooked then
+        restrictionHooked = true
+        AK.OnRestrictionLift(function()
+            if not next(restrictedApplies) then return end
+            local pending = restrictedApplies
+            restrictedApplies = {}
+            for _, apply in pairs(pending) do apply() end
+        end)
+    end
+    return true
+end
+
+-- One-shot OOC reconciler for parent-geometry passes skipped inside lockdown. Every
+-- bar parent has the engine aura container ANCHORED to it, which makes the PARENT's
+-- own SetSize/ClearAllPoints/SetPoint ADDON_ACTION_BLOCKED in combat (a protected
+-- anchor-dependent poisons its anchor ancestor's geometry) -- while the cinematic/
+-- faction/vehicle recovery lane legitimately re-drives config mid-combat. Keyed and
+-- coalesced; the event is registered only while something is queued, so idle cost is
+-- zero.
+local pabRegenApplies = {}
+local pabRegenFrame
+local function QueuePABRegenApply(key, fn)
+    pabRegenApplies[key] = fn
+    if not pabRegenFrame then
+        pabRegenFrame = CreateFrame("Frame")
+        pabRegenFrame:SetScript("OnEvent", function(self)
+            self:UnregisterEvent("PLAYER_REGEN_ENABLED")
+            local pending = pabRegenApplies
+            pabRegenApplies = {}
+            for _, apply in pairs(pending) do apply() end
+        end)
+    end
+    pabRegenFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+end
+
+-- Combat-safe Show/Hide for a bar PARENT. The engine aura container is a
+-- CHILD of the parent, so the parent's own Show/Hide is ADDON_ACTION_BLOCKED
+-- in lockdown exactly like its SetSize/SetPoint (field report: the
+-- cinematic/faction recovery lane re-asserting the default bars mid-combat).
+-- No call at all when the state already matches; in combat the visual verdict
+-- lands through alpha (never protected) and the real Show/Hide is replayed at
+-- regen via `recompute`, which re-derives the verdict at that time.
+-- Suppression (pabSuppressed) rides on alpha OUT of combat too, never on the
+-- shown state: it lifts on transitions that routinely land mid-combat, and a
+-- real Hide taken while suppressed cannot be undone until the next regen edge.
+-- Field report (Kings' Rest, Entomb): the tomb is a vehicle and being inside it
+-- drops the player's combat, so the ride's hide replayed for real at that regen
+-- and the exit's show was blocked -- the bars stayed gone for the whole boss
+-- pulled afterwards.
+local function SetParentShownSafe(key, parent, want, recompute)
+    want = want and true or false
+    local locked = InCombatLockdown()
+    local shown = parent:IsShown()
+    if issecretvalue and issecretvalue(shown) then shown = nil end
+    local alpha = (pabSuppressed or (locked and not want)) and 0 or 1
+    if parent:GetAlpha() ~= alpha then parent:SetAlpha(alpha) end
+    if shown == want then return end
+    if locked then
+        QueuePABRegenApply("shown:" .. key, recompute)
+        return
+    end
+    parent:SetShown(want)
+end
+
+-- Default-bar enable toggle (cfg.enabled, nil = enabled): the parent hides
+-- exactly like a disabled custom bar's. Vehicle suppression still wins while
+-- active -- SetParentShownSafe keeps it on alpha, so this pass carries the
+-- enable verdict without un-suppressing anything (a bar built mid-ride used to
+-- come up at full alpha here).
+local function ApplyDefaultBarShown(isBuff)
+    local s = PAB()
+    if not s then return end
+    local parent
+    if isBuff then parent = buffsParent else parent = debuffsParent end
+    if not parent then return end
+    local cfg = isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)
+    -- Master enable + Use Blizzard Buffs both stand the defaults down (the
+    -- recovery lane can reach this while disabled-awaiting-reload).
+    SetParentShownSafe(isBuff and "default-buffs" or "default-debuffs", parent,
+        s.enabled == true and cfg.enabled ~= false and s.useBlizzardBuffs ~= true,
+        function() ApplyDefaultBarShown(isBuff) end)
+end
+
 -- Grow direction. AK.ApplyContainerLayout only applies growth when BOTH growthH and
 -- growthV are set. Values are AnchorUtil.FlowDirection members, NOT strings
 -- (Blizzard_SharedXMLBase/AnchorUtil.lua: Left=-1, Right=1, Up=1, Down=-1); our
--- settings store "LEFT"/"RIGHT" strings, matching EUI_UnlockMode.lua's dropdown
+-- settings store uppercase direction strings, matching EUI_UnlockMode.lua's dropdown
 -- `val` convention.
 --
 -- CRITICAL: AnchorUtil.ApplyFlowLayout positions every element via
@@ -1460,28 +2506,44 @@ local PAB_MaybeRefreshPreview -- forward-declared; assigned in the options-page 
 local function ToGrowthH(dirStr, wrapStr)
     local FlowDir = AnchorUtil and AnchorUtil.FlowDirection
     if not FlowDir then return nil end
+    if dirStr == "CENTER_VERTICAL" then return FlowDir.Right end
     if dirStr == "UP" or dirStr == "DOWN" then
         return wrapStr == "RIGHT" and FlowDir.Right or FlowDir.Left
     end
-    return dirStr == "RIGHT" and FlowDir.Right or FlowDir.Left
+    return (dirStr == "RIGHT" or dirStr == "CENTER_HORIZONTAL") and FlowDir.Right or FlowDir.Left
 end
-local function ToGrowthV(dirStr)
+-- Gated on the GROWTH direction, never on the wrap value itself (same shape as
+-- ToGrowthH above). iconWrapDirection is one shared field whose Up/Down values are
+-- only offered for LEFT/RIGHT growth, so a value left behind by a growth-direction
+-- change must stay inert everywhere else: reading it unconditionally flipped
+-- CENTER_VERTICAL's columns to grow Up out of its fixed "TOP" anchor, and stacked
+-- CENTER_HORIZONTAL's rows upward, from a setting whose cog those modes never show.
+local function ToGrowthV(dirStr, wrapStr)
     local FlowDir = AnchorUtil and AnchorUtil.FlowDirection
     if not FlowDir then return nil end
     if dirStr == "UP" then return FlowDir.Up end
     if dirStr == "DOWN" then return FlowDir.Down end
-    return FlowDir.Down -- horizontal growth: rows always wrap downward
+    if dirStr == "LEFT" or dirStr == "RIGHT" then
+        return wrapStr == "UP" and FlowDir.Up or FlowDir.Down
+    end
+    return FlowDir.Down -- centered growth: rows always wrap downward
 end
 -- Corner = the flow's fixed start point = (opposite of growthV side) + (opposite of
 -- growthH side), same rule horizontal or vertical (LEFT/RIGHT: growthV is always Down
 -- -> TOP component; growthH Right/Left -> LEFT/RIGHT component).
 local function CornerFor(dirStr, wrapStr)
+    if dirStr == "CENTER_VERTICAL" then return "TOP" end
     if dirStr == "UP" or dirStr == "DOWN" then
         local vSide = (dirStr == "UP") and "BOTTOM" or "TOP"
         local hSide = (wrapStr == "RIGHT") and "LEFT" or "RIGHT"
         return vSide .. hSide
     end
-    return dirStr == "RIGHT" and "TOPLEFT" or "TOPRIGHT"
+    if dirStr == "LEFT" or dirStr == "RIGHT" then
+        local vSide = (wrapStr == "UP") and "BOTTOM" or "TOP"
+        local hSide = (dirStr == "RIGHT") and "LEFT" or "RIGHT"
+        return vSide .. hSide
+    end
+    return (dirStr == "CENTER_HORIZONTAL") and "TOPLEFT" or "TOPRIGHT"
 end
 
 -- Shared by every container, default and custom alike: builds the AK.RequestContainer
@@ -1493,16 +2555,17 @@ end
 local function BuildContainerSpec(parent, cfg, grid)
     local dir = cfg.growDirection or "LEFT"
     local wrap = cfg.iconWrapDirection or "LEFT"
-    local vertical = (dir == "UP" or dir == "DOWN")
-    local corner = CornerFor(dir, wrap)
-    return corner, {
-        point = { corner, parent, corner, 0, 0 },
+    local vertical = (dir == "UP" or dir == "DOWN" or dir == "CENTER_VERTICAL")
+    local layoutAnchor = dir == "CENTER_HORIZONTAL" and "LEFT" or CornerFor(dir, wrap)
+    local containerAnchor = (dir == "CENTER_HORIZONTAL" or dir == "CENTER_VERTICAL") and "CENTER" or layoutAnchor
+    return containerAnchor, {
+        point = { containerAnchor, parent, containerAnchor, 0, 0 },
         layout = {
-            anchorPoint = corner,
+            anchorPoint = layoutAnchor,
             padding = { 0, 0, 0, 0 },
             rowWidth = grid.rowWidth,
             growthH = ToGrowthH(dir, wrap),
-            growthV = ToGrowthV(dir),
+            growthV = ToGrowthV(dir, wrap),
         },
     }, vertical
 end
@@ -1513,16 +2576,29 @@ end
 -- the three cannot drift. The outer frame anchor is a plain SetPoint (not AK-managed),
 -- so it is live-settable like any other frame anchor.
 local function ApplyContainerAnchorAndGrowth(container, parent, cfg, grid)
-    local corner, spec, vertical = BuildContainerSpec(parent, cfg, grid)
+    local containerAnchor, spec, vertical = BuildContainerSpec(parent, cfg, grid)
+    local direction = cfg.growDirection or "LEFT"
+    local directionChanged = containerDirections[container] and containerDirections[container] ~= direction
+    containerDirections[container] = direction
+    if directionChanged then container:Hide() end
+
+    local size = PabSnap(cfg.iconSize or 32)
     container:ClearAllPoints()
-    container:SetPoint(corner, parent, corner, 0, 0)
-    AK.SetContainerAnchor(container, corner)
+    container:SetSize(size, size)
+    container:SetPoint(containerAnchor, parent, containerAnchor, 0, 0)
+    AK.SetContainerAnchor(container, spec.layout.anchorPoint)
     AK.SetContainerAxis(container, vertical)
     if spec.layout.growthH then
         AK.SetContainerGrowth(container, spec.layout.growthH, spec.layout.growthV)
     end
     AK.SetContainerPadding(container, 0, 0, 0, 0)
     AK.SetContainerRowWidth(container, grid.rowWidth)
+
+    if directionChanged then
+        container:SetUnit("player")
+        container:UpdateAllAuras()
+        container:Show()
+    end
 end
 
 -- Default anchor when no saved position exists yet. Independent per bar (bars must be
@@ -1544,34 +2620,122 @@ end
 -- dimension handling keeps both edges on whole pixels, while plain SnapForES would
 -- round the center itself and push edges onto half pixels; every other anchor point
 -- uses SnapForES.
-local function SnapBarPos(frame, point, relPoint, x, y)
+local function SnapBarPos(frame, point, relPoint, x, y, w, h)
     if not (x and y) then return x, y end
     local PP = EllesmereUI.PP
     local es = frame:GetEffectiveScale()
     local isCenterAnchor = (point == "CENTER" or point == nil)
         and (relPoint == "CENTER" or relPoint == nil)
+    -- w/h replace the frame's own size when given (legacy positions, BarAnchorOffset).
     if isCenterAnchor then
-        return PP.SnapCenterForDim(x, frame:GetWidth() or 0, es),
-            PP.SnapCenterForDim(y, frame:GetHeight() or 0, es)
+        return PP.SnapCenterForDim(x, w or frame:GetWidth() or 0, es),
+            PP.SnapCenterForDim(y, h or frame:GetHeight() or 0, es)
     end
     return PP.SnapForES(x, es), PP.SnapForES(y, es)
 end
 
+-- Pixel-rounding compensation. A stored position places a reference frame (see
+-- BarAnchorOffset); the live frame is the snapped grid, slightly larger or smaller.
+-- Returns the SetPoint offset that keeps the growth origin (the parent corner the
+-- container is pinned to, the center for centered growth) where the reference frame
+-- puts it, for a frame anchored at `point`. dw/dh are (reference - snapped) at apply
+-- time; ApplyLiveConfig also passes a reference size change to move a stored center
+-- with its origin.
+local OriginShift
+do
+    local FRAC_X = { TOPLEFT = 0, LEFT = 0, BOTTOMLEFT = 0, TOP = 0.5, CENTER = 0.5,
+        BOTTOM = 0.5, TOPRIGHT = 1, RIGHT = 1, BOTTOMRIGHT = 1 }
+    local FRAC_Y = { BOTTOMLEFT = 0, BOTTOM = 0, BOTTOMRIGHT = 0, LEFT = 0.5, CENTER = 0.5,
+        RIGHT = 0.5, TOPLEFT = 1, TOP = 1, TOPRIGHT = 1 }
+    function OriginShift(cfg, point, dw, dh)
+        local dir = cfg.growDirection or "LEFT"
+        local origin = (dir == "CENTER_HORIZONTAL" or dir == "CENTER_VERTICAL") and "CENTER"
+            or CornerFor(dir, cfg.iconWrapDirection or "LEFT")
+        point = point or "CENTER"
+        return (FRAC_X[origin] - (FRAC_X[point] or 0.5)) * dw,
+            (FRAC_Y[origin] - (FRAC_Y[point] or 0.5)) * dh
+    end
+end
+
+-- Pre-snap SetPoint offsets for a stored bar position. A position saved by an
+-- unlock-mode move since the rounding fix (pos.design) refers to the design frame.
+-- Any other position, defaults included, keeps the placement it had before the fix:
+-- its growth origin stays where the truncated legacy frame, snapped as before, put
+-- it at this resolution, until the bar is moved.
+local function BarAnchorOffset(frame, cfg, grid, pos)
+    local x, y = pos.x, pos.y
+    if not (x and y) then return x, y end
+    local rw, rh = grid.designWidth, grid.designHeight
+    if not pos.design then
+        rw, rh = grid.legacyWidth, grid.legacyHeight
+        x, y = SnapBarPos(frame or UIParent, pos.point, pos.relPoint or pos.point, x, y, rw, rh)
+    end
+    local dx, dy = OriginShift(cfg, pos.point, rw - grid.width, rh - grid.height)
+    return x + dx, y + dy
+end
+
+-- Unlock-mode savePos: x/y is the VISUAL position the mover hands over, `cur` the
+-- stored one. An unchanged position (a discard or an untouched commit writes back
+-- what loadPos returned) keeps `cur` as it is, so a legacy position only converts
+-- on a real move. Anything else is stored as a design position.
+local function MoverStorePos(frame, cfg, grid, cur, point, relPoint, x, y)
+    relPoint = relPoint or point
+    if not (x and y) then return { point = point, relPoint = relPoint, x = x, y = y } end
+    if cur and cur.point == point and (cur.relPoint or cur.point) == relPoint then
+        local cx, cy = BarAnchorOffset(frame, cfg, grid, cur)
+        if cx and cy and math.abs(x - cx) < 0.001 and math.abs(y - cy) < 0.001 then return cur end
+    end
+    local dx, dy = OriginShift(cfg, point, grid.designWidth - grid.width, grid.designHeight - grid.height)
+    return { point = point, relPoint = relPoint, x = x - dx, y = y - dy, design = true }
+end
+
+-- Centered growth needs a position whose meaning does not change with the mover's
+-- configured grid size. Rebase any edge-anchored saved position to CENTER/CENTER at
+-- the frame's current visual center before resizing it.
+local function RebaseBarPositionToCenter(frame, pos)
+    if pos and pos.point == "CENTER" and (pos.relPoint or pos.point) == "CENTER" then return pos end
+    local cx, cy = frame:GetCenter()
+    local ux, uy = UIParent:GetCenter()
+    if not (cx and cy and ux and uy) then return pos end
+    local x, y = cx - ux, cy - uy
+    local sx, sy = SnapBarPos(frame, "CENTER", "CENTER", x, y)
+    frame:ClearAllPoints()
+    frame:SetPoint("CENTER", UIParent, "CENTER", sx, sy)
+    -- design: centered growth has no rounding shift at CENTER, so the measured
+    -- center already is the design center (BarAnchorOffset).
+    return { point = "CENTER", relPoint = "CENTER", x = x, y = y, design = true }
+end
+
 -- Applies the saved position (if any) or the default to the given parent frame.
 -- Shared between initial creation and the unlock-mode applyPos callback so the two
--- never drift into different SetPoint logic.
-local function ApplyBarPosition(parent, isBuff)
-    local s = PAB()
-    local pos = s and s[BarPositionKey(isBuff)]
-    local def = isBuff and DEFAULT_POS.buffs or DEFAULT_POS.debuffs
-    parent:ClearAllPoints()
-    if pos and pos.point then
-        local x, y = SnapBarPos(parent, pos.point, pos.relPoint or pos.point, pos.x, pos.y)
-        parent:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, x, y)
-    else
-        local x, y = SnapBarPos(parent, def.point, def.relPoint, def.x, def.y)
-        parent:SetPoint(def.point, UIParent, def.relPoint, x, y)
+-- never drift into different SetPoint logic. `grid` is optional (computed when nil).
+-- An unlock-anchored bar belongs to the anchor: the stored position is only a
+-- snapshot of where the anchor put it at the last Save & Exit, stale once the
+-- target moves (a player frame riding a CDM whose width varies per spec or
+-- character), and nothing re-anchors a fixed-size bar afterwards. The stored
+-- position still seeds a parent with no point yet; the anchor then places it.
+local function ApplyBarPosition(parent, isBuff, grid)
+    local unlockKey = isBuff and "PAB_Buffs" or "PAB_Debuffs"
+    local anchored = EllesmereUI.IsUnlockAnchored and EllesmereUI.IsUnlockAnchored(unlockKey)
+    if anchored and parent:GetNumPoints() > 0 and EllesmereUI.ReapplyOwnAnchor then
+        EllesmereUI.ReapplyOwnAnchor(unlockKey)
+        return
     end
+    local s = PAB()
+    local posKey = BarPositionKey(isBuff)
+    local pos = s and s[posKey]
+    local def = isBuff and DEFAULT_POS.buffs or DEFAULT_POS.debuffs
+    local cfg = s and (isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s))
+    local p = (pos and pos.point) and pos or def
+    local x, y = p.x, p.y
+    if cfg then x, y = BarAnchorOffset(parent, cfg, grid or ComputeGrid(isBuff, cfg), p) end
+    parent:ClearAllPoints()
+    x, y = SnapBarPos(parent, p.point, p.relPoint or p.point, x, y)
+    parent:SetPoint(p.point, UIParent, p.relPoint or p.point, x, y)
+    if cfg and (cfg.growDirection == "CENTER_HORIZONTAL" or cfg.growDirection == "CENTER_VERTICAL") then
+        s[posKey] = RebaseBarPositionToCenter(parent, pos)
+    end
+    if anchored and EllesmereUI.ReapplyOwnAnchor then EllesmereUI.ReapplyOwnAnchor(unlockKey) end
 end
 
 -- Blizzard's player BuffFrame/DebuffFrame are superseded by this module: hide them so
@@ -1581,58 +2745,166 @@ end
 -- inside it, so nothing is tainted. Neither frame is protected/secure, so plain Hide()
 -- is safe with no lockdown concern.
 local blizzardAurasHidden = false
+-- True while PAB owns the buff/debuff display (the natives must stay
+-- hidden): master-enabled and not in Use Blizzard Buffs mode. The re-hide
+-- hooks below read this LIVE, so Disable All and Use Blizzard Buffs can
+-- hand the display back without a reload.
+local function PabOwnsNativeAuras()
+    local s = PAB()
+    return (s and s.enabled == true and s.useBlizzardBuffs ~= true) and true or false
+end
+
 local function HideBlizzardPlayerAuras()
     if blizzardAurasHidden then return end
     blizzardAurasHidden = true
     if BuffFrame then
         BuffFrame:Hide()
-        hooksecurefunc(BuffFrame, "Show", function() BuffFrame:Hide() end)
+        hooksecurefunc(BuffFrame, "Show", function()
+            if PabOwnsNativeAuras() then BuffFrame:Hide() end
+        end)
     end
     if DebuffFrame then
         DebuffFrame:Hide()
-        hooksecurefunc(DebuffFrame, "Show", function() DebuffFrame:Hide() end)
+        hooksecurefunc(DebuffFrame, "Show", function()
+            if PabOwnsNativeAuras() then DebuffFrame:Hide() end
+        end)
     end
 end
 
--- Shifts the default Buffs container inward by the active weapon-enchant
--- count (see EUI_UnitFrames_WeaponEnchants.lua): the enchant buttons occupy
--- the bar's first cells and the engine run starts after them -- Blizzard's
--- temp-enchants-first ordering. Zero enchants (or a filtered-out record)
--- leaves the anchor byte-identical. Full rows overflow the reserved grid by
--- the shift while an oil is up -- accepted; the shift is transient.
-local function ShiftBuffsForEnchants(container, parent, cfg, grid)
-    local n = (ns._weaponEnchPAB and ns.WeaponEnchants_Count and ns.WeaponEnchants_Count()) or 0
-    if n == 0 then return end
-    local corner = BuildContainerSpec(parent, cfg, grid)
-    local dir = cfg.growDirection or "LEFT"
-    local dx, dy = 0, 0
-    if dir == "RIGHT" then dx = 1 elseif dir == "LEFT" then dx = -1
-    elseif dir == "UP" then dy = 1 elseif dir == "DOWN" then dy = -1 end
-    local cell = EllesmereUI.PP.Scale(cfg.iconSize or 32) + (cfg.padding or 5)
-    container:ClearAllPoints()
-    container:SetPoint(corner, parent, corner, dx * n * cell, dy * n * cell)
+-- Hands the native display back mid-session (Disable All / Use Blizzard
+-- Buffs ON): the hooks above release once PabOwnsNativeAuras() is false, so
+-- an explicit Show restores Blizzard's frames without a reload. No-op if
+-- the natives were never hidden this session.
+local function ShowBlizzardPlayerAuras()
+    if not blizzardAurasHidden then return end
+    if PabOwnsNativeAuras() then return end
+    if BuffFrame then BuffFrame:Show() end
+    if DebuffFrame then DebuffFrame:Show() end
 end
 
--- Combat-path re-shift for enchant count changes: re-seating the CONTAINER
--- is combat-legal (plain SetPoint, same class as the merged-debuff ride),
--- but the full ApplyLiveConfig is not -- the secure enchant trio anchors
--- into the bar frame's family, which blocks the bar's own SetSize in
--- lockdown. Recomputes the live grid and re-seats ONLY the container,
--- INCLUDING the shift-to-zero reset when the last oil expires.
-function ns.PAB_ReShiftEnchants()
-    local s = PAB()
-    if not (AK and s and buffsContainer and buffsParent) then return end
-    local cfg = DefaultBuffsCfg(s)
-    local grid = ComputeGrid(true, cfg)
-    local corner = BuildContainerSpec(buffsParent, cfg, grid)
-    local n = (ns._weaponEnchPAB and ns.WeaponEnchants_Count and ns.WeaponEnchants_Count()) or 0
-    local dir = cfg.growDirection or "LEFT"
-    local dx, dy = 0, 0
-    if dir == "RIGHT" then dx = 1 elseif dir == "LEFT" then dx = -1
-    elseif dir == "UP" then dy = 1 elseif dir == "DOWN" then dy = -1 end
-    local cell = EllesmereUI.PP.Scale(cfg.iconSize or 32) + (cfg.padding or 5)
-    buffsContainer:ClearAllPoints()
-    buffsContainer:SetPoint(corner, buffsParent, corner, dx * n * cell, dy * n * cell)
+-- Re-asserts native visibility for the CURRENT profile/mode (profile swaps
+-- cross enable/useBlizzard modes in both directions): hide when PAB owns
+-- the display -- the first hide installs the hooks, later ones re-assert
+-- past the latch -- show when it does not.
+local function SyncNativeAuras()
+    if PabOwnsNativeAuras() then
+        if blizzardAurasHidden then
+            if BuffFrame then BuffFrame:Hide() end
+            if DebuffFrame then DebuffFrame:Hide() end
+        else
+            HideBlizzardPlayerAuras()
+        end
+    else
+        ShowBlizzardPlayerAuras()
+    end
+end
+
+-- Weapon enchants are not auras, so only the engine's own item-enchantment
+-- source renders them (see AK.AddItemEnchantmentsToContainer): a LEADING
+-- layout group on the Buffs container, flowed ahead of the aura run in every
+-- grow direction and in combat. They ride the bar's broad-content modes
+-- (ns.PAB_EnchantsOn: All Buffs or Has Duration on the default Buffs bar),
+-- with no opt-in of their own.
+local function BuildEnchantSpec(cfg, pad, rowGap, maxSlots)
+    local layout = BuildGroupLayout(cfg, pad, rowGap)
+    local placement = CustomAuraContainerItemEnchantmentPlacement
+    if placement then layout.placement = placement.BeforeAuraGroups end
+    local sortMethods = AuraContainerItemEnchantmentSortMethod
+    local sortDirs = AuraContainerSortDirection
+    return {
+        style = STYLE_BUFFS,
+        -- Marks the cell as a weapon enchant for the style pass (Blizzard
+        -- Style draws the stock temp-enchant ring on those only).
+        extraInit = AK.EnchantCellInit,
+        layout = layout,
+        hidePermanent = true,
+        maxSlots = maxSlots,
+        -- REVERSE keeps MAIN HAND adjacent to the aura run: the engine puts
+        -- the group's first element at the leading edge, and Slot order is
+        -- main hand, off hand, ranged.
+        sortMethod = sortMethods and sortMethods.Slot,
+        sortDirection = sortDirs and sortDirs.Reverse,
+    }
+end
+
+-- Declares them on `container` (idempotent) and re-applies their layout, so
+-- a live padding/icon-size change follows. Turning the row OFF is served by
+-- the content signature below instead: the engine has no addon-facing
+-- unregister, so the container has to be rebuilt for that.
+-- Wrapped in do...end: this file sits at Lua 5.1's 200-locals-per-chunk
+-- limit, so only the two helpers used below stay chunk-level locals.
+local BuffAuraMax, SyncEnchantEvents
+do
+    -- Inventory slots behind AuraContainerItemEnchantmentSlot, in the same order.
+    local ENCH_INV_SLOTS = { INVSLOT_MAINHAND or 16, INVSLOT_OFFHAND or 17, INVSLOT_RANGED or 18 }
+
+    -- Weapon enchants showing right now. Only duration-bearing ones render
+    -- (hidePermanent in BuildEnchantSpec), so an empty or permanently enchanted
+    -- slot costs nothing. Equipment state, not aura data: these returns carry no
+    -- secret flags, in restricted combat either.
+    local function ActiveEnchantCount(slots)
+        local api = C_PaperDollInfo and C_PaperDollInfo.GetTemporaryEnchantmentInfo
+        if not api then return 0 end
+        local n = 0
+        for i = 1, math.min(slots or 0, #ENCH_INV_SLOTS) do
+            local info = api(ENCH_INV_SLOTS[i])
+            if info and info.hasExpirationTime then n = n + 1 end
+        end
+        return n
+    end
+
+    -- Aura cap for the Buffs bar: "Max Icons" is the whole bar's budget, so the
+    -- cells actually showing come off it and the rendered total stays at the
+    -- configured number. Nothing is reserved for a slot that is not enchanted.
+    function BuffAuraMax(grid)
+        local slots = grid.enchSlots or 0
+        if slots <= 0 then return grid.effectiveMax end
+        return math.max(0, grid.effectiveMax - ActiveEnchantCount(slots))
+    end
+
+    -- The budget moves with the enchants, so an applied or expired oil re-applies
+    -- it. Registered ONLY while the row is on, and the count is change-guarded:
+    -- WEAPON_ENCHANT_CHANGED also fires for charge ticks, which leave the cell
+    -- count alone.
+    local enchEventFrame, lastEnchCount
+    function SyncEnchantEvents(want)
+        if want then
+            if not enchEventFrame then
+                enchEventFrame = CreateFrame("Frame")
+                enchEventFrame:SetScript("OnEvent", function()
+                    local n = ActiveEnchantCount(#ENCH_INV_SLOTS)
+                    if n == lastEnchCount then return end
+                    lastEnchCount = n
+                    if ns.PAB_ApplyLiveConfig then ns.PAB_ApplyLiveConfig(true) end
+                end)
+            end
+            lastEnchCount = ActiveEnchantCount(#ENCH_INV_SLOTS)
+            enchEventFrame:RegisterEvent("WEAPON_ENCHANT_CHANGED")
+            enchEventFrame:RegisterEvent("WEAPON_SLOT_CHANGED")
+        elseif enchEventFrame then
+            enchEventFrame:UnregisterAllEvents()
+            lastEnchCount = nil
+        end
+    end
+end
+
+local function ApplyEnchants(container, cfg, pad, grid)
+    local on = ns.PAB_EnchantsOn(cfg)
+    SyncEnchantEvents(on)
+    if not (on and container and grid) then return end
+    if (grid.enchSlots or 0) <= 0 then return end
+    AK.AddItemEnchantmentsToContainer(container,
+        BuildEnchantSpec(cfg, pad, grid.rowGap, grid.enchSlots))
+end
+
+-- Buffs content signature: the resolved spell set PLUS the number of declared
+-- weapon-enchant slots. A group's candidateFilters are fixed at declaration
+-- and an item enchantment cannot be undeclared at all, so a change in either
+-- releases the container and builds a fresh one -- including a grid shrunk
+-- below three cells, which declares fewer slots than before.
+local function BuffsContentSig(cfg, spells, enchSlots)
+    enchSlots = ns.PAB_EnchantsOn(cfg) and (enchSlots or 0) or 0
+    return table.concat(spells, ",") .. (enchSlots > 0 and ("|e" .. enchSlots) or "")
 end
 
 local function CreateBars()
@@ -1640,7 +2912,7 @@ local function CreateBars()
     if not AK then return end -- 12.1 gated at file top; defensive only
 
     local s = PAB()
-    if not s then return end -- ns.db not ready yet; TryCreateBars() below retries
+    if not s then return end -- ns.db not ready yet; SetupOptionsPanel calls back once it is
 
     -- Master enable, default OFF: nothing below runs while disabled -- Blizzard's
     -- BuffFrame/DebuffFrame stay untouched, no containers, no unlock elements, options
@@ -1655,11 +2927,18 @@ local function CreateBars()
     end
     if s.enabled ~= true then return end
 
+    -- Enablement is confirmed from here down: arm the cinematic/faction/
+    -- vehicle recovery lane (defined at file bottom; the whole file has
+    -- loaded by the time anything calls CreateBars). Idempotent.
+    ns.PAB_ArmRecovery()
+
     -- Must run before DefaultBuffsCfg/DefaultDebuffsCfg are first called, so seeded
     -- values are what their first lazy-create populates. One-time-ever seed, not a
     -- re-appliable migration (see SeedDefaultBuffsDebuffsFromLegacySources).
     SeedDefaultBuffsDebuffsFromLegacySources(s)
     EnsureDebuffFilterV2(s)
+    EnsureFilterLanes(s)
+    EnsureBarEnable(s)
 
     -- Must run before buffCfg/custom-bar spell resolution below: the curated presets
     -- are otherwise only imported when the options page opens, so a bar referencing a
@@ -1671,6 +2950,17 @@ local function CreateBars()
     -- After the import: the External Defensives seed references the imported
     -- "Externals" preset filter by id.
     EnsureExtDefCustomBar(s)
+
+    -- Use Blizzard Buffs: PAB stands down for the DEFAULT bars only --
+    -- Blizzard's native BuffFrame/DebuffFrame stay untouched and the default
+    -- bars never build; custom bars (editing-spec buckets included) still
+    -- run in full. Default-bar unlock elements drop via their isHidden.
+    if s.useBlizzardBuffs == true then
+        RegisterPABUnlock()
+        ReloadAllCustomBars()
+        SyncCancelCVar()
+        return
+    end
 
     HideBlizzardPlayerAuras()
 
@@ -1684,15 +2974,25 @@ local function CreateBars()
 
     buffsParent = buffsParent or CreateFrame("Frame", "EllesmereUIPlayerAuraBars_Buffs", UIParent)
     buffsParent:SetSize(buffGrid.width, buffGrid.height)
-    ApplyBarPosition(buffsParent, true)
-    lastSize.buffs = { w = buffGrid.width, h = buffGrid.height }
+    ApplyBarPosition(buffsParent, true, buffGrid)
+    lastSize.buffs = { w = buffGrid.width, h = buffGrid.height, dw = buffGrid.designWidth,
+        dh = buffGrid.designHeight, lw = buffGrid.legacyWidth, lh = buffGrid.legacyHeight,
+        gd = buffCfg.growDirection, wd = buffCfg.iconWrapDirection }
 
     debuffsParent = debuffsParent or CreateFrame("Frame", "EllesmereUIPlayerAuraBars_Debuffs", UIParent)
     debuffsParent:SetSize(debuffGrid.width, debuffGrid.height)
-    ApplyBarPosition(debuffsParent, false)
-    lastSize.debuffs = { w = debuffGrid.width, h = debuffGrid.height }
+    ApplyBarPosition(debuffsParent, false, debuffGrid)
+    lastSize.debuffs = { w = debuffGrid.width, h = debuffGrid.height, dw = debuffGrid.designWidth,
+        dh = debuffGrid.designHeight, lw = debuffGrid.legacyWidth, lh = debuffGrid.legacyHeight,
+        gd = debuffCfg.growDirection, wd = debuffCfg.iconWrapDirection }
 
-    local debuffChain = BuildChain("HARMFUL", function(class) return ClassEnabled(class, false, debuffCfg) or (PAB_FxSafeToForce(class) and PAB_FxWantsCategory(debuffCfg.fxList, class.key)) end, debuffCfg.showAllDebuffs ~= false, DebuffSubtractFn(debuffCfg))
+    -- Enable toggles (cfg.enabled, nil = enabled): containers and groups still
+    -- build below so a live re-enable needs no reload; a disabled bar just
+    -- hides its parent (custom-bar pattern).
+    ApplyDefaultBarShown(true)
+    ApplyDefaultBarShown(false)
+
+    local debuffChain = DebuffChainFor(debuffCfg)
 
     -- Single scalar padding, feeding ONLY ApplyGroupConfig's per-group
     -- elementSpacing/lineSpacing/groupSpacing/groupLineSpacing (gap BETWEEN icons).
@@ -1703,25 +3003,8 @@ local function CreateBars()
     local buffPad = buffCfg.padding or 5
     local debuffPad = debuffCfg.padding or 5
 
-    local buffCorner, buffSpec, buffVertical = BuildContainerSpec(buffsParent, buffCfg, buffGrid)
-    local _, debuffSpec, debuffVertical = BuildContainerSpec(debuffsParent, debuffCfg, debuffGrid)
-
-    -- Weapon enchant lead icons (oils/imbues are not auras; see
-    -- EUI_UnitFrames_WeaponEnchants.lua): opt-in (showWeaponEnchants, default
-    -- off -- the cell shift offsets the aura grid), exposed as the "Weapon
-    -- Enchants" pinned row in the bar's Filters dropdown. A content source of
-    -- its own, NOT gated on the broad-content modes: enchants are not auras
-    -- and never come from the catch-all group, so checking the row alone
-    -- shows just the enchant cells. They render with the bar's live style, so
-    -- every customization follows automatically.
-    if buffCfg.showWeaponEnchants == true then
-        ns._weaponEnchPAB = { parent = buffsParent, corner = buffCorner,
-            dir = buffCfg.growDirection or "LEFT",
-            pad = buffPad, styleKey = STYLE_BUFFS, canCancel = true }
-    else
-        ns._weaponEnchPAB = nil
-    end
-    if ns.WeaponEnchants_Layout then ns.WeaponEnchants_Layout() end
+    local _, buffSpec = BuildContainerSpec(buffsParent, buffCfg, buffGrid)
+    local _, debuffSpec = BuildContainerSpec(debuffsParent, debuffCfg, debuffGrid)
 
     -- Groups are declared additively right after creation (not via spec.groups) so
     -- the same ApplyGroupConfig path handles both initial creation and every later
@@ -1749,13 +3032,20 @@ local function CreateBars()
     -- the sig-diffing.
     local buffAllChain = BuffBarChain(buffCfg)
     local buffSpells = ns.PAB_ResolveSpells(buffCfg)
-    buffsSlotSig = table.concat(buffSpells, ",")
+    buffsSlotSig = BuffsContentSig(buffCfg, buffSpells, buffGrid.enchSlots)
+    -- This runs more than once per session (master re-enable, Use Blizzard
+    -- Buffs off, a profile swap whose content signature moved), and a container
+    -- can never be destroyed: retire the previous pair first or the orphans stay
+    -- shown on the same parent and every aura -- and every enchant cell -- renders
+    -- twice.
+    RetireContainer(buffsContainer, declared.buffs)
+    RetireContainer(debuffsContainer, declared.debuffs)
     AK.RequestContainer(buffsParent, "player", buffSpec, function(container)
         buffsContainer = container
-        AK.SetContainerAxis(container, buffVertical)
-        ShiftBuffsForEnchants(container, buffsParent, buffCfg, buffGrid)
+        ApplyContainerAnchorAndGrowth(container, buffsParent, buffCfg, buffGrid)
+        ApplyEnchants(container, buffCfg, buffPad, buffGrid)
         declared.buffs = {}
-        ApplyGroupConfig(container, buffAllChain, declared.buffs, STYLE_BUFFS, buffGrid.effectiveMax, buffPad, buffGrid.rowGap, buffCfg, BuffCandidateExtras(buffCfg))
+        ApplyGroupConfig(container, buffAllChain, declared.buffs, STYLE_BUFFS, BuffAuraMax(buffGrid), buffPad, buffGrid.rowGap, buffCfg, BuffCandidateExtras(buffCfg))
         if #buffSpells > 0 then
             local includeMap = {}
             for i = 1, #buffSpells do includeMap[buffSpells[i]] = true end
@@ -1763,26 +3053,55 @@ local function CreateBars()
                 key = "spells",
                 filter = { "HELPFUL" },
                 style = STYLE_BUFFS,
-                maxFrameCount = buffGrid.effectiveMax,
+                maxFrameCount = BuffAuraMax(buffGrid),
                 candidateFilters = MergeCandidateFilters({ includeSpellIDs = includeMap }, BuffCandidateExtras(buffCfg)),
                 sortMethod = ResolveSortMethod(buffCfg),
                 sortDirection = ResolveSortDirection(buffCfg),
-            })
-            container:SetAuraGroupLayout("spells", {
-                elementSpacing = buffPad, lineSpacing = buffGrid.rowGap,
-                groupSpacing = buffPad, groupLineSpacing = buffGrid.rowGap,
+                layout = BuildGroupLayout(buffCfg, buffPad, buffGrid.rowGap),
             })
             declared.buffs.spells = true
         end
     end)
     AK.RequestContainer(debuffsParent, "player", debuffSpec, function(container)
         debuffsContainer = container
-        AK.SetContainerAxis(container, debuffVertical)
+        ApplyContainerAnchorAndGrowth(container, debuffsParent, debuffCfg, debuffGrid)
         declared.debuffs = {}
-        ApplyGroupConfig(container, debuffChain, declared.debuffs, STYLE_DEBUFFS, debuffGrid.effectiveMax, debuffPad, debuffGrid.rowGap, debuffCfg)
+        ApplyGroupConfig(container, debuffChain, declared.debuffs, STYLE_DEBUFFS, debuffGrid.effectiveMax, debuffPad, debuffGrid.rowGap, debuffCfg, DebuffCandidateExtras(debuffCfg))
     end)
     RegisterPABUnlock()
     ReloadAllCustomBars()
+    SyncCancelCVar()
+end
+
+-- Unlock mode's cog menu only offers "Element Options" for keys in
+-- EllesmereUI._ELEMENT_SETTINGS_MAP; a module adds its own dynamic keys there the
+-- way EllesmereUIDataBars.lua does, so EUI_UnlockMode.lua's static map needs no
+-- PAB branch. barId nil = one of the two built-in bars.
+--
+-- No sectionName/highlightText: NavigateToElementSettings scans the page
+-- wrapper's DIRECT children for section headers, and PABMP_BuildPage builds past
+-- `parent` into its own root on the shared scroll frame, so nothing is scannable.
+local function MapElementSettings(key, kind, barId)
+    if not EllesmereUI then return end
+    EllesmereUI._ELEMENT_SETTINGS_MAP = EllesmereUI._ELEMENT_SETTINGS_MAP or {}
+    EllesmereUI._ELEMENT_SETTINGS_MAP[key] = {
+        module = "EllesmereUIUnitFrames",
+        page = "Player Aura Bars",
+        preSelectFn = function()
+            if not EllesmereUI._setPABSelection then return end
+            if not barId then
+                EllesmereUI._setPABSelection(kind, "default")
+                return
+            end
+            -- Owning bucket resolved at click time, not baked in at registration:
+            -- the tile's "Add To" menu can move a bar to another editing-spec
+            -- bucket long after its key was mapped.
+            local bar, bucket
+            if kind == "buff" then bar, bucket = ns.PAB_GetCustomBuffBar(barId)
+            else bar, bucket = ns.PAB_GetCustomDebuffBar(barId) end
+            if bar then EllesmereUI._setPABSelection(kind, barId, bucket) end
+        end,
+    }
 end
 
 -- Unlock-mode registration, patterned on EllesmereUIDamageMeters.lua's
@@ -1802,6 +3121,15 @@ function RegisterPABUnlock()
             order = order,
             noResize = true,
             noAnchorTarget = true,
+            -- Enable toggle: a disabled default bar keeps no mover (custom-bar
+            -- parity). Master-disabled and Use Blizzard Buffs stand the
+            -- defaults down entirely, mover included.
+            isHidden = function()
+                local s = PAB()
+                if not s or s.enabled ~= true or s.useBlizzardBuffs == true then return true end
+                local cfg = isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)
+                return cfg.enabled == false
+            end,
             getFrame = function() return getParent() end,
             -- Deliberately NOT container:GetWidth()/GetHeight(): AuraContainer geometry
             -- is a Secret Value while tainted (throws in EUI_UnlockMode.lua comparing a
@@ -1813,16 +3141,39 @@ function RegisterPABUnlock()
                 local grid = ComputeGrid(isBuff, isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s))
                 return grid.width, grid.height
             end,
+            -- The mover works in VISUAL positions (the snapped live frame): loadPos
+            -- converts the stored one (BarAnchorOffset), savePos goes back through
+            -- MoverStorePos, which leaves an unchanged position untouched.
             savePos = function(_, point, relPoint, x, y)
                 local s = PAB()
                 if not s then return end
-                s[BarPositionKey(isBuff)] = { point = point, relPoint = relPoint or point, x = x, y = y }
+                local posKey = BarPositionKey(isBuff)
+                local cfg = isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)
+                s[posKey] = MoverStorePos(getParent(), cfg, ComputeGrid(isBuff, cfg), s[posKey], point, relPoint, x, y)
             end,
             loadPos = function()
                 local s = PAB()
                 local pos = s and s[BarPositionKey(isBuff)]
                 if not pos then return nil end
-                return { point = pos.point, relPoint = pos.relPoint, x = pos.x, y = pos.y }
+                local cfg = isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)
+                local x, y = BarAnchorOffset(getParent(), cfg, ComputeGrid(isBuff, cfg), pos)
+                return { point = pos.point, relPoint = pos.relPoint, x = x, y = y }
+            end,
+            -- Spec-override unlock layers bank and restore the STORED table through
+            -- these, not the visual position loadPos returns: a layer harvested at
+            -- one resolution stays valid at another and keeps the design flag.
+            loadRawPosition = function()
+                local s = PAB()
+                local pos = s and s[BarPositionKey(isBuff)]
+                if not pos then return nil end
+                return { point = pos.point, relPoint = pos.relPoint, x = pos.x, y = pos.y,
+                    design = pos.design }
+            end,
+            saveRawPosition = function(_, p)
+                local s = PAB()
+                if not (s and p and p.point) then return end
+                s[BarPositionKey(isBuff)] = { point = p.point, relPoint = p.relPoint or p.point,
+                    x = p.x, y = p.y, design = p.design }
             end,
             clearPos = function()
                 local s = PAB()
@@ -1835,11 +3186,10 @@ function RegisterPABUnlock()
         })
     end
 
-    -- Buffs mover carries the bar's content-derived name (see
-    -- ns.PAB_DefaultBuffsName), so an enchants-only bar reads "Weapon Enchants"
-    -- in unlock mode instead of "Buffs". Baked in at registration --
-    -- EUI_UnlockMode.lua's GetBarLabel returns the stored string -- which is why
-    -- ApplyLiveConfig re-registers when the name changes.
+    -- Buffs mover carries the bar's display name (see ns.PAB_DefaultBuffsName).
+    -- Baked in at registration -- EUI_UnlockMode.lua's GetBarLabel returns the
+    -- stored string -- which is why ApplyLiveConfig re-registers when the name
+    -- changes.
     local s = PAB()
     local buffLabel = ns.PAB_DefaultBuffsName(s and DefaultBuffsCfg(s) or nil)
     lastUnlockBuffLabel = buffLabel
@@ -1848,6 +3198,8 @@ function RegisterPABUnlock()
         MakeBarElement("PAB_Buffs", buffLabel, 700, true, function() return buffsParent end),
         MakeBarElement("PAB_Debuffs", "Debuffs", 701, false, function() return debuffsParent end),
     }
+    MapElementSettings("PAB_Buffs", "buff")
+    MapElementSettings("PAB_Debuffs", "debuff")
     EllesmereUI:RegisterUnlockElements(elements, "EllesmereUIUnitFrames")
     -- Registration alone only updates the element table; a mover already built
     -- this session keeps the label CreateMover baked into its FontString. No-op
@@ -1856,6 +3208,10 @@ function RegisterPABUnlock()
         EllesmereUI.RefreshUnlockElementLabel("PAB_Buffs")
     end
 end
+-- Exported for the default-bar enable toggles: re-registering re-runs unlock
+-- mode's Sync, which re-reads isHidden and drops a disabled bar's mover
+-- mid-session instead of waiting for the next natural Sync.
+ns.PAB_RegisterUnlock = function() RegisterPABUnlock() end
 
 -- Public hook for the Options UI: rebuild both style tables and re-decorate every
 -- existing button. Purely a re-skin -- does NOT touch groups, filters, container
@@ -1869,70 +3225,177 @@ local function RestyleBars()
     AK.styles[STYLE_DEBUFFS] = BuildStyle(false, DefaultDebuffsCfg(s))
     AK.RestyleSoon(STYLE_BUFFS)
     AK.RestyleSoon(STYLE_DEBUFFS)
+    SyncCancelCVar()
 end
 ns.PAB_Restyle = RestyleBars
+
+-- CursorFreelookStartDelta is the fraction of the screen the cursor must move before a
+-- held mouse button counts as camera freelook instead of a click; Blizzard's own
+-- shipped default is 0.001 (verified against the client's cvar list, not assumed). At
+-- 0 -- the most aggressive setting, zero movement required -- ANY right-click on an
+-- aura icon is claimed for freelook before the release reaches our button, silently
+-- eating the "Right-Click to Cancel" click (field-reported 2026-08-12, twice
+-- independently). Players land on 0 via third-party "camera feel" addons/macros (a
+-- dedicated community addon, CursorDeltaFix, does exactly this:
+-- SetCVar("CursorFreelookStartDelta", 0)) or a manual /console tweak, not from
+-- anything EllesmereUI does.
+--
+-- Repair only, never a nudge above Blizzard's default: we only ever touch this CVar
+-- when it is caught sitting at the pathological 0, restoring it to Blizzard's own
+-- 0.001 -- never raised past that, and never touched at all if it's anywhere else
+-- (including a deliberately-tuned non-zero, non-default value). Conditional on some
+-- right-click-cancelable buff surface actually being live, so a player who never uses
+-- the feature never has this CVar touched by EllesmereUI at all.
+local CANCEL_CVAR = "CursorFreelookStartDelta"
+local CANCEL_CVAR_BROKEN = 0
+local CANCEL_CVAR_DEFAULT = "0.001"
+
+--- True while some right-click-cancelable player buff display is live: the default
+--- Buffs bar (rightClickCancel defaults ON), any enabled custom buff bar with its own
+--- toggle ON, or the classic Unit Frames player-buffs display (EUI_UnitFrames_
+--- AuraContainers.lua's cancelButtons is unconditional whenever unit=="player" and
+--- isBuff, gated only on the element being shown at all).
+local function AnyRightClickCancelActive(s)
+    -- Use Blizzard Buffs: the NATIVE BuffFrame owns the display and its
+    -- right-click cancel breaks on the same CVar -- always repair.
+    if s.useBlizzardBuffs == true then return true end
+    local dbc = DefaultBuffsCfg(s)
+    if dbc.enabled ~= false and dbc.rightClickCancel ~= false then return true end
+    local customBuffBars = s.customBuffBars
+    if customBuffBars then
+        for i = 1, #customBuffBars do
+            local bar = customBuffBars[i]
+            if bar.enabled ~= false and bar.rightClickCancel ~= false then return true end
+        end
+    end
+    -- Editing-spec bucket buff bars count too (enable-toggle test only,
+    -- matching the legacy loop: the CVar repair may run while the spec is
+    -- mid-change, so err on the permissive side).
+    if s.pabSpecBars then
+        for _, b in pairs(s.pabSpecBars) do
+            local bl = b.buffBars
+            if bl then
+                for i = 1, #bl do
+                    local bar = bl[i]
+                    if bar.enabled ~= false and bar.rightClickCancel ~= false then return true end
+                end
+            end
+        end
+    end
+    local db = ns.db
+    local playerCfg = db and db.profile and db.profile.player
+    if playerCfg and playerCfg.showBuffs ~= false then return true end
+    return false
+end
+
+function SyncCancelCVar()
+    local s = PAB()
+    if not s or s.enabled ~= true then return end
+    if not AnyRightClickCancelActive(s) then return end
+    if InCombatLockdown() then return end
+    if tonumber(GetCVar(CANCEL_CVAR)) == CANCEL_CVAR_BROKEN then
+        SetCVar(CANCEL_CVAR, CANCEL_CVAR_DEFAULT)
+    end
+end
 
 -- Public hook for the Options UI: live counterpart to RestyleBars for everything
 -- spec-level (class toggles, grid: iconsPerRow/maxRows/padding/maxBuffs-or-Debuffs,
 -- grow direction). Applies to ONE polarity's container; callers touching a shared
 -- field (iconSize) call it for both. No-op before the container exists
--- (TryCreateBars calls CreateBars() once ns.db is ready).
+-- (SetupOptionsPanel calls CreateBars() once ns.db is ready).
 local function ApplyLiveConfig(isBuff)
     local s = PAB()
     if not (AK and s) then return end
+    if DeferRestrictedApply(isBuff and "default-buffs" or "default-debuffs",
+        function() ApplyLiveConfig(isBuff) end,
+        isBuff and buffsContainer or debuffsContainer,
+        (isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)).growDirection) then return end
     local container = isBuff and buffsContainer or debuffsContainer
     local parent = isBuff and buffsParent or debuffsParent
     if not container or not parent then return end
 
     local cfg = isBuff and DefaultBuffsCfg(s) or DefaultDebuffsCfg(s)
+    -- Enable toggle: a disabled bar hides its parent and skips every live
+    -- apply below (geometry, enchant layout, group work) -- re-enabling runs
+    -- the full pass. Same shape as the custom bars' early return. Use
+    -- Blizzard Buffs and the MASTER disable stand the default bars down the
+    -- same way. Weapon enchants ride the container, so they stand down with
+    -- the bar's parent -- nothing extra to tear down here.
+    ApplyDefaultBarShown(isBuff)
+    if s.enabled ~= true or cfg.enabled == false or s.useBlizzardBuffs == true then
+        if isBuff then SyncEnchantEvents(false) end
+        return
+    end
     local grid = ComputeGrid(isBuff, cfg)
     local sizeKey = isBuff and "buffs" or "debuffs"
     local prev = lastSize[sizeKey]
 
-    -- Compensate for CENTER-anchored saved positions: SetSize on a CENTER/CENTER point
-    -- grows/shrinks symmetrically, so any size change visibly shifts the icons. Shift
-    -- the saved position by half the delta so the CENTER point stays put. Uses OUR OWN
-    -- last-applied size (lastSize), not parent:GetWidth/GetHeight -- querying the live
-    -- frame is jitter-prone across rapid successive calls (slider drags), since its
-    -- rendered size may not yet reflect the previous call. Skipped when unchanged.
+    -- Edge-growing containers use a fixed parent corner, so move a CENTER-saved parent
+    -- by half the size delta to keep that corner fixed. Centered growth deliberately
+    -- skips this: the parent center is its fixed anchor. Uses lastSize rather than live
+    -- geometry so rapid slider updates cannot read a stale prior size.
     local posKey = BarPositionKey(isBuff)
     local pos = s[posKey]
-    if pos and pos.point == "CENTER" and prev and (prev.w ~= grid.width or prev.h ~= grid.height) then
-        pos.x = pos.x + (prev.w - grid.width) / 2
-        pos.y = pos.y + (prev.h - grid.height) / 2
-        -- Snap against the NEW grid.width/height (what parent:SetSize is about to
-        -- apply), not parent:GetWidth/GetHeight -- those still read the OLD size, the
-        -- resize hasn't run yet. The STORED pos keeps the raw accumulation; only the
-        -- SetPoint values are snapped.
-        local PP = EllesmereUI.PP
-        local es = parent:GetEffectiveScale()
-        local sx = PP.SnapCenterForDim(pos.x, grid.width, es)
-        local sy = PP.SnapCenterForDim(pos.y, grid.height, es)
-        parent:ClearAllPoints()
-        parent:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, sx, sy)
+    local centered = cfg.growDirection == "CENTER_HORIZONTAL" or cfg.growDirection == "CENTER_VERTICAL"
+    -- The engine aura container anchored to `parent` makes the PARENT's own geometry
+    -- protected in combat (anchor-ancestor rule): the SetSize/ClearAllPoints/SetPoint
+    -- below are ADDON_ACTION_BLOCKED inside lockdown -- and the cinematic/faction/
+    -- vehicle recovery lane runs this function in instanced combat BY DESIGN (see
+    -- DeferRestrictedApply). A recovery re-drive carries an UNCHANGED grid, so
+    -- skipping the geometry cluster drops nothing there; a genuinely changed grid
+    -- (options edited mid-combat) or a still-pending centered rebase reconciles once
+    -- at the regen edge. lastSize stays untouched on the skip so the deferred pass
+    -- still sees the real last-applied size (the fixed-corner compensation needs it),
+    -- and the stored pos is not mutated for a resize that never landed.
+    if InCombatLockdown() then
+        local sizeChanged = not (prev and prev.w == grid.width and prev.h == grid.height
+            and prev.dw == grid.designWidth and prev.dh == grid.designHeight
+            and prev.gd == cfg.growDirection and prev.wd == cfg.iconWrapDirection)
+        local rebasePending = centered
+            and not (pos and pos.point == "CENTER" and (pos.relPoint or pos.point) == "CENTER")
+        if sizeChanged or rebasePending then
+            QueuePABRegenApply(sizeKey, function() ApplyLiveConfig(isBuff) end)
+        end
+    else
+        if centered then
+            pos = RebaseBarPositionToCenter(parent, pos)
+            s[posKey] = pos
+        end
+        local resized = not centered and prev
+            and (prev.w ~= grid.width or prev.h ~= grid.height
+                or prev.dw ~= grid.designWidth or prev.dh ~= grid.designHeight)
+        if resized and pos and pos.point == "CENTER" then
+            -- The stored center belongs to its reference frame (design or legacy, see
+            -- BarAnchorOffset), so it moves by that frame's delta, toward whichever
+            -- side the growth origin is on.
+            local dx, dy
+            if pos.design then
+                dx, dy = OriginShift(cfg, pos.point, prev.dw - grid.designWidth, prev.dh - grid.designHeight)
+            else
+                dx, dy = OriginShift(cfg, pos.point, prev.lw - grid.legacyWidth, prev.lh - grid.legacyHeight)
+            end
+            pos.x = pos.x + dx
+            pos.y = pos.y + dy
+        end
+        local turned = prev and (prev.gd ~= cfg.growDirection or prev.wd ~= cfg.iconWrapDirection)
+        lastSize[sizeKey] = { w = grid.width, h = grid.height, dw = grid.designWidth,
+            dh = grid.designHeight, lw = grid.legacyWidth, lh = grid.legacyHeight,
+            gd = cfg.growDirection, wd = cfg.iconWrapDirection }
+        parent:SetSize(grid.width, grid.height)
+        -- Re-seated AFTER SetSize so SnapBarPos snaps against the new size and the
+        -- rounding shift follows the new grid, or the new origin after a grow/wrap
+        -- direction change. The STORED pos keeps the raw accumulation. Never for an
+        -- unlock-anchored bar: the anchor owns its placement and re-applies itself on
+        -- a size change.
+        local anchored = EllesmereUI.IsUnlockAnchored
+            and EllesmereUI.IsUnlockAnchored(isBuff and "PAB_Buffs" or "PAB_Debuffs")
+        if (resized or turned) and not anchored then ApplyBarPosition(parent, isBuff, grid) end
     end
-    lastSize[sizeKey] = { w = grid.width, h = grid.height }
-
-    parent:SetSize(grid.width, grid.height)
 
     local pad = cfg.padding or 5
     ApplyContainerAnchorAndGrowth(container, parent, cfg, grid)
 
     if isBuff then
-        -- Keep the weapon-enchant cells riding the bar's live geometry and
-        -- filter state (opt-in only -- an independent content source, see the
-        -- publish in CreateBars), then shift the engine run inward past them.
-        if cfg.showWeaponEnchants == true then
-            local liveCorner = BuildContainerSpec(parent, cfg, grid)
-            ns._weaponEnchPAB = { parent = parent, corner = liveCorner,
-                dir = cfg.growDirection or "LEFT",
-                pad = pad, styleKey = STYLE_BUFFS, canCancel = true }
-        else
-            ns._weaponEnchPAB = nil
-        end
-        ShiftBuffsForEnchants(container, parent, cfg, grid)
-        if ns.WeaponEnchants_Layout then ns.WeaponEnchants_Layout() end
-
         -- Unlock mode bakes the mover's label at registration, so a Filters
         -- change would leave the old name on it until the next CreateBars.
         -- Re-register only when the name actually changed -- this function runs
@@ -1945,7 +3408,7 @@ local function ApplyLiveConfig(isBuff)
 
     if isBuff then
         local spells = ns.PAB_ResolveSpells(cfg)
-        local sig = table.concat(spells, ",")
+        local sig = BuffsContentSig(cfg, spells, grid.enchSlots)
         local allChain = BuffBarChain(cfg)
         if sig ~= buffsSlotSig then
             -- Safe to fully release+rebuild: the default Buffs container holds only the
@@ -1953,15 +3416,16 @@ local function ApplyLiveConfig(isBuff)
             -- container's anchor/growth/rowWidth come from `spec` below -- the live
             -- SetContainerAnchor/etc calls above ran against the OLD container and are
             -- harmless overhead. A group's candidateFilters is fixed at declaration, so a
-            -- spell-list change requires this release+rebuild.
+            -- spell-list change requires this release+rebuild -- and so does the
+            -- weapon-enchant row, which the engine cannot undeclare at all.
             RetireContainer(container, declared.buffs)
-            local _, spec, specVertical = BuildContainerSpec(parent, cfg, grid)
+            local _, spec = BuildContainerSpec(parent, cfg, grid)
             AK.RequestContainer(parent, "player", spec, function(newContainer)
                 buffsContainer = newContainer
-                AK.SetContainerAxis(newContainer, specVertical)
-                ShiftBuffsForEnchants(newContainer, parent, cfg, grid)
+                ApplyContainerAnchorAndGrowth(newContainer, parent, cfg, grid)
+                ApplyEnchants(newContainer, cfg, pad, grid)
                 declared.buffs = {}
-                ApplyGroupConfig(newContainer, allChain, declared.buffs, STYLE_BUFFS, grid.effectiveMax, pad, grid.rowGap, cfg, BuffCandidateExtras(cfg))
+                ApplyGroupConfig(newContainer, allChain, declared.buffs, STYLE_BUFFS, BuffAuraMax(grid), pad, grid.rowGap, cfg, BuffCandidateExtras(cfg))
                 if #spells > 0 then
                     local includeMap = {}
                     for i = 1, #spells do includeMap[spells[i]] = true end
@@ -1969,14 +3433,11 @@ local function ApplyLiveConfig(isBuff)
                         key = "spells",
                         filter = { "HELPFUL" },
                         style = STYLE_BUFFS,
-                        maxFrameCount = grid.effectiveMax,
+                        maxFrameCount = BuffAuraMax(grid),
                         candidateFilters = MergeCandidateFilters({ includeSpellIDs = includeMap }, BuffCandidateExtras(cfg)),
                         sortMethod = ResolveSortMethod(cfg),
                         sortDirection = ResolveSortDirection(cfg),
-                    })
-                    newContainer:SetAuraGroupLayout("spells", {
-                        elementSpacing = pad, lineSpacing = grid.rowGap,
-                        groupSpacing = pad, groupLineSpacing = grid.rowGap,
+                        layout = BuildGroupLayout(cfg, pad, grid.rowGap),
                     })
                     declared.buffs.spells = true
                 end
@@ -1988,13 +3449,15 @@ local function ApplyLiveConfig(isBuff)
             -- zeroes the catch-all when `allChain` is empty, so one call covers on and
             -- off. The spells group isn't part of that chain path, so its
             -- maxFrameCount/layout/sort are refreshed here directly.
-            ApplyGroupConfig(container, allChain, declared.buffs, STYLE_BUFFS, grid.effectiveMax, pad, grid.rowGap, cfg, BuffCandidateExtras(cfg))
+            --
+            -- The enchant layout rides this branch (not the pass above): on the
+            -- rebuild path the container here is the one about to be retired,
+            -- and declaring three engine frames on it would leak them.
+            ApplyEnchants(container, cfg, pad, grid)
+            ApplyGroupConfig(container, allChain, declared.buffs, STYLE_BUFFS, BuffAuraMax(grid), pad, grid.rowGap, cfg, BuffCandidateExtras(cfg))
             if declared.buffs.spells then
-                container:SetAuraGroupMaxFrameCount("spells", grid.effectiveMax)
-                container:SetAuraGroupLayout("spells", {
-                    elementSpacing = pad, lineSpacing = grid.rowGap,
-                    groupSpacing = pad, groupLineSpacing = grid.rowGap,
-                })
+                container:SetAuraGroupMaxFrameCount("spells", BuffAuraMax(grid))
+                container:SetAuraGroupLayout("spells", BuildGroupLayout(cfg, pad, grid.rowGap))
                 local liveIncludeMap = {}
                 for i = 1, #spells do liveIncludeMap[spells[i]] = true end
                 container:SetAuraGroupCandidateFilters("spells",
@@ -2006,8 +3469,8 @@ local function ApplyLiveConfig(isBuff)
             end
         end
     else
-        local chain = BuildChain("HARMFUL", function(class) return ClassEnabled(class, false, cfg) or (PAB_FxSafeToForce(class) and PAB_FxWantsCategory(cfg.fxList, class.key)) end, cfg.showAllDebuffs ~= false, DebuffSubtractFn(cfg))
-        ApplyGroupConfig(container, chain, declared.debuffs, STYLE_DEBUFFS, grid.effectiveMax, pad, grid.rowGap, cfg)
+        local chain = DebuffChainFor(cfg)
+        ApplyGroupConfig(container, chain, declared.debuffs, STYLE_DEBUFFS, grid.effectiveMax, pad, grid.rowGap, cfg, DebuffCandidateExtras(cfg))
     end
 
     if PAB_MaybeRefreshPreview then PAB_MaybeRefreshPreview(isBuff and "buff" or "debuff", "default") end
@@ -2046,10 +3509,12 @@ function ns.PAB_SetGrowDirection(barKey, dir)
     if not s then return end
     if barKey == "PAB_Buffs" then
         DefaultBuffsCfg(s).growDirection = dir
+        RestyleBars()
         ApplyLiveConfig(true)
         return
     elseif barKey == "PAB_Debuffs" then
         DefaultDebuffsCfg(s).growDirection = dir
+        RestyleBars()
         ApplyLiveConfig(false)
         return
     end
@@ -2162,7 +3627,9 @@ function ns.PAB_RenameFilter(id, name)
 end
 
 -- Also strips the filter's assignment from every buff-side cfg that could reference
--- it (default Buffs bar + every custom buff bar).
+-- it: default Buffs bar + every custom buff bar (both lanes), plus the player UNIT
+-- FRAME's buff filter lanes -- it shares this registry through its own keys
+-- (buffFilters/buffNegFilters, see PlayerBuffChain in EUI_UnitFrames_AuraContainers.lua).
 function ns.PAB_DeleteFilter(id)
     local s = PAB()
     if not (s and s.pabFilters) then return end
@@ -2170,25 +3637,84 @@ function ns.PAB_DeleteFilter(id)
     for i = #list, 1, -1 do
         if list[i].id == id then table.remove(list, i) end
     end
-    if s.defaultBuffs and s.defaultBuffs.filters then s.defaultBuffs.filters[id] = nil end
+    local function Strip(bar, isDefault)
+        if bar.filters then bar.filters[id] = nil end
+        if bar.negFilters then bar.negFilters[id] = nil end
+        -- No-empty rule: deleting an ENABLED bar's last content source falls
+        -- back to All Buffs, same as unchecking it in the Filters dropdown
+        -- would. Disabled bars keep their stored state untouched (the
+        -- EnsureBarEnable invariant).
+        if bar.enabled ~= false and not BuffBarHasContent(bar, isDefault) then
+            bar.showAllBuffs = nil
+        end
+    end
+    if s.defaultBuffs then Strip(s.defaultBuffs, true) end
     local customBuffBars = s.customBuffBars
     if customBuffBars then
         for i = 1, #customBuffBars do
-            local bar = customBuffBars[i]
-            if bar.filters then bar.filters[id] = nil end
+            Strip(customBuffBars[i], false)
         end
+    end
+    -- Editing-spec bucket bars share the same filter registry.
+    if s.pabSpecBars then
+        for _, b in pairs(s.pabSpecBars) do
+            local bl = b.buffBars
+            if bl then
+                for i = 1, #bl do Strip(bl[i], false) end
+            end
+        end
+    end
+    local ps = ns.db and ns.db.profile and ns.db.profile.player
+    if ps then
+        if ps.buffFilters then ps.buffFilters[id] = nil end
+        if ps.buffNegFilters then ps.buffNegFilters[id] = nil end
+        -- Same fallback for the player frame's buff filter (shared registry).
+        if ps.buffShowAll == false and ps.buffHasDuration ~= true
+            and not (ps.buffFilters and next(ps.buffFilters))
+            and not (ps.buffSpells and #ps.buffSpells > 0) then
+            ps.buffShowAll = nil
+        end
+        -- The player FRAME's buff container resolves this registry through the
+        -- UF reload pass, not through the PAB apply the caller runs.
+        if _G._EUF_ReloadFrames then _G._EUF_ReloadFrames() end
     end
 end
 
 -- Checkbox state for one spell within one filter. state=nil removes the spell
 -- entirely: every PAB filter spell is "custom", no curated/preset spell to fall back to.
+-- The write applies to the whole SAME-NAME FAMILY within the filter: PAB flattens
+-- curated alternates into their own keys, and the Filter Editor shows one row per
+-- NAME (lowest id), so a click on the visible row must carry the hidden alternates
+-- with it -- otherwise a disabled-seeded family like Divine Hymn (64843 + alt
+-- 64844) checks only the primary while the buff that actually lands is the alt
+-- (field report 2026-08-16: "64844 not tracked"). Name-matching mirrors the
+-- editor's dedup exactly (both fall back to the id when the name is uncached).
 function ns.PAB_SetSpellState(filterId, spellID, state)
     local f = ns.PAB_GetFilter(filterId)
     if not f then return end
-    if state == nil then
-        f.spells[spellID] = nil
-    else
-        f.spells[spellID] = state and true or false
+    local function Write(id)
+        if state == nil then
+            f.spells[id] = nil
+        else
+            f.spells[id] = state and true or false
+        end
+    end
+    Write(spellID)
+    -- Members of a curated family follow the clicked row, deletes included: the editor
+    -- shows one row per NAME, so a member under a different name has a row of its own
+    -- but is still the same buff, and would otherwise linger as a tracked id with no
+    -- row left to clear it from. Only ids the filter already holds are rewritten.
+    local fam = ns.PAB_SPELL_FAMILY and ns.PAB_SPELL_FAMILY[spellID]
+    if fam then
+        for i = 1, #fam do
+            if fam[i] ~= spellID and f.spells[fam[i]] ~= nil then Write(fam[i]) end
+        end
+    end
+    local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)
+    if name then
+        for id in pairs(f.spells) do
+            if id ~= spellID and C_Spell.GetSpellName(id) == name then Write(id) end
+        end
     end
 end
 
@@ -2205,23 +3731,52 @@ end
 -- Sorted so the caller's signature diffing stays deterministic.
 function ns.PAB_ResolveSpells(cfg)
     local set = {}
+    local direct
     local spells = cfg.spells
     if spells then
-        for i = 1, #spells do set[spells[i]] = true end
+        direct = {}
+        for i = 1, #spells do
+            set[spells[i]] = true
+            direct[spells[i]] = true
+            ExpandFamily(direct, spells[i])
+            ExpandFamily(set, spells[i])
+        end
     end
-    -- Under Show All Buffs the checked filters are a SUBTRACT set (their spells leave
-    -- via the catch-all's excludeSpellIDs, see BuffBarChain), so feeding them into the
-    -- spells group here would re-render every subtracted spell. Extra Spells stay
-    -- additive in both modes.
-    local filters = (cfg.showAllBuffs == false and cfg.hasDuration ~= true) and cfg.filters or nil
+    -- Under the broad modes (All Buffs / Has Duration) the hide-lane filters leave via
+    -- the catch-all's excludeSpellIDs (see BuffBarChain), so the spells group carries
+    -- only Extra Spells there. In add mode the show-lane filters union in, minus the
+    -- hide lane. Extra Spells stay additive in both modes and win over the hide lane.
+    local addMode = cfg.showAllBuffs == false and cfg.hasDuration ~= true
+    local filters = addMode and cfg.filters or nil
     if filters then
         for filterId in pairs(filters) do
             local f = ns.PAB_GetFilter(filterId)
             if f then
                 for id, on in pairs(f.spells) do
-                    if on then set[id] = true end
+                    if on then
+                        set[id] = true
+                        ExpandFamily(set, id, f.spells)
+                    end
                 end
             end
+        end
+    end
+    local negFilters = addMode and cfg.negFilters or nil
+    if negFilters then
+        local hide = {}
+        for filterId in pairs(negFilters) do
+            local f = ns.PAB_GetFilter(filterId)
+            if f then
+                for id, on in pairs(f.spells) do
+                    if on then
+                        hide[id] = true
+                        ExpandFamily(hide, id, f.spells)
+                    end
+                end
+            end
+        end
+        for id in pairs(hide) do
+            if not (direct and direct[id]) then set[id] = nil end
         end
     end
     local out = {}
@@ -2386,6 +3941,9 @@ end
 -- set. "ALL"-class spells get no hint (no class header row for them).
 local SPELL_CLASS_HINTS = {}
 local BM2_FILTER_SEED = {}
+-- Curated primary -> alts (own copy: the RF bridge is absent when that
+-- module is disabled, and the family heal below must not depend on it).
+local PRESET_ALTS = {}
 do
     local BP = EllesmereUI.BUFF_PRESETS
     for i = 1, #BP.filters do
@@ -2398,6 +3956,7 @@ do
                 dst[#dst + 1] = id
                 if info.class ~= "ALL" then SPELL_CLASS_HINTS[id] = info.class end
                 if info.alts then
+                    PRESET_ALTS[id] = info.alts
                     for j = 1, #info.alts do
                         local alt = info.alts[j]
                         dst[#dst + 1] = alt
@@ -2411,6 +3970,16 @@ do
         BM2_FILTER_SEED[#BM2_FILTER_SEED + 1] =
             { name = def.name, enabled = enabled, disabled = disabled }
     end
+    -- Every member of a curated family (primary + its alternates) maps to the whole
+    -- member list, so PAB_ResolveSpells can expand from whichever id the user has.
+    -- Families are disjoint, so one carried by two preset filters rewrites an equal entry.
+    local fams = {}
+    for primary, alts in pairs(PRESET_ALTS) do
+        local fam = { primary }
+        for i = 1, #alts do fam[#fam + 1] = alts[i] end
+        for i = 1, #fam do fams[fam[i]] = fam end
+    end
+    ns.PAB_SPELL_FAMILY = fams
 end
 ns.PAB_SPELL_CLASS_HINTS = SPELL_CLASS_HINTS
 
@@ -2469,6 +4038,17 @@ function ns.PAB_ImportBM2Filters()
                 local id = seed.disabled[j]
                 if f.spells[id] == nil then f.spells[id] = false end
             end
+            -- Family heal: a checked PRIMARY whose curated alternates were left
+            -- unchecked (the pre-fix editor toggled only the visible row) pulls
+            -- its alternates up. Enable-only, primary->alt only, curated
+            -- families only: never disables, never touches user-added ids.
+            for primary, alts in pairs(PRESET_ALTS) do
+                if f.spells[primary] == true then
+                    for k = 1, #alts do
+                        if f.spells[alts[k]] == false then f.spells[alts[k]] = true end
+                    end
+                end
+            end
         end
     end
     return created
@@ -2479,31 +4059,61 @@ function ns.PAB_CustomDebuffBars()
     return s and s.customDebuffBars or nil
 end
 
+-- Both lookups search the legacy array first, then every editing-spec
+-- bucket (ids are globally unique). Second return = the owning bucket key
+-- ("allspecs" for the legacy array) for callers that gate on applicability.
 function ns.PAB_GetCustomBuffBar(id)
     local list = ns.PAB_CustomBuffBars()
-    if not list then return nil end
-    for i = 1, #list do
-        if list[i].id == id then return list[i] end
+    if list then
+        for i = 1, #list do
+            if list[i].id == id then return list[i], "allspecs" end
+        end
+    end
+    local s = PAB()
+    local st = s and s.pabSpecBars
+    if st then
+        for key, b in pairs(st) do
+            local bl = b.buffBars
+            if bl then
+                for i = 1, #bl do
+                    if bl[i].id == id then return bl[i], key end
+                end
+            end
+        end
     end
 end
 
 function ns.PAB_GetCustomDebuffBar(id)
     local list = ns.PAB_CustomDebuffBars()
-    if not list then return nil end
-    for i = 1, #list do
-        if list[i].id == id then return list[i] end
+    if list then
+        for i = 1, #list do
+            if list[i].id == id then return list[i], "allspecs" end
+        end
+    end
+    local s = PAB()
+    local st = s and s.pabSpecBars
+    if st then
+        for key, b in pairs(st) do
+            local bl = b.debuffBars
+            if bl then
+                for i = 1, #bl do
+                    if bl[i].id == id then return bl[i], key end
+                end
+            end
+        end
     end
 end
 
 -- Bar objects (both kinds) also carry the same shared+category cfg fields as
 -- DefaultBuffsCfg/DefaultDebuffsCfg (iconSize, durationShow/stackShow,
 -- durationPosition/TextSize/OffsetX/Y/ColorR/G/B, stackPosition/TextSize/OffsetX/
--- Y/ColorR/G/B; buff/debuff bars additionally borderSize/R/G/B/A, iconZoom, padding,
+-- Y/ColorR/G/B; buff/debuff bars additionally borderSize/R/G/B/A, borderTexture and
+-- optional texture offset/shift/layer fields, iconZoom, padding,
 -- iconsPerRow, maxRows, maxTotal; debuff bars additionally dispelColorMagic/Curse/
 -- Disease/Poison/Bleed). NOT pre-populated, same as those two starting as {}:
 -- BuildStyle/ComputeGrid apply the same `or <default>` fallbacks either way, so a
 -- fresh bar renders with sane defaults and Options only writes fields the user touches.
-function ns.PAB_AddCustomBuffBar(name)
+function ns.PAB_AddCustomBuffBar(name, bucketKey)
     local s = PABEnsure()
     if not s then return nil end
     s.customBuffBars = s.customBuffBars or {}
@@ -2522,11 +4132,14 @@ function ns.PAB_AddCustomBuffBar(name)
         maxRows = 1,
         maxTotal = 8,
     }
-    s.customBuffBars[#s.customBuffBars + 1] = bar
+    -- The edited editing-spec bucket owns the new bar; ids come from the ONE
+    -- shared counter regardless of bucket.
+    local target = ns.PAB_BucketBars(true, bucketKey, true) or s.customBuffBars
+    target[#target + 1] = bar
     return bar
 end
 
-function ns.PAB_AddCustomDebuffBar(name)
+function ns.PAB_AddCustomDebuffBar(name, bucketKey)
     local s = PABEnsure()
     if not s then return nil end
     s.customDebuffBars = s.customDebuffBars or {}
@@ -2541,7 +4154,8 @@ function ns.PAB_AddCustomDebuffBar(name)
         maxRows = 1,
         maxTotal = 8,
     }
-    s.customDebuffBars[#s.customDebuffBars + 1] = bar
+    local target = ns.PAB_BucketBars(false, bucketKey, true) or s.customDebuffBars
+    target[#target + 1] = bar
     return bar
 end
 
@@ -2549,20 +4163,191 @@ end
 -- engine-side group/slots (containers are add-only). The engine-wiring layer must
 -- instead detect the missing DB entry and set maxFrameCount = 0 / hide the bar's
 -- frames, like disabled default groups.
+-- Deep-copies a custom bar into another editing-spec bucket (the right-click
+-- "Add To" menu): full settings clone -- position included -- under a fresh
+-- global id; the source is untouched.
+function ns.PAB_CopyCustomBar(isBuff, src, bucketKey)
+    local s = PABEnsure()
+    if not (s and src) then return nil end
+    local target = ns.PAB_BucketBars(isBuff, bucketKey, true)
+    if not target then return nil end
+    local function Copy(v)
+        if type(v) ~= "table" then return v end
+        local o = {}
+        for k, v2 in pairs(v) do o[k] = Copy(v2) end
+        return o
+    end
+    local bar = Copy(src)
+    bar.id = NextBarId(s)
+    target[#target + 1] = bar
+    return bar
+end
+
+-- Shared by both deletes: strip the id from every editing-spec bucket and
+-- sweep its per-spec disable keys (ids are global and never reused, so a
+-- deleted bar's key could only leak).
+local function DeleteFromSpecBuckets(s, id, listField)
+    local st = s.pabSpecBars
+    if not st then return end
+    for _, b in pairs(st) do
+        local bl = b[listField]
+        if bl then
+            for i = #bl, 1, -1 do
+                if bl[i].id == id then table.remove(bl, i) end
+            end
+        end
+        if b.inhDis then b.inhDis[id] = nil end
+    end
+end
+
 function ns.PAB_DeleteCustomBuffBar(id)
     local s = PABEnsure()
-    if not (s and s.customBuffBars) then return end
-    for i = #s.customBuffBars, 1, -1 do
-        if s.customBuffBars[i].id == id then table.remove(s.customBuffBars, i) end
+    if not s then return end
+    if s.customBuffBars then
+        for i = #s.customBuffBars, 1, -1 do
+            if s.customBuffBars[i].id == id then table.remove(s.customBuffBars, i) end
+        end
     end
+    DeleteFromSpecBuckets(s, id, "buffBars")
 end
 
 function ns.PAB_DeleteCustomDebuffBar(id)
     local s = PABEnsure()
-    if not (s and s.customDebuffBars) then return end
-    for i = #s.customDebuffBars, 1, -1 do
-        if s.customDebuffBars[i].id == id then table.remove(s.customDebuffBars, i) end
+    if not s then return end
+    if s.customDebuffBars then
+        for i = #s.customDebuffBars, 1, -1 do
+            if s.customDebuffBars[i].id == id then table.remove(s.customDebuffBars, i) end
+        end
     end
+    DeleteFromSpecBuckets(s, id, "debuffBars")
+end
+
+-------------------------------------------------------------------------------
+--  Editing-spec buckets. The legacy arrays (s.customBuffBars /
+--  s.customDebuffBars) ARE the "All Specs" bucket, in place: zero migration,
+--  and profiles opened by older builds keep rendering them. Every other
+--  bucket lives under s.pabSpecBars[key] = { buffBars, debuffBars, inhDis },
+--  key = "nonhealer"/"tanks"/"dps"/"healers" (group buckets) or "spec<ID>"
+--  (a concrete spec; healer specs included). Bar ids stay globally unique
+--  across buckets (the one shared s.nextBarId), so per-spec disables key on
+--  the bare id. Absent pabSpecBars = feature unused = every path below
+--  degenerates to the legacy behavior at zero cost.
+-------------------------------------------------------------------------------
+
+-- Role group for a specialization ID. Mirrors the RaidFrames helper
+-- (ns.BM_RoleBucketForSpecID lives in a different addon namespace, hence a
+-- local twin): healers/Aug = HEALER role or Augmentation (1473), keeping
+-- "All Non Healers/Aug" its exact complement.
+local function RoleBucketForSpecID(specID)
+    if not specID then return nil end
+    if specID == 1473 then return "healers" end
+    local role = GetSpecializationInfoByID and select(5, GetSpecializationInfoByID(specID))
+    if role == "HEALER" then return "healers" end
+    if role == "TANK" then return "tanks" end
+    if role then return "dps" end
+    -- Unknown spec/unavailable API: no role bucket beats a wrong one.
+    return nil
+end
+ns.PAB_RoleBucketForSpecID = RoleBucketForSpecID
+
+local function CurrentSpecID()
+    local idx = GetSpecialization and GetSpecialization()
+    return idx and GetSpecializationInfo and GetSpecializationInfo(idx) or nil
+end
+
+-- Group buckets a concrete "spec<ID>" view inherits from, in display order.
+-- nil for group views and unknown keys.
+function ns.PAB_InheritedGroupsFor(bucketKey)
+    local m = type(bucketKey) == "string" and bucketKey:match("^spec(%d+)$")
+    local sid = m and tonumber(m)
+    if not sid then return nil end
+    local out = { "allspecs" }
+    local roleKey = RoleBucketForSpecID(sid)
+    if roleKey ~= "healers" then out[#out + 1] = "nonhealer" end
+    if roleKey then out[#out + 1] = roleKey end
+    return out
+end
+
+local function SpecBarBucket(s, key, create)
+    local st = s.pabSpecBars
+    if not st then
+        if not create then return nil end
+        st = {}; s.pabSpecBars = st
+    end
+    local b = st[key]
+    if not b then
+        if not create then return nil end
+        b = { buffBars = {}, debuffBars = {}, inhDis = {} }
+        st[key] = b
+    end
+    b.buffBars = b.buffBars or {}
+    b.debuffBars = b.debuffBars or {}
+    b.inhDis = b.inhDis or {}
+    return b
+end
+
+-- Bucket bar array for an EDITED view ("allspecs"/nil = the legacy arrays).
+function ns.PAB_BucketBars(isBuff, key, create)
+    local s = create and PABEnsure() or PAB()
+    if not s then return nil end
+    if not key or key == "allspecs" then
+        if isBuff then
+            if create then s.customBuffBars = s.customBuffBars or {} end
+            return s.customBuffBars
+        end
+        if create then s.customDebuffBars = s.customDebuffBars or {} end
+        return s.customDebuffBars
+    end
+    local b = SpecBarBucket(s, key, create)
+    if not b then return nil end
+    if isBuff then return b.buffBars end
+    return b.debuffBars
+end
+
+-- Per-spec disable of a GROUP bucket's bar, stored on the viewing spec's
+-- concrete "spec<ID>" bucket (ids are global, the bare id suffices).
+function ns.PAB_InhDisabled(concreteKey, id)
+    local s = PAB()
+    local b = s and SpecBarBucket(s, concreteKey, false)
+    return (b and b.inhDis and b.inhDis[id]) and true or false
+end
+
+function ns.PAB_SetInhDisabled(concreteKey, id, disabled)
+    local s = PABEnsure()
+    if not (s and concreteKey and id) then return end
+    local b = SpecBarBucket(s, concreteKey, true)
+    b.inhDis[id] = disabled and true or nil
+end
+
+-- Does bucketKey's content render for the given spec?
+local function BucketApplies(bucketKey, sid)
+    if not bucketKey or bucketKey == "allspecs" then return true end
+    local m = bucketKey:match("^spec(%d+)$")
+    if m then return sid == tonumber(m) end
+    if not sid then return false end
+    local roleKey = RoleBucketForSpecID(sid)
+    if bucketKey == "nonhealer" then return roleKey ~= "healers" end
+    return bucketKey == roleKey
+end
+
+-- Render verdict for a custom bar: the MODULE is on (Disable All is a full
+-- stand-down, custom bars included -- the field bug was custom bars
+-- lingering), the bar's own toggle is on, its owning bucket applies to the
+-- CURRENT spec, and (group buckets, All Specs included) this spec hasn't
+-- per-spec disabled it. bucketKey nil = legacy = "allspecs".
+function ns.PAB_BarActive(bar, bucketKey)
+    if not bar or bar.enabled == false then return false end
+    local sMaster = PAB()
+    if not sMaster or sMaster.enabled ~= true then return false end
+    local sid = CurrentSpecID()
+    if not BucketApplies(bucketKey, sid) then return false end
+    local isOwn = bucketKey and bucketKey:match("^spec%d") and true or false
+    if not isOwn and sid then
+        local s = PAB()
+        local con = s and s.pabSpecBars and s.pabSpecBars["spec" .. sid]
+        if con and con.inhDis and con.inhDis[bar.id] then return false end
+    end
+    return true
 end
 
 -------------------------------------------------------------------------------
@@ -2610,12 +4395,24 @@ end
 
 -- Applies bar.pos (or the default) to a custom bar's parent frame. Same SetPoint
 -- logic as ApplyBarPosition, kept separate only because custom bars key off bar.pos
--- on the bar object, not a fixed s[BarPositionKey] slot.
-local function ApplyCustomBarPosition(parent, bar, barId)
+-- on the bar object, not a fixed s[BarPositionKey] slot. Same anchored rule too.
+local function ApplyCustomBarPosition(parent, bar, barId, isBuff, grid)
+    local unlockKey = (isBuff and "PAB_CustomBuff_" or "PAB_CustomDebuff_") .. barId
+    local anchored = EllesmereUI.IsUnlockAnchored and EllesmereUI.IsUnlockAnchored(unlockKey)
+    if anchored and parent:GetNumPoints() > 0 and EllesmereUI.ReapplyOwnAnchor then
+        EllesmereUI.ReapplyOwnAnchor(unlockKey)
+        return
+    end
     local pos = bar.pos or DefaultCustomPos(barId)
+    local x, y = BarAnchorOffset(parent, bar, grid or ComputeGrid(isBuff, bar), pos)
     parent:ClearAllPoints()
-    local x, y = SnapBarPos(parent, pos.point, pos.relPoint or pos.point, pos.x, pos.y)
+    x, y = SnapBarPos(parent, pos.point, pos.relPoint or pos.point, x, y)
     parent:SetPoint(pos.point, UIParent, pos.relPoint or pos.point, x, y)
+    if bar.growDirection == "CENTER_HORIZONTAL" or bar.growDirection == "CENTER_VERTICAL" then
+        local centeredPos = RebaseBarPositionToCenter(parent, pos)
+        if bar.pos or centeredPos ~= pos then bar.pos = centeredPos end
+    end
+    if anchored and EllesmereUI.ReapplyOwnAnchor then EllesmereUI.ReapplyOwnAnchor(unlockKey) end
 end
 
 local function CustomBuffSpellSignature(spells)
@@ -2643,6 +4440,7 @@ local function RegisterPABCustomUnlock()
 
     local function MakeCustomBarElement(barId, bar, order, isBuff, parents)
         local key = (isBuff and "PAB_CustomBuff_" or "PAB_CustomDebuff_") .. barId
+        MapElementSettings(key, isBuff and "buff" or "debuff", barId)
         return key, MK({
             key = key,
             label = "PAB: " .. (bar.name or (isBuff and "Buff Bar" or "Debuff Bar")),
@@ -2651,8 +4449,12 @@ local function RegisterPABCustomUnlock()
             noResize = true,
             noAnchorTarget = true,
             isHidden = function()
-                local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
-                return not b or b.enabled == false
+                local b, bk
+                if isBuff then b, bk = ns.PAB_GetCustomBuffBar(barId)
+                else b, bk = ns.PAB_GetCustomDebuffBar(barId) end
+                -- Bucket-scoped bars drop their mover on specs they do not
+                -- render for (or were per-spec disabled on).
+                return not (b and ns.PAB_BarActive(b, bk))
             end,
             getFrame = function() return parents[barId] end,
             getSize = function()
@@ -2661,14 +4463,32 @@ local function RegisterPABCustomUnlock()
                 local grid = ComputeGrid(isBuff, b)
                 return grid.width, grid.height
             end,
+            -- Visual <-> stored conversion, as in RegisterPABUnlock's MakeBarElement.
             savePos = function(_, point, relPoint, x, y)
                 local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
                 if not b then return end
-                b.pos = { point = point, relPoint = relPoint or point, x = x, y = y }
+                b.pos = MoverStorePos(parents[barId], b, ComputeGrid(isBuff, b), b.pos, point, relPoint, x, y)
             end,
             loadPos = function()
                 local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
-                return b and b.pos or nil
+                local pos = b and b.pos
+                if not pos then return nil end
+                local x, y = BarAnchorOffset(parents[barId], b, ComputeGrid(isBuff, b), pos)
+                return { point = pos.point, relPoint = pos.relPoint, x = x, y = y }
+            end,
+            -- Raw stored position for spec-override layers, as in MakeBarElement.
+            loadRawPosition = function()
+                local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
+                local pos = b and b.pos
+                if not pos then return nil end
+                return { point = pos.point, relPoint = pos.relPoint, x = pos.x, y = pos.y,
+                    design = pos.design }
+            end,
+            saveRawPosition = function(_, p)
+                local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
+                if not (b and p and p.point) then return end
+                b.pos = { point = p.point, relPoint = p.relPoint or p.point,
+                    x = p.x, y = p.y, design = p.design }
             end,
             clearPos = function()
                 local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
@@ -2677,7 +4497,7 @@ local function RegisterPABCustomUnlock()
             applyPos = function()
                 local b = isBuff and ns.PAB_GetCustomBuffBar(barId) or ns.PAB_GetCustomDebuffBar(barId)
                 local parent = parents[barId]
-                if b and parent then ApplyCustomBarPosition(parent, b, barId) end
+                if b and parent then ApplyCustomBarPosition(parent, b, barId, isBuff) end
             end,
         })
     end
@@ -2701,21 +4521,58 @@ local function RegisterPABCustomUnlock()
             pabRegisteredCustomDebuffKeys[key] = true
         end
     end
+    -- Editing-spec bucket bars register too (every bucket -- isHidden drops
+    -- the mover on specs a bar doesn't render for).
+    do
+        local s = PAB()
+        local st = s and s.pabSpecBars
+        if st then
+            for _, b in pairs(st) do
+                local bl = b.buffBars
+                if bl then
+                    for i = 1, #bl do
+                        local bar = bl[i]
+                        local key, el = MakeCustomBarElement(bar.id, bar, 702, true, customBuffParents)
+                        elements[#elements + 1] = el
+                        pabRegisteredCustomBuffKeys[key] = true
+                    end
+                end
+                local dl = b.debuffBars
+                if dl then
+                    for i = 1, #dl do
+                        local bar = dl[i]
+                        local key, el = MakeCustomBarElement(bar.id, bar, 703, false, customDebuffParents)
+                        elements[#elements + 1] = el
+                        pabRegisteredCustomDebuffKeys[key] = true
+                    end
+                end
+            end
+        end
+    end
 
     if #elements > 0 then
         EllesmereUI:RegisterUnlockElements(elements, "EllesmereUIUnitFrames")
     end
 
     -- Retire keys for bars deleted since the last call -- safe here (unlike TBB)
-    -- because PAB custom-bar ids are permanent, see doc comment above.
+    -- because PAB custom-bar ids are permanent, see doc comment above. The
+    -- element-options map entry is retired with the mover; a leftover entry would
+    -- be harmless (no mover, no cog) but the id is gone for good either way.
+    local elemMap = EllesmereUI._ELEMENT_SETTINGS_MAP
     if prevBuffKeys then
         for key in pairs(prevBuffKeys) do
-            if not pabRegisteredCustomBuffKeys[key] then EllesmereUI:UnregisterUnlockElement(key) end
+            if not pabRegisteredCustomBuffKeys[key] then
+                EllesmereUI:UnregisterUnlockElement(key)
+                if elemMap then elemMap[key] = nil end
+            end
         end
     end
     if prevDebuffKeys then
         for key in pairs(prevDebuffKeys) do
-            if not pabRegisteredCustomDebuffKeys[key] then EllesmereUI:UnregisterUnlockElement(key) end
+            if not pabRegisteredCustomDebuffKeys[key] then
+                EllesmereUI:UnregisterUnlockElement(key)
+                if elemMap then elemMap[key] = nil end
+            end
         end
     end
 end
@@ -2734,8 +4591,7 @@ ns.PAB_RegisterCustomUnlock = RegisterPABCustomUnlock
 local function ReloadCustomBuffBarImpl(barId)
     AK = AK or (EllesmereUI and EllesmereUI.AuraKit)
     if not AK then return end
-
-    local bar = ns.PAB_GetCustomBuffBar(barId)
+    local bar, barBucket = ns.PAB_GetCustomBuffBar(barId)
     if not bar then
         -- Deleted: release the container (frees its slot-button tracking; engine
         -- frames themselves are never destroyed) and hide the now-orphaned parent.
@@ -2744,6 +4600,9 @@ local function ReloadCustomBuffBarImpl(barId)
         customBuffContainers[barId], customBuffParents[barId], customBuffSig[barId], customBuffDeclared[barId] = nil, nil, nil, nil
         return
     end
+    if DeferRestrictedApply("custom-buff-" .. barId,
+        function() ns.PAB_ReloadCustomBuffBar(barId) end,
+        customBuffContainers[barId], bar.growDirection) then return end
 
     local styleKey = CustomBuffStyleKey(barId)
     AK.styles[styleKey] = BuildStyle(true, bar)
@@ -2755,18 +4614,40 @@ local function ReloadCustomBuffBarImpl(barId)
     -- RestyleSoon re-runs ApplyStyleToRegions against every already-live button
     -- under that key.
     AK.RestyleSoon(styleKey)
+    SyncCancelCVar()
 
+    local grid = ComputeGrid(true, bar)
     local parent = customBuffParents[barId]
+    local fresh = false
     if not parent then
         parent = CreateFrame("Frame", "EllesmereUIPlayerAuraBars_CustomBuff" .. barId, UIParent)
         customBuffParents[barId] = parent
+        parent:SetSize(grid.width, grid.height)
+        fresh = true
     end
-    ApplyCustomBarPosition(parent, bar, barId)
-    parent:SetShown(bar.enabled ~= false)
-    if bar.enabled == false then return end
+    -- Same anchor-ancestor rule as ApplyLiveConfig: an EXISTING parent has the engine
+    -- container anchored to it, so its position/size writes are blocked in lockdown --
+    -- skip them and reconcile with one full reload at the regen edge (position deltas
+    -- are not tracked per bar, so the queue is unconditional on the skip). A parent
+    -- created THIS pass has no container anchored yet and stays fully writable. The
+    -- config re-drive below still runs -- that is what the in-combat recovery needs.
+    local geomLocked = not fresh and InCombatLockdown()
+    if geomLocked then
+        QueuePABRegenApply("custom-buff-" .. barId, function() ns.PAB_ReloadCustomBuffBar(barId) end)
+    else
+        ApplyCustomBarPosition(parent, bar, barId, true, grid)
+    end
+    -- Effective render verdict: the bar's own toggle AND its editing-spec
+    -- bucket's applicability to the current spec AND this spec's per-spec
+    -- disable of group bars. Inactive parks exactly like disabled.
+    local barActive = ns.PAB_BarActive(bar, barBucket)
+    SetParentShownSafe("custom-buff-" .. barId, parent, barActive,
+        function() ns.PAB_ReloadCustomBuffBar(barId) end)
+    if not barActive then return end
 
-    local grid = ComputeGrid(true, bar)
-    parent:SetSize(grid.width, grid.height)
+    if not geomLocked then
+        parent:SetSize(grid.width, grid.height)
+    end
 
     local spells = ns.PAB_ResolveSpells(bar)
     local sig = CustomBuffSpellSignature(spells)
@@ -2792,10 +4673,7 @@ local function ReloadCustomBuffBarImpl(barId)
             if #spells > 0 then
                 local livePad = bar.padding or 5
                 container:SetAuraGroupMaxFrameCount("spells", grid.effectiveMax)
-                container:SetAuraGroupLayout("spells", {
-                    elementSpacing = livePad, lineSpacing = grid.rowGap,
-                    groupSpacing = livePad, groupLineSpacing = grid.rowGap,
-                })
+                container:SetAuraGroupLayout("spells", BuildGroupLayout(bar, livePad, grid.rowGap))
                 local liveIncludeMap = {}
                 for i = 1, #spells do liveIncludeMap[spells[i]] = true end
                 container:SetAuraGroupCandidateFilters("spells",
@@ -2813,11 +4691,11 @@ local function ReloadCustomBuffBarImpl(barId)
         customBuffContainers[barId] = nil
     end
 
-    local _, spec, specVertical = BuildContainerSpec(parent, bar, grid)
+    local _, spec = BuildContainerSpec(parent, bar, grid)
     local pad = bar.padding or 5
     AK.RequestContainer(parent, "player", spec, function(container)
         customBuffContainers[barId] = container
-        AK.SetContainerAxis(container, specVertical)
+        ApplyContainerAnchorAndGrowth(container, parent, bar, grid)
         customBuffSig[barId] = sig
         customBuffDeclared[barId] = {}
         ApplyGroupConfig(container, allChain, customBuffDeclared[barId], styleKey, grid.effectiveMax, pad, grid.rowGap, bar, BuffCandidateExtras(bar))
@@ -2832,10 +4710,7 @@ local function ReloadCustomBuffBarImpl(barId)
                 candidateFilters = MergeCandidateFilters({ includeSpellIDs = includeMap }, BuffCandidateExtras(bar)),
                 sortMethod = ResolveSortMethod(bar),
                 sortDirection = ResolveSortDirection(bar),
-            })
-            container:SetAuraGroupLayout("spells", {
-                elementSpacing = pad, lineSpacing = grid.rowGap,
-                groupSpacing = pad, groupLineSpacing = grid.rowGap,
+                layout = BuildGroupLayout(bar, pad, grid.rowGap),
             })
         end
     end)
@@ -2855,8 +4730,7 @@ end
 local function ReloadCustomDebuffBarImpl(barId)
     AK = AK or (EllesmereUI and EllesmereUI.AuraKit)
     if not AK then return end
-
-    local bar = ns.PAB_GetCustomDebuffBar(barId)
+    local bar, barBucket = ns.PAB_GetCustomDebuffBar(barId)
     if not bar then
         if customDebuffContainers[barId] then
             -- Groups cannot be un-declared, so zero every group's frame count instead:
@@ -2877,39 +4751,57 @@ local function ReloadCustomDebuffBarImpl(barId)
         customDebuffParents[barId], customDebuffContainers[barId], customDebuffDeclared[barId] = nil, nil, nil
         return
     end
+    if DeferRestrictedApply("custom-debuff-" .. barId,
+        function() ns.PAB_ReloadCustomDebuffBar(barId) end,
+        customDebuffContainers[barId], bar.growDirection) then return end
 
     local styleKey = CustomDebuffStyleKey(barId)
     AK.styles[styleKey] = BuildStyle(false, bar)
     -- Required for the same reason as ReloadCustomBuffBarImpl above.
     AK.RestyleSoon(styleKey)
 
+    local grid = ComputeGrid(false, bar)
     local parent = customDebuffParents[barId]
+    local fresh = false
     if not parent then
         parent = CreateFrame("Frame", "EllesmereUIPlayerAuraBars_CustomDebuff" .. barId, UIParent)
         customDebuffParents[barId] = parent
+        parent:SetSize(grid.width, grid.height)
+        fresh = true
     end
-    ApplyCustomBarPosition(parent, bar, barId)
-    parent:SetShown(bar.enabled ~= false)
-    if bar.enabled == false then return end
+    -- Same lockdown rule as the custom buff reload above (anchor-ancestor geometry
+    -- block; full-reload reconcile at regen; fresh parents stay writable).
+    local geomLocked = not fresh and InCombatLockdown()
+    if geomLocked then
+        QueuePABRegenApply("custom-debuff-" .. barId, function() ns.PAB_ReloadCustomDebuffBar(barId) end)
+    else
+        ApplyCustomBarPosition(parent, bar, barId, false, grid)
+    end
+    -- Same effective-render verdict as the custom buff reload above.
+    local barActive = ns.PAB_BarActive(bar, barBucket)
+    SetParentShownSafe("custom-debuff-" .. barId, parent, barActive,
+        function() ns.PAB_ReloadCustomDebuffBar(barId) end)
+    if not barActive then return end
 
-    local grid = ComputeGrid(false, bar)
-    parent:SetSize(grid.width, grid.height)
+    if not geomLocked then
+        parent:SetSize(grid.width, grid.height)
+    end
 
-    local chain = BuildChain("HARMFUL", function(class) return ClassEnabled(class, false, bar) or (PAB_FxSafeToForce(class) and PAB_FxWantsCategory(bar.fxList, class.key)) end, bar.showAllDebuffs ~= false, DebuffSubtractFn(bar))
-    local _, spec, vertical = BuildContainerSpec(parent, bar, grid)
+    local chain = DebuffChainFor(bar)
+    local _, spec = BuildContainerSpec(parent, bar, grid)
     local pad = bar.padding or 5
 
     if not customDebuffContainers[barId] then
         AK.RequestContainer(parent, "player", spec, function(container)
             customDebuffContainers[barId] = container
-            AK.SetContainerAxis(container, vertical)
+            ApplyContainerAnchorAndGrowth(container, parent, bar, grid)
             customDebuffDeclared[barId] = {}
-            ApplyGroupConfig(container, chain, customDebuffDeclared[barId], styleKey, grid.effectiveMax, pad, grid.rowGap, bar)
+            ApplyGroupConfig(container, chain, customDebuffDeclared[barId], styleKey, grid.effectiveMax, pad, grid.rowGap, bar, DebuffCandidateExtras(bar))
         end)
     else
         local container = customDebuffContainers[barId]
         ApplyContainerAnchorAndGrowth(container, parent, bar, grid)
-        ApplyGroupConfig(container, chain, customDebuffDeclared[barId], styleKey, grid.effectiveMax, pad, grid.rowGap, bar)
+        ApplyGroupConfig(container, chain, customDebuffDeclared[barId], styleKey, grid.effectiveMax, pad, grid.rowGap, bar, DebuffCandidateExtras(bar))
     end
 end
 
@@ -2919,17 +4811,60 @@ function ns.PAB_ReloadCustomDebuffBar(barId)
     if PAB_MaybeRefreshPreview then PAB_MaybeRefreshPreview("debuff", barId) end
 end
 
--- Rebuilds every persisted custom bar's engine state. Called once from TryCreateBars
--- alongside the default bars, and safe to call again any time (profile switch): both
--- reload functions above are idempotent no-ops when nothing changed.
+-- Rebuilds every persisted custom bar's engine state. Called once from CreateBars
+-- alongside the default bars, and safe to call again any time (profile switch, spec
+-- change): both reload functions above are idempotent no-ops when nothing changed.
+-- Iterates the legacy arrays AND every editing-spec bucket -- each per-bar reload
+-- resolves its own effective verdict, so bars from now-inactive buckets park their
+-- frames exactly like disabled ones.
 local function ReloadAllCustomBarsImpl()
+    local presentBuff, presentDebuff = {}, {}
     local buffList = ns.PAB_CustomBuffBars()
     if buffList then
-        for i = 1, #buffList do ns.PAB_ReloadCustomBuffBar(buffList[i].id) end
+        for i = 1, #buffList do
+            presentBuff[buffList[i].id] = true
+            ns.PAB_ReloadCustomBuffBar(buffList[i].id)
+        end
     end
     local debuffList = ns.PAB_CustomDebuffBars()
     if debuffList then
-        for i = 1, #debuffList do ns.PAB_ReloadCustomDebuffBar(debuffList[i].id) end
+        for i = 1, #debuffList do
+            presentDebuff[debuffList[i].id] = true
+            ns.PAB_ReloadCustomDebuffBar(debuffList[i].id)
+        end
+    end
+    local s = PAB()
+    local st = s and s.pabSpecBars
+    if st then
+        for _, b in pairs(st) do
+            local bl = b.buffBars
+            if bl then
+                for i = 1, #bl do
+                    presentBuff[bl[i].id] = true
+                    ns.PAB_ReloadCustomBuffBar(bl[i].id)
+                end
+            end
+            local dl = b.debuffBars
+            if dl then
+                for i = 1, #dl do
+                    presentDebuff[dl[i].id] = true
+                    ns.PAB_ReloadCustomDebuffBar(dl[i].id)
+                end
+            end
+        end
+    end
+    -- STALE SWEEP (field bug: a bar from the PREVIOUS profile stayed on
+    -- screen after a profile swap): addon-side parents/containers are keyed
+    -- by bar id and outlive the profile table. Any id the CURRENT profile no
+    -- longer carries takes the per-bar reload's deleted-bar branch, which
+    -- retires the container, hides the parent and clears the bookkeeping.
+    -- (Lua 5.1: clearing the CURRENT key during pairs() is legal; the
+    -- deleted-bar branch nils exactly the iterated id.)
+    for barId in pairs(customBuffParents) do
+        if not presentBuff[barId] then ns.PAB_ReloadCustomBuffBar(barId) end
+    end
+    for barId in pairs(customDebuffParents) do
+        if not presentDebuff[barId] then ns.PAB_ReloadCustomDebuffBar(barId) end
     end
 end
 ReloadAllCustomBars = ReloadAllCustomBarsImpl
@@ -3109,11 +5044,11 @@ local function PreviewSpellIcon(spellID)
 end
 
 -- Weapon-enchant preview cells, leading the bar exactly like the live ones
--- (EUI_UnitFrames_WeaponEnchants.lua publishes them ahead of the engine run).
+-- (the engine flows its item-enchantment group ahead of the aura groups).
 -- Main hand + off hand only: those are the two slots reachable in current
--- retail content, even though both that module's SLOTS and Blizzard's
--- UpdateTemporaryEnchantmentBuffs still poll a third (ranged) -- so a bar sized
--- for three enchants shows one placeholder cell of genuine spare capacity here,
+-- retail content, even though the engine declares a third (ranged), as
+-- Blizzard's own UpdateTemporaryEnchantmentBuffs does -- so a bar sized for
+-- three enchants shows one placeholder cell of genuine spare capacity here,
 -- which is what the live bar would do too.
 --
 -- Paints the player's OWN equipped weapon icons rather than an invented sample:
@@ -3128,9 +5063,12 @@ local PREVIEW_ENCHANT_SLOTS = { INVSLOT_MAINHAND or 16, INVSLOT_OFFHAND or 17 }
 -- unknown-icon question mark there would advertise a cell the player can never
 -- fill. An unarmed character still gets the single main-hand cell, so ticking
 -- the option always previews as something rather than silently nothing.
+-- Walked in REVERSE, mirroring the live group's sortDirection: the engine puts
+-- the first element at the leading edge, so main hand ends up adjacent to the
+-- aura run (see BuildEnchantSpec), off hand out at the corner.
 local function PreviewEnchantSlots()
     local out = {}
-    for i = 1, #PREVIEW_ENCHANT_SLOTS do
+    for i = #PREVIEW_ENCHANT_SLOTS, 1, -1 do
         local slot = PREVIEW_ENCHANT_SLOTS[i]
         if GetInventoryItemTexture("player", slot) then out[#out + 1] = slot end
     end
@@ -3275,6 +5213,16 @@ local function CreatePreviewIcon(box)
     btn.cooldown:SetHideCountdownNumbers(true)
     btn.cooldown:Hide()
     btn.border = CreateFrame("Frame", nil, btn)
+    btn.borderState = {}
+    -- Dispel-type icon host: a child frame created after the cooldown and the border,
+    -- so the icon draws above the swipe and the border like the live button's holder.
+    -- A texture on the button itself sits under every child frame whatever its layer,
+    -- so the frozen preview swipe covered it.
+    btn.typeHost = CreateFrame("Frame", nil, btn)
+    btn.typeHost:SetAllPoints()
+    -- Plain preview region, not a real AuraKit button -- masking is unguarded here.
+    btn.shapeMask = btn:CreateMaskTexture()
+    btn.shapeMask:Hide()
     btn.textHost = CreateFrame("Frame", nil, btn)
     btn.duration = btn.textHost:CreateFontString(nil, "OVERLAY")
     btn.stack = btn.textHost:CreateFontString(nil, "OVERLAY")
@@ -3325,9 +5273,32 @@ local function ApplyPreviewScale(cfg, comp)
     out.padding = (cfg.padding or 5) * comp
     out.rowSpacing = cfg.rowSpacing and (cfg.rowSpacing * comp) or nil
     out.borderSize = (cfg.borderSize or 1) * comp
+    -- Textured borders use a discrete 0-4 lookup for edge art. Preserve that raw
+    -- key and scale the resolved edge/offset geometry separately; Solid continues
+    -- to use the compensated borderSize above.
+    out.borderTextureSizeOverride = cfg.borderSize or 1
+    out.borderTextureScaleOverride = comp
+    -- PabShapeBorderSize is keyed by the raw 0-4 level, so it must run BEFORE scaling
+    -- (unlike out.borderSize above) -- resolve the level, then scale the result,
+    -- mirroring iconSize's own scale-after-resolve treatment. BuildStyle prefers this
+    -- over recomputing from the already-scaled out.borderSize when present.
+    out.shapeBorderSizeOverride = PabShapeBorderSize(cfg.borderSize or 1) * comp
+    -- The exact size (borderSizePx) pairs with the RAW step and texture, so it is
+    -- resolved here, before the compensation above, and handed to BuildStyle as
+    -- borderPxOverride. Solid scales like borderSize; a textured edge stays raw
+    -- because the eight-slice draw scales it by borderTextureScaleOverride itself.
+    local rawTex = cfg.borderTexture
+    local rawPx = EllesmereUI.BorderPx(cfg.borderSizePx, cfg.borderSize or 1, rawTex)
+    if rawPx then
+        local textured = rawTex and rawTex ~= "" and rawTex ~= "solid"
+        out.borderPxOverride = textured and rawPx or (rawPx * comp)
+    end
     out.durationTextSize = (cfg.durationTextSize or 11) * comp
     out.durationOffsetX = (cfg.durationOffsetX or 0) * comp
     out.durationOffsetY = (cfg.durationOffsetY or 0) * comp
+    out.dispelIconSize = (cfg.dispelIconSize or 16) * comp
+    out.dispelIconOffsetX = (cfg.dispelIconOffsetX or 0) * comp
+    out.dispelIconOffsetY = (cfg.dispelIconOffsetY or 0) * comp
     out.stackTextSize = (cfg.stackTextSize or 11) * comp
     out.stackOffsetX = (cfg.stackOffsetX or 0) * comp
     out.stackOffsetY = (cfg.stackOffsetY or 0) * comp
@@ -3394,7 +5365,9 @@ local function HasFillerSource(isBuff, cfg)
     if isBuff then
         return cfg.showAllBuffs ~= false or cfg.hasDuration == true
     end
-    return cfg.showAllDebuffs ~= false or HasAnyTrue(cfg.classFilters)
+    -- Match All picks that can never match together render nothing.
+    if ns.PAB_DebuffMatchEmpty(cfg) then return false end
+    return cfg.showAllDebuffs ~= false or cfg.hasDuration == true or HasAnyTrue(cfg.classFilters)
 end
 
 -- BuildPreviewSlots (below) builds one descriptor per icon slot (length `count`).
@@ -3434,10 +5407,26 @@ end
 -- reshuffle on every live-apply refresh.
 local function BuildMixedRealSpells(cfg)
     local sources = {}
-    -- Under Show All Buffs the checked filters are a SUBTRACT set (see
-    -- BuffBarChain): they must not surface as leading real icons; the filler
-    -- pool drops their spells instead (BuildPreviewSlots).
+    -- Broad modes render through the catch-all, so show-lane real icons only exist in
+    -- add mode; the hide lane (cfg.negFilters) drops its spells from these sources the
+    -- same way the live spells group resolves (PAB_ResolveSpells) -- Extra Spells are
+    -- a separate source below and win over the hide lane there too.
     if cfg.filters and cfg.showAllBuffs == false and cfg.hasDuration ~= true then
+        local negSet
+        if cfg.negFilters then
+            for filterId in pairs(cfg.negFilters) do
+                local nf = ns.PAB_GetFilter and ns.PAB_GetFilter(filterId)
+                if nf and nf.spells then
+                    for id, on in pairs(nf.spells) do
+                        if on then
+                            negSet = negSet or {}
+                            negSet[id] = true
+                            ExpandFamily(negSet, id, nf.spells)
+                        end
+                    end
+                end
+            end
+        end
         local allFilters = ns.PAB_Filters and ns.PAB_Filters()
         if allFilters then
             for i = 1, #allFilters do
@@ -3445,7 +5434,7 @@ local function BuildMixedRealSpells(cfg)
                 if cfg.filters[f.id] then
                     local ids = {}
                     for id, on in pairs(f.spells) do
-                        if on then ids[#ids + 1] = id end
+                        if on and not (negSet and negSet[id]) then ids[#ids + 1] = id end
                     end
                     if #ids > 0 then
                         table.sort(ids)
@@ -3490,28 +5479,22 @@ local function BuildPreviewSlots(isBuff, cfg, list, listLen, count)
     -- appear, not just their order. Truncate to `count` on the stable, sort-
     -- independent mixed order FIRST, then sort that fixed selection for display.
     -- Weapon enchants take the LEADING cells and are never sorted into the aura
-    -- content: they are not auras. They are also ADDITIVE, not a slice of the
-    -- bar's capacity -- the live container keeps its full maxFrameCount and is
-    -- shifted past them wholesale (ShiftBuffsForEnchants), so an enchant never
-    -- costs an aura its slot.
+    -- content: they are not auras. They do take a cell each, though: Max Icons
+    -- counts the whole bar, so the aura slots below are what is left after them.
     local numEnch, enchSlots = 0, nil
-    if isBuff and cfg.showWeaponEnchants == true then
+    if isBuff and ns.PAB_EnchantsOn(cfg) then
         enchSlots = PreviewEnchantSlots()
         numEnch = #enchSlots
     end
-    -- The two modes are genuinely different shapes and the preview mirrors both:
-    --   * alongside auras -- the container keeps its full maxFrameCount and is
-    --     shifted past the enchants wholesale, so they cost no aura its slot and
-    --     the first row overflows the reserved grid by the shift.
-    --   * enchants-only -- the grid was auto-sized FOR the enchants
-    --     (SyncWeaponEnchantsGrid) and the container holds no groups, so the
-    --     cells sit INSIDE that reserved width. The leftover cells stay as
-    --     placeholders on purpose: they are what explains where the bar's width
-    --     comes from, and dropping them made the 3-wide frame look arbitrary.
-    local avail = count
-    if isBuff and ns.PAB_IsWeaponEnchantsOnly(cfg) then
-        avail = math.max(0, count - numEnch)
-    end
+    -- Both modes render exactly `count` cells, which is what Max Icons promises:
+    -- the enchant cells lead, the aura slots take the rest. The enchants-only
+    -- bar keeps its leftovers as placeholders on purpose -- they are what
+    -- explains where the bar's width comes from.
+    --
+    -- The live bar counts the enchants ACTUALLY up (BuffAuraMax); the preview
+    -- counts the weapon slots that could carry one, so an unenchanted character
+    -- still sees the shape the option produces.
+    local avail = math.max(0, count - numEnch)
 
     local mixed = isBuff and DedupeByIcon(BuildMixedRealSpells(cfg)) or nil
     local extraIDs
@@ -3532,18 +5515,19 @@ local function BuildPreviewSlots(isBuff, cfg, list, listLen, count)
     end
     if numFiller > 0 then
         if hasFiller then
-            -- Buff subtract mode (All Buffs on + checked filters): the filler pool
+            -- Buff subtract mode (broad mode + hide-lane filters): the filler pool
             -- drops every subtracted spell, matching what the live catch-all's
             -- excludeSpellIDs removes.
             local subSet
-            if isBuff and (cfg.showAllBuffs ~= false or cfg.hasDuration == true) and cfg.filters then
-                for filterId in pairs(cfg.filters) do
+            if isBuff and (cfg.showAllBuffs ~= false or cfg.hasDuration == true) and cfg.negFilters then
+                for filterId in pairs(cfg.negFilters) do
                     local f = ns.PAB_GetFilter and ns.PAB_GetFilter(filterId)
                     if f and f.spells then
                         for id, on in pairs(f.spells) do
                             if on then
                                 subSet = subSet or {}
                                 subSet[id] = true
+                                ExpandFamily(subSet, id, f.spells)
                             end
                         end
                     end
@@ -3664,7 +5648,8 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
     -- box/divider while doing it.
     local growDir = cfg.growDirection or "LEFT"
     local wrapDir = cfg.iconWrapDirection or "LEFT"
-    local vertical = (growDir == "UP" or growDir == "DOWN")
+    local centeredVertical = growDir == "CENTER_VERTICAL"
+    local vertical = (growDir == "UP" or growDir == "DOWN" or centeredVertical)
     local corner = CornerFor(growDir, wrapDir)
     local pad = cfg.padding or 5
     local rowGap = cfg.rowSpacing or 12
@@ -3678,11 +5663,12 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
     -- selects the fixed filler slice from this stable, shuffled-once order FIRST, sorts after.
     local list = (pool and #pool > 0 and pool) or (isBuff and PREVIEW_BUFF_SPELLS or PREVIEW_DEBUFF_SPELLS)
     local listLen = #list
-    local slots, numEnch = BuildPreviewSlots(isBuff, cfg, list, listLen, count)
+    -- Enchant cells are the leading `slots` entries and carry their own kind,
+    -- so the packing below needs no separate count of them.
+    local slots = BuildPreviewSlots(isBuff, cfg, list, listLen, count)
     -- Enchants are additive leading cells, so the rendered total exceeds the
     -- bar's aura capacity by however many are showing.
     local total = #slots
-    local auraCount = total - numEnch
 
     -- Icon Effects Per-Filter preview (debuffs only): deliberately NOT tied to the
     -- bar's own active Base Filters/Show All Debuffs state -- requiring a matching
@@ -3714,42 +5700,37 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
         end
     end
 
-    local rows = math.max(1, math.ceil(auraCount / cols))
+    -- Enchant cells share the line with the auras (one engine flow, see the
+    -- packing block below), so they count toward the wrap.
+    local rows = math.max(1, math.ceil(total / cols))
 
     -- Real per-icon flow packing: each slot's OWN actual render size (its fx Size
     -- override, or the bar's base iconSize) drives its own footprint directly, so
     -- spacing between normal icons stays tight and only an oversized icon's immediate
     -- neighbors get pushed out -- true flow-layout behavior rather than a uniform
-    -- worst-case cell grid (which left too much gap around every normal icon).
+    -- worst-case cell grid (which left too much gap around every normal icon). Shape-
+    -- expanded the same as the live bar's own button SetSize (BuildStyle/
+    -- EnsurePabSizedStyle), so preview spacing/footprint matches the real bar.
     local slotSize = {}
     for i = 1, total do
         local e = fxBySlot and fxBySlot[i]
         local sz = e and tonumber(e.size)
-        slotSize[i] = (sz and sz > 0) and sz or iconSize
+        slotSize[i] = PabShapedSize((sz and sz > 0) and sz or iconSize, cfg.iconShape)
     end
 
     local rowWidth, rowHeight, colOffset, rowYOffset = {}, {}, {}, {}
     do
-        -- Weapon enchants lead row 0 at the bar's own corner, and the aura block
-        -- starts past them on EVERY row -- ShiftBuffsForEnchants moves the whole
-        -- container, not just its first line, so lower rows stay indented by the
-        -- same amount and the first row overflows the reserved grid by the
-        -- shift. That asymmetry is the real bar's behavior; packing enchants as
-        -- plain leading members of one uniform flow would wrap row 2 back to the
-        -- bar's edge and misrepresent it.
-        local enchShift = 0
-        for k = 1, numEnch do
-            colOffset[k] = enchShift
-            enchShift = enchShift + slotSize[k] + pad
-            rowHeight[0] = math.max(rowHeight[0] or 0, slotSize[k])
-        end
-
+        -- ONE uniform flow, enchants first: the engine lays the weapon-enchant
+        -- frames out as their own layout group placed BEFORE the aura groups
+        -- on the same container, so they lead row 0 as plain members of the
+        -- line and row 2 wraps back to the bar's own edge, no per-row indent.
+        -- Their cells come out of the aura cap, so the box always fits.
         local runningX, runningY = {}, 0
-        for r = 0, rows - 1 do runningX[r] = enchShift end
-        for i = numEnch + 1, total do
-            local r = math.floor((i - numEnch - 1) / cols)
-            colOffset[i] = runningX[r]
-            runningX[r] = runningX[r] + slotSize[i] + pad
+        for r = 0, rows - 1 do runningX[r] = 0 end
+        for i = 1, total do
+            local r = math.floor((i - 1) / cols)
+            colOffset[i] = runningX[r] or 0
+            runningX[r] = (runningX[r] or 0) + slotSize[i] + pad
             rowHeight[r] = math.max(rowHeight[r] or 0, slotSize[i])
         end
         for r = 0, rows - 1 do
@@ -3769,6 +5750,10 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
     local halfPrimary, halfCross = blockW / 2, blockH / 2
     local growUp = (growDir == "UP")
     local wrapRight = (wrapDir == "RIGHT")
+    -- Read the wrap-up state off the CORNER, not off wrapDir: CornerFor only emits a
+    -- BOTTOM component where an Up wrap is actually in effect, so the preview cannot
+    -- drift from the real bars or inherit a stale wrap in the centered modes.
+    local wrapUp = (corner == "BOTTOMLEFT" or corner == "BOTTOMRIGHT")
 
     for i = 1, math.max(total, #icons) do
         if i <= total then
@@ -3778,29 +5763,29 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
                 icons[i] = btn
             end
 
-            -- Enchant cells all live on row 0; aura slots index into their own
-            -- block, which starts after them (see the packing block above).
-            local row = (i <= numEnch) and 0
-                or math.floor((i - numEnch - 1) / cols)
+            local row = math.floor((i - 1) / cols)
             local withinLineStep = colOffset[i]
             local acrossLinesStep = rowYOffset[row]
             -- btn's own anchor point is `corner` (matching growDirection/
             -- iconWrapDirection), placed at an offset from the box's CENTER -- see the
             -- block-centering comment above `local rows = ...`. Vertical growth
-            -- (Up/Down) swaps which step drives X vs Y: the within-line step (icons
+            -- swaps which step drives X vs Y: the within-line step (icons
             -- stacking inside one column) becomes Y, the across-lines step (columns
             -- wrapping sideways) becomes X -- mirrors the corner/growthH/growthV swap
             -- in CornerFor/BuildContainerSpec used by the real (non-preview) bars.
             local btnX, btnY
-            if vertical then
+            if centeredVertical then
+                btnY = halfPrimary - withinLineStep - slotSize[i] / 2
+                btnX = -halfCross + acrossLinesStep + slotSize[i] / 2
+            elseif vertical then
                 btnY = growUp and (-halfPrimary + withinLineStep) or (halfPrimary - withinLineStep)
                 btnX = wrapRight and (-halfCross + acrossLinesStep) or (halfCross - acrossLinesStep)
             else
-                btnX = (corner == "TOPRIGHT") and (halfPrimary - withinLineStep) or (-halfPrimary + withinLineStep)
-                btnY = halfCross - acrossLinesStep
+                btnY = wrapUp and (-halfCross + acrossLinesStep) or (halfCross - acrossLinesStep)
+                btnX = (corner == "TOPRIGHT" or corner == "BOTTOMRIGHT") and (halfPrimary - withinLineStep) or (-halfPrimary + withinLineStep)
             end
             btn:ClearAllPoints()
-            btn:SetPoint(corner, box, "CENTER", btnX, btnY)
+            btn:SetPoint(centeredVertical and "CENTER" or corner, box, "CENTER", btnX, btnY)
             btn:SetSize(slotSize[i], slotSize[i])
 
             local slot = slots[i]
@@ -3844,8 +5829,45 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
                 btn.icon:SetTexCoord(z, 1 - z, z, 1 - z)
             end
 
-            btn.border:SetAllPoints(btn.icon)
-            btn.border:SetFrameLevel(btn:GetFrameLevel() + 1)
+            -- Mirrors EllesmereUI_AuraKit.lua's ApplyStyleToRegions, unguarded (plain regions).
+            local shapeActive = style.iconShape and style.iconShape ~= "none" and style.shapeMaskPath
+            if shapeActive then
+                btn.shapeMask:SetTexture(style.shapeMaskPath, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+                btn.shapeMask:SetAllPoints(btn)
+                btn.shapeMask:Show()
+                local sz = slotSize[i]
+                local zoom = style.iconZoom or 0.055
+                local shapeKey = style.iconShape .. "|" .. sz .. "|" .. zoom
+                if btn._shapeApplied ~= shapeKey then
+                    pcall(btn.icon.RemoveMaskTexture, btn.icon, btn.shapeMask)
+                    btn.icon:AddMaskTexture(btn.shapeMask)
+                    local insetPx = style.shapeInsetPx or 17
+                    local visRatio = (128 - 2 * insetPx) / 128
+                    local fullExpand = ((1 / visRatio) - 1) * 0.5
+                    -- Coupled to Icon Zoom, same as the live bar (EllesmereUI_AuraKit.lua).
+                    local expand = math.max(fullExpand * (zoom / 0.055), 0)
+                    btn.icon:ClearAllPoints()
+                    btn.icon:SetPoint("TOPLEFT", btn, "TOPLEFT", -expand * sz, expand * sz)
+                    btn.icon:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", expand * sz, -expand * sz)
+                    btn._shapeApplied = shapeKey
+                end
+            else
+                if btn._shapeApplied then
+                    pcall(btn.icon.RemoveMaskTexture, btn.icon, btn.shapeMask)
+                    btn.icon:ClearAllPoints()
+                    btn.icon:SetAllPoints()
+                    btn._shapeApplied = nil
+                end
+                btn.shapeMask:Hide()
+            end
+
+            btn.border:SetAllPoints(shapeActive and btn or btn.icon)
+            btn.border:SetFrameLevel(style.border and style.border.behind
+                and math.max(0, btn:GetFrameLevel() - 1)
+                or (btn:GetFrameLevel() + 1))
+            -- Type-icon host above the border's strip container (+1) and the fx
+            -- border/glow hosts (+1/+2), like the live dispel holder clears them.
+            btn.typeHost:SetFrameLevel(btn.border:GetFrameLevel() + 3)
             local PP = EllesmereUI and EllesmereUI.PanelPP
             if PP and style.border then
                 local br, bg, bb, ba = style.border[1], style.border[2], style.border[3], style.border[4]
@@ -3854,22 +5876,68 @@ local function RenderPreviewIcons(box, icons, isBuff, cfg, fontPath, pool)
                     br, bg, bb, ba = c.r, c.g, c.b, 1
                 end
                 local size = style.border.size or 1
-                -- PP.CreateBorder is create-ONCE-only -- a second call with a different
-                -- size/color on an already-created host is a silent no-op
-                -- (EllesmereUI.lua's PP.CreateBorder early-returns the cached container
-                -- without touching bd.borderSize/borderColor). Live border-size/color
-                -- changes on an already-created host must go through PP.UpdateBorder
-                -- instead -- the same borderMade branch EllesmereUI_AuraKit.lua's own
-                -- ApplyStyleToRegions uses for the real bar's borders.
-                if btn.borderMade then
-                    PP.UpdateBorder(btn.border, size, br, bg, bb, ba)
-                elseif PP.CreateBorder then
-                    PP.CreateBorder(btn.border, br, bg, bb, ba, size, "OVERLAY", 7)
+                if shapeActive and style.shapeBorderPath and PP.ApplyMaskedShapeBorder then
+                    if EllesmereUI.HideBorderStyle then EllesmereUI.HideBorderStyle(btn.border) end
+                    if btn.borderState and btn.borderState._secretBorderEdges then
+                        for _, tex in pairs(btn.borderState._secretBorderEdges) do tex:Hide() end
+                    end
+                    PP:ApplyMaskedShapeBorder(btn.border, btn.shapeMask, style.shapeBorderPath, style.shapeBorderSize or size, br, bg, bb, ba)
+                    btn.border:Show()
+                else
+                    if PP.HideMaskedShapeBorder then PP:HideMaskedShapeBorder(btn.border)
+                    elseif btn.border._shapeBorderTex then btn.border._shapeBorderTex:Hide() end
+                    local b = style.border
+                    local appliedSize = (b.texture and b.texture ~= "" and b.texture ~= "solid")
+                        and (b.textureSize or size) or size
+                    EllesmereUI.ApplySecretSafeBorderStyle(btn.border, btn.borderState,
+                        appliedSize, br, bg, bb, ba, b.texture or "solid",
+                        b.offsetX, b.offsetY, b.shiftX, b.shiftY,
+                        b.addonKey or "unitframes", b.sizeKey or size, b.edgeScale, b.edgePx)
                     btn.borderMade = true
                 end
-                if PP.ShowBorder then PP.ShowBorder(btn.border) else btn.border:Show() end
             else
-                if PP and PP.HideBorder then PP.HideBorder(btn.border) else btn.border:Hide() end
+                if EllesmereUI.ApplySecretSafeBorderStyle then
+                    EllesmereUI.ApplySecretSafeBorderStyle(btn.border, btn.borderState,
+                        0, 0, 0, 0, 0, "solid")
+                elseif PP and PP.HideBorder then PP.HideBorder(btn.border) else btn.border:Hide() end
+                if PP and PP.HideMaskedShapeBorder then PP:HideMaskedShapeBorder(btn.border)
+                elseif btn.border._shapeBorderTex then btn.border._shapeBorderTex:Hide() end
+            end
+
+            -- Dispel-type indicator icon (style.dispelTypeIcon): the live bar's
+            -- engine channel picks the art per aura; here the fake entry's own
+            -- dispel token does. Drawn on its own host above the swipe and border.
+            local ti = style.dispelTypeIcon
+            if ti and dispel and PV_DISPEL_ICON_ATLAS[dispel] then
+                if not btn.typeIcon then
+                    btn.typeIcon = btn.typeHost:CreateTexture(nil, "OVERLAY", nil, 3)
+                end
+                btn.typeIcon:SetAtlas(PV_DISPEL_ICON_ATLAS[dispel])
+                -- Geometry from the (panel-scaled) cfg, like iconSize above --
+                -- style carries the live pixel-snapped size, wrong units here.
+                local tiSz = cfg.dispelIconSize or 16
+                btn.typeIcon:SetSize(tiSz, tiSz)
+                btn.typeIcon:ClearAllPoints()
+                local tiPt = PV_DISPEL_ICON_POINTS[ti.pos] or "CENTER"
+                btn.typeIcon:SetPoint(tiPt, btn, tiPt,
+                    cfg.dispelIconOffsetX or 0, cfg.dispelIconOffsetY or 0)
+                btn.typeIcon:Show()
+            elseif btn.typeIcon then
+                btn.typeIcon:Hide()
+            end
+
+            local cdMaskKey = shapeActive and style.iconShape or nil
+            if btn._cdShapeApplied ~= cdMaskKey then
+                if cdMaskKey then
+                    pcall(btn.cooldown.AddMaskTexture, btn.cooldown, btn.shapeMask)
+                    if btn.cooldown.SetSwipeTexture then
+                        pcall(btn.cooldown.SetSwipeTexture, btn.cooldown, style.shapeMaskPath)
+                    end
+                else
+                    pcall(btn.cooldown.RemoveMaskTexture, btn.cooldown, btn.shapeMask)
+                    if btn.cooldown.SetSwipeTexture then pcall(btn.cooldown.SetSwipeTexture, btn.cooldown, "") end
+                end
+                btn._cdShapeApplied = cdMaskKey
             end
 
             if slot.kind ~= "placeholder" then
@@ -4096,36 +6164,11 @@ end
 --  Lifecycle
 -------------------------------------------------------------------------------
 
--- ns.db is set by EllesmereUIUnitFrames.lua's SetupOptionsPanel(), which
--- EnableBody() only schedules via C_Timer.After(0, SetupOptionsPanel) -- one frame
--- AFTER PLAYER_LOGIN's handlers finish. A single PLAYER_LOGIN listener here would run
--- BEFORE ns.db exists (confirmed: PAB() returned nil at that point). Rather than
--- depend on the exact relative timing between two independent C_Timer.After(0, ...)
--- calls in different files, retry with a capped, gently backing-off timer until ns.db
--- is actually populated.
-local RETRY_CAP = 40 -- ~ a few seconds worst case at the backed-off interval; then give up loudly
-local retryCount = 0
-
-local function TryCreateBars()
-    -- Module-disabled stand-down: EnableBody stamps ns._eufEnabled before this
-    -- handler can run (same PLAYER_LOGIN dispatch, parent enable-drain first,
-    -- module router second, this file's handler third). No stamp = the Unit
-    -- Frames module is off this session, ns.db will never arrive, and erroring
-    -- would spam every login for users who simply disabled the module.
-    if not ns._eufEnabled then return end
-    if PAB() then
-        CreateBars()
-        return
-    end
-    retryCount = retryCount + 1
-    if retryCount > RETRY_CAP then
-        geterrorhandler()("EllesmereUIUnitFrames_PlayerAuraBars: ns.db never became "
-            .. "available after " .. RETRY_CAP .. " retries -- Player Aura Bars did not load.")
-        return
-    end
-    C_Timer.After(0, TryCreateBars)
-end
-
+-- Login build: EllesmereUIUnitFrames.lua's SetupOptionsPanel() calls this once it
+-- has set ns.db. A PLAYER_LOGIN listener here needed EnableBody's handler to run
+-- first and stood down silently otherwise (field: Blizzard buffs up, no custom
+-- bars until an options change). A disabled Unit Frames module never runs
+-- SetupOptionsPanel, so PAB stays down with no extra check.
 ns.PAB_CreateBars = CreateBars
 
 function ns.PAB_Enabled()
@@ -4133,59 +6176,382 @@ function ns.PAB_Enabled()
     return (s and s.enabled == true) or false
 end
 
--- Called by the options page's activation overlay. Enabling builds the bars live
--- (CreateBars guards its own re-entry; AK.RequestContainer self-defers to
--- PLAYER_REGEN_ENABLED in combat). There is no live disable path -- the Blizzard
--- corner-frame hide latches for the session, so turning PAB off is a settings write
--- that takes effect on reload.
+-- Called by the options page's activation overlay and the sidebar's Disable
+-- All toggle. Enabling builds the bars live (CreateBars guards its own
+-- re-entry; container creation is combat-legal). Disabling is reload-bound
+-- for the BLIZZARD side (the corner-frame
+-- hide latches for the session) but stands every PAB frame down NOW -- the
+-- field bug was custom bars lingering through the "Later" window while the
+-- default bars hid: Disable All must be a complete visual no-op.
 function ns.PAB_SetEnabled(v)
     local s = PAB()
     if not s then return end
     s.enabled = v and true or nil
-    if v then CreateBars() end
+    if v then
+        -- A stand-down latched before the module went off has no lane to lift
+        -- it while disabled, and the rebuild below would come up dimmed.
+        ClearDegraded()
+        CreateBars()
+        return
+    end
+    if buffsParent then buffsParent:Hide() end
+    if debuffsParent then debuffsParent:Hide() end
+    for _, parent in pairs(customBuffParents) do parent:Hide() end
+    for _, parent in pairs(customDebuffParents) do parent:Hide() end
+    SyncEnchantEvents(false)
+    -- The re-hide hooks release once the master is off: hand Blizzard's
+    -- native display back live.
+    ShowBlizzardPlayerAuras()
+    -- Re-registering re-reads isHidden (master gate now false everywhere), so
+    -- an open unlock session drops every PAB mover immediately.
+    RegisterPABUnlock()
+    RegisterPABCustomUnlock()
 end
 
--- Cinematic recovery. An addon-cancelled cinematic (CINEMATIC_STOP) puts the
--- engine aura containers through a hide/re-show whose re-parse can land while
--- the teardown's filter state is still degraded -- filtered bars then render
--- the FULL buff set, and with no aura event following, the wrong content
--- sticks. The one lever Lua holds over engine-owned content is config: re-run
--- the group config for every live container (candidate filters are the
--- live-changeable channel, so re-setting them forces a fresh parse), one tick
--- after the event so the teardown has finished. Coalesced; rare event.
+function ns.PAB_UseBlizzard()
+    local s = PAB()
+    return (s and s.useBlizzardBuffs == true) or false
+end
+
+-- Stock styles (Global Settings > Style) for the aura bars: "eui",
+-- "blizzard" or "classic", read from the profile once (first call with a
+-- profile present) and latched for the session like the other module
+-- getters, so a live profile switch never flips the look under the
+-- engine-registered border art; the profile system prompts for a reload
+-- instead. The Classic flag wins when both are set. Both stock styles wear
+-- the same stock aura borders, so PAB_Blizz answers for either.
+function ns.PAB_Style()
+    local v = ns._pabStyle
+    if v == nil then
+        local s = PAB()
+        if not s then return "eui" end
+        v = (s.useClassicStyle and "classic") or (s.useBlizzardStyle and "blizzard") or "eui"
+        ns._pabStyle = v
+    end
+    return v
+end
+function ns.PAB_Blizz() return ns.PAB_Style() ~= "eui" end
+function ns.PAB_Classic() return ns.PAB_Style() == "classic" end
+
+-- Profile-grade resync, called from the _EUF_ReloadFrames tail (profile
+-- switches, imports, spec-override swaps all land there): re-asserts the
+-- CURRENT profile's enable/useBlizzard modes across the default-bar
+-- visibility, the native frames and the default unlock movers. Builds the
+-- module late when a swap crosses from a disabled-at-login state into an
+-- enabled profile (nothing else would). Deliberately does NOT run
+-- ApplyLiveConfig: its size-rebase writes assume lastSize belongs to the
+-- SAME profile and would corrupt the new profile's saved positions.
+function ns.PAB_ProfileResync()
+    local s = PAB()
+    if s and s.enabled == true and s.useBlizzardBuffs ~= true
+        and not (buffsParent or debuffsParent) then
+        -- Enabled profile, module never built this session: full build
+        -- (covers customs + unlock + natives itself).
+        CreateBars()
+        return
+    end
+    -- Content that can only change by rebuilding the container (the resolved
+    -- spell set, and the weapon-enchant row the engine cannot undeclare) does
+    -- not reach ApplyLiveConfig on a swap, so the new profile's signature is
+    -- reconciled here. CreateBars is the safe lane for it: it applies the new
+    -- profile's sizes and positions outright instead of running
+    -- ApplyLiveConfig's size-rebase against the OLD profile's lastSize.
+    if s and s.enabled == true and s.useBlizzardBuffs ~= true and buffsParent then
+        local buffCfg = DefaultBuffsCfg(s)
+        local buffGrid = ComputeGrid(true, buffCfg)
+        if BuffsContentSig(buffCfg, ns.PAB_ResolveSpells(buffCfg), buffGrid.enchSlots) ~= buffsSlotSig then
+            CreateBars()
+            return
+        end
+    end
+    ApplyDefaultBarShown(true)
+    ApplyDefaultBarShown(false)
+    SyncNativeAuras()
+    RegisterPABUnlock()
+end
+
+-- Live apply for the Use Blizzard Buffs toggle. ON: the default bars stand
+-- down and the natives come back NOW (the re-hide hooks read ownership
+-- live). OFF: a full CreateBars pass rebuilds the default bars and hides
+-- the natives again, entirely live. Custom bars run in both modes.
+function ns.PAB_ApplyUseBlizzard()
+    local s = PAB()
+    if not (s and s.enabled == true) then return end
+    if s.useBlizzardBuffs == true then
+        ApplyDefaultBarShown(true)
+        ApplyDefaultBarShown(false)
+        SyncEnchantEvents(false)
+        ShowBlizzardPlayerAuras()
+        RegisterPABUnlock()
+    else
+        CreateBars()
+        RegisterPABUnlock()
+    end
+end
+
+-- Cinematic / faction-flip recovery. Two triggers, one degradation class:
+-- an addon-cancelled cinematic (CINEMATIC_STOP) puts the engine aura
+-- containers through a hide/re-show whose re-parse can land while the
+-- teardown's filter state is still degraded, and EVERY cinematic
+-- (in-world cutscenes included) fires UNIT_FACTION for the player at start
+-- and end -- the unit briefly stops being assistable, which silently
+-- disables spell-ID candidate filters engine-side (authors-channel
+-- consensus 2026-08-13: same mechanism community-wide; UNIT_FLAGS does NOT
+-- fire, UNIT_FACTION is the only edge). Filtered bars then render the FULL
+-- buff set, and with no aura event following, the wrong content sticks.
+-- The one lever Lua holds over engine-owned content is config: re-run the
+-- group config for every live container (candidate filters are the
+-- live-changeable channel, so re-setting them forces a fresh parse), one
+-- tick after the event so the transition has finished. Coalesced; the
+-- start+end UNIT_FACTION burst collapses to one re-drive.
+-- Vehicle suppression: assistability stays down for the WHOLE ride, so the
+-- exit re-drive alone still left the ride itself showing the full buff set.
+-- Match the raid frames' gate by standing the bar parents down -- the
+-- vehicle has its own UI -- and restoring on exit, where the recovery
+-- re-drive repaints from clean filter state. The stand-down is alpha, not a
+-- Hide (SetParentShownSafe): the exit routinely lands inside lockdown, where
+-- a Show is blocked. A suppressed ride therefore costs what ordinary play
+-- costs -- the containers stay registered behind alpha 0.
+-- vehicleHidden and pabSuppressed are forward-declared at the top of the state
+-- section (every parent-visibility pass reads the latter).
+-- Bare apply, no state guard: the recovery lane re-asserts the CURRENT
+-- state after its reload paths (which Show() the parents as a side effect).
+-- Restoring (hidden = false) honors each bar's OWN enable toggle -- a
+-- vehicle exit must never re-show a disabled bar's fully-populated grid.
+-- Probe-verified self-assist state (the RF AssistProbe self-branch, ported):
+-- the engine's spell-ID filter degradation tracks ASSISTABILITY, not any event's
+-- timing. A clean false = degraded (hide, never render the full-set parse);
+-- unreadable answers fail OPEN (the historical self-exemption -- never
+-- retry-loop against secrecy).
+local pabDegraded = false
+local pabSettleTicker
+local function PabAssistProbe()
+    local probe = UnitUsingVehicle or UnitInVehicle
+    if probe("player") then return false end
+    local ok, canSelf = pcall(UnitCanAssist, "player", "player")
+    if ok and not (issecretvalue and issecretvalue(canSelf)) and canSelf == false then
+        return false
+    end
+    return true
+end
+
+local function ApplyVehicleHidden(hidden)
+    -- One suppression state, two causes: a vehicle ride and a probe-degraded
+    -- window (cinematic / faction flip) hide the same parents -- degraded
+    -- filter output must never render, exactly like the RF assist gate.
+    hidden = hidden or pabDegraded
+    -- The suppression itself lands on alpha inside SetParentShownSafe; `want`
+    -- below stays the durable render verdict, so a bar disabled mid-ride still
+    -- hides for real and a reload that runs during the ride cannot un-suppress
+    -- the parents behind our back.
+    pabSuppressed = hidden
+    local s = PAB()
+    -- Regen replay re-derives from the LIVE vehicle state, not the argument.
+    local function recompute() ApplyVehicleHidden(vehicleHidden) end
+    -- Master enable + Use Blizzard Buffs both stand the defaults down: a
+    -- vehicle exit during the disabled "Later" window must not re-show them.
+    if buffsParent then
+        SetParentShownSafe("vehicle-buffs", buffsParent, (not s
+            or (s.enabled == true and DefaultBuffsCfg(s).enabled ~= false
+                and s.useBlizzardBuffs ~= true)), recompute)
+    end
+    if debuffsParent then
+        SetParentShownSafe("vehicle-debuffs", debuffsParent, (not s
+            or (s.enabled == true and DefaultDebuffsCfg(s).enabled ~= false
+                and s.useBlizzardBuffs ~= true)), recompute)
+    end
+    -- Restore honors the FULL render verdict (master enable + bar toggle +
+    -- editing-spec bucket applicability + per-spec disable): a vehicle exit
+    -- must never re-show a parked bar's fully-populated grid. Orphan parents
+    -- (bar gone after a delete/profile switch) stay hidden -- the old
+    -- `not bar` show-fallback punched through every gate.
+    for barId, parent in pairs(customBuffParents) do
+        local bar, bk = ns.PAB_GetCustomBuffBar(barId)
+        SetParentShownSafe("vehicle-cb-" .. barId, parent,
+            bar ~= nil and ns.PAB_BarActive(bar, bk), recompute)
+    end
+    for barId, parent in pairs(customDebuffParents) do
+        local bar, bk = ns.PAB_GetCustomDebuffBar(barId)
+        SetParentShownSafe("vehicle-cd-" .. barId, parent,
+            bar ~= nil and ns.PAB_BarActive(bar, bk), recompute)
+    end
+end
+local function SetVehicleHidden(hidden)
+    if vehicleHidden == hidden then return end
+    vehicleHidden = hidden
+    -- Lifting: the containers kept parsing behind alpha 0 (dimmed, not hidden,
+    -- so their engine events stayed live) and the spell-ID filters are still
+    -- degraded through the exit transition -- un-dimming on the raw event edge
+    -- would paint the full-set parse. Hand the stand-down to the degraded lane
+    -- instead: the same event arms it, and it un-dims and forces the clean
+    -- re-parse in one execution. Both callers reach the lane immediately, and
+    -- every lane exit clears the latch (ClearDegraded below).
+    if not hidden then pabDegraded = true end
+    ApplyVehicleHidden(hidden)
+end
+
+-- The latch is only ever meaningful while the recovery lane is live: every
+-- early exit down there hands it back, or a stand-down set on a transition
+-- outlives the thing that caused it and every later bar comes up dimmed.
+-- Forward-declared at the top of the state section (the enable path clears a
+-- latch that was set while the module was off, where no lane runs at all).
+function ClearDegraded()
+    if not pabDegraded then return end
+    pabDegraded = false
+    ApplyVehicleHidden(vehicleHidden)
+end
+
 local cineFixPending = false
 local function ReapplyAllAfterCinematic()
     if cineFixPending then return end
-    if not (buffsContainer or debuffsContainer) then return end
+    -- Custom containers count as live consumers too: under Use Blizzard
+    -- Buffs the default containers never exist, but custom bars still need
+    -- the filter-degradation repair.
+    if not (buffsContainer or debuffsContainer
+        or next(customBuffContainers) or next(customDebuffContainers)) then
+        ClearDegraded()
+        return
+    end
     cineFixPending = true
     C_Timer.After(0, function()
         cineFixPending = false
+        -- Master-disabled (awaiting reload): nothing to repair, and the
+        -- re-drives below must not touch parked frames.
+        local sM = PAB()
+        if not sM or sM.enabled ~= true then
+            ClearDegraded()
+            return
+        end
+        -- Suppressed ride: a re-drive is pointless -- the bars are dimmed and
+        -- the exit edge re-drives for real. UNIT_FACTION fires on the boarding
+        -- transition and funnels straight here, so this is the common path.
+        -- Re-assert and stop.
+        if vehicleHidden then
+            ApplyVehicleHidden(true)
+            return
+        end
+        -- Probe before acting (the RF regain model): a re-drive that lands
+        -- while the player is STILL non-assistable re-bakes the degraded
+        -- full-set parse, and if that was the last UNIT_FACTION edge nothing
+        -- ever repairs it (field: full buff set stuck after cinematics).
+        -- Degraded at this tick: stand the parents down and wait. No event
+        -- marks "assistability restored" when the restore lags the event, so a
+        -- settle watcher exists ONLY while degraded and self-cancels on the
+        -- first clean probe. It deliberately never gives up: the stand-down is
+        -- alpha-only now, so nothing else re-shows the bars, and a watcher that
+        -- stopped early would leave them invisible for the rest of the session.
+        -- Two C calls per quarter-second, and only while degraded.
+        if not PabAssistProbe() then
+            if not pabDegraded then
+                pabDegraded = true
+                ApplyVehicleHidden(vehicleHidden)
+            end
+            if not pabSettleTicker then
+                pabSettleTicker = C_Timer.NewTicker(0.25, function()
+                    if PabAssistProbe() then
+                        pabSettleTicker:Cancel()
+                        pabSettleTicker = nil
+                        ReapplyAllAfterCinematic()
+                    end
+                end)
+            end
+            return
+        end
+        if pabSettleTicker then pabSettleTicker:Cancel(); pabSettleTicker = nil end
+        if pabDegraded then
+            -- Verified regain: un-dim here and force the re-parse below in the
+            -- same execution, so no frame paints the stand-down's stale content.
+            pabDegraded = false
+            ApplyVehicleHidden(vehicleHidden)
+        end
         ApplyLiveConfig(true)
         ApplyLiveConfig(false)
-        local cb = ns.PAB_CustomBuffBars()
-        if cb then
-            for _, bar in ipairs(cb) do ns.PAB_ReloadCustomBuffBar(bar.id) end
-        end
-        local db2 = ns.PAB_CustomDebuffBars()
-        if db2 then
-            for _, bar in ipairs(db2) do ns.PAB_ReloadCustomDebuffBar(bar.id) end
-        end
+        -- Every custom bar, editing-spec buckets included: the recovery
+        -- exists to repair engine-degraded candidate filters, and an active
+        -- bucket bar degrades exactly like a legacy one.
+        ReloadAllCustomBars()
+        -- Force the re-parse outright. The config re-drive above cannot: a
+        -- live group's candidate payload does not retake (see CandFP), and the
+        -- engine caches membership per aura instance -- UNIT_AURA re-parses only
+        -- what changed, so a spell-ID group parsed while the player was
+        -- non-assistable keeps serving the full buff set until something marks a
+        -- full rebuild. UpdateAllAuras is that lever (the same one the RF assist
+        -- regain, UF player lane and CDM FakeActive use); the vehicle path only
+        -- got it for free through the parents' Hide/Show. Bounded to this
+        -- coalesced edge: one full parse per live container per cinematic edge.
+        if buffsContainer then buffsContainer:UpdateAllAuras() end
+        if debuffsContainer then debuffsContainer:UpdateAllAuras() end
+        for _, c in pairs(customBuffContainers) do c:UpdateAllAuras() end
+        for _, c in pairs(customDebuffContainers) do c:UpdateAllAuras() end
     end)
 end
 
+-- Registers nothing itself: CreateBars calls ns.PAB_ArmRecovery() once it has
+-- confirmed the module is enabled -- login build and live enable both.
 local initFrame = CreateFrame("Frame")
-initFrame:RegisterEvent("PLAYER_LOGIN")
 initFrame:SetScript("OnEvent", function(self, event)
-    if event == "PLAYER_LOGIN" then
-        self:UnregisterEvent("PLAYER_LOGIN")
-        TryCreateBars()
-        -- Registered only for sessions where the feature runs at all; the
-        -- handler's container guard covers the module-disabled stand-down.
-        if ns.PAB_Enabled() then
-            self:RegisterEvent("CINEMATIC_STOP")
+    if event == "PLAYER_ENTERING_WORLD" then
+        if vehicleHidden then
+            local probe = UnitUsingVehicle or UnitInVehicle
+            if not probe("player") then
+                SetVehicleHidden(false)
+                ReapplyAllAfterCinematic()
+            end
+        end
+        -- Editing-spec buckets: the login reload can run before
+        -- GetSpecialization() answers, parking every bucket bar until the
+        -- next spec change. Re-drive once per world entry (gated = one
+        -- table read for profiles without buckets; idempotent otherwise).
+        local s = PAB()
+        if s and s.pabSpecBars then ReloadAllCustomBars() end
+        return
+    end
+    if event == "UNIT_ENTERING_VEHICLE" or event == "UNIT_ENTERED_VEHICLE" then
+        SetVehicleHidden(true)
+        return
+    end
+    if event == "UNIT_EXITED_VEHICLE" then
+        SetVehicleHidden(false)
+    end
+    if event == "PLAYER_SPECIALIZATION_CHANGED" then
+        -- Editing-spec bucket bars activate/park with the spec. Gated to
+        -- profiles that actually built buckets -- everyone else pays one
+        -- table read per spec change. Unlock elements re-sync through the
+        -- per-bar reload wrappers.
+        local s = PAB()
+        if s and s.pabSpecBars then
+            ReloadAllCustomBars()
         end
         return
     end
     ReapplyAllAfterCinematic()
 end)
+
+-- Called by CreateBars once it has passed its own enabled check -- the only
+-- point where "PAB is actually running" is known to be true. Idempotent:
+-- CreateBars can run more than once per session (login build, live enable).
+local recoveryArmed = false
+function ns.PAB_ArmRecovery()
+    if recoveryArmed then return end
+    recoveryArmed = true
+    initFrame:RegisterEvent("CINEMATIC_STOP")
+    -- Player-only registration: cinematics fire UNIT_FACTION for every unit;
+    -- the player edge is the one that degrades these containers' filters.
+    -- Also covers non-cinematic faction flips (Pandaren faction choice) --
+    -- rare, and the re-drive is cheap.
+    initFrame:RegisterUnitEvent("UNIT_FACTION", "player")
+    -- Vehicles are the third trigger of the same class: boarding drops the
+    -- player's assistability for the whole ride. The bars SUPPRESS for the
+    -- duration (SetVehicleHidden) and the exit edge re-drives -- same
+    -- trigger set as the RF assist gate and the UF player lane.
+    initFrame:RegisterUnitEvent("UNIT_ENTERING_VEHICLE", "player")
+    initFrame:RegisterUnitEvent("UNIT_ENTERED_VEHICLE", "player")
+    initFrame:RegisterUnitEvent("UNIT_EXITED_VEHICLE", "player")
+    -- Safety net only: an exit that never fires EXITED (teleport out of a
+    -- vehicle). Zero work on ordinary loading screens.
+    initFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    -- Editing-spec buckets: bucket bars follow the player's spec (handler
+    -- early-returns for profiles without buckets).
+    initFrame:RegisterUnitEvent("PLAYER_SPECIALIZATION_CHANGED", "player")
+end
 

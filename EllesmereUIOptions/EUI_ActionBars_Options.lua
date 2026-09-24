@@ -6,11 +6,38 @@ if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_C
 local ADDON_NAME = "EllesmereUIActionBars"
 local ns = EllesmereUI._ModuleNS[ADDON_NAME]  -- module namespace (published by the module at its load)
 if not ns then return end  -- module disabled: no options page
+-- Stood down for the session (secure snippets unavailable: WoW Forever beta):
+-- the module is not running, so its page stays out of the sidebar.
+if (EllesmereUI.Lite.GetAddon(ADDON_NAME, true) or ns).standDown then return end
 local EAB = ns.EAB
 local VisibilityCompat = EAB and EAB.VisibilityCompat
+-- Anchor dropdown for the three button texts (keybind / charges / macro name);
+-- "default" = stock placement, stored as nil in the profile.
+local TEXT_ANCHOR_LABELS = {
+    default = "Default", TOPLEFT = "Top Left", TOP = "Top", TOPRIGHT = "Top Right",
+    BOTTOMLEFT = "Bottom Left", BOTTOM = "Bottom", BOTTOMRIGHT = "Bottom Right",
+}
+local TEXT_ANCHOR_DROPDOWN_ORDER = { "default" }
+for i, a in ipairs(EAB and EAB.TEXT_ANCHOR_ORDER or {}) do TEXT_ANCHOR_DROPDOWN_ORDER[i + 1] = a end
 
 local function GetEABOptOutline() return EllesmereUI.GetFontOutlineFlag and EllesmereUI.GetFontOutlineFlag() or "" end
 local function GetEABOptUseShadow() return EllesmereUI.GetFontUseShadow and EllesmereUI.GetFontUseShadow() or true end
+
+-- The registry offsets/shifts a border renders with when the user has set none
+-- (the Border Options cog's shown Shift defaults; the Width/Height Offset row
+-- resolves its own): its step's "actionbars" entry, scaled to an exact size
+-- (EllesmereUI.BorderPx) the way ApplyBorderStyle scales it; px nil = the
+-- step's own values, the legacy path.
+local function ShownBorderDefaults(tex, sizeKey, step, px)
+    local dox, doy, dsx, dsy = EllesmereUI.GetBorderDefaults("actionbars", tex, sizeKey)
+    if px then
+        local gamePP = EllesmereUI.PP
+        local EDGE_MAP = EllesmereUI.BORDER_EDGE_MAP
+        local f = (px * gamePP.mult) / (EDGE_MAP[step] or EDGE_MAP[1])
+        dox, doy, dsx, dsy = gamePP.Snap(dox * f), gamePP.Snap(doy * f), gamePP.Snap(dsx * f), gamePP.Snap(dsy * f)
+    end
+    return dox, doy, dsx, dsy
+end
 
 -------------------------------------------------------------------------------
 --  Section / page names  (edit here to rename everywhere)
@@ -540,6 +567,79 @@ initFrame:SetScript("OnEvent", function(self)
             }
         end
 
+        -- Stock styles: the stock button art on a preview button, laid out as
+        -- the live buttons lay it (they keep Blizzard's own textures, scaled
+        -- with the button). Blizzard Style: the rounded icon-frame mask centred
+        -- on the icon and the icon-frame ring at its stock 46x45-on-45 ratio.
+        -- Classic WoW UI: the vanilla slot ring at 66/36 of the button
+        -- (CENTER 0,-1/36), the empty-slot art on an empty slot, no mask. No
+        -- EUI border, shape or backdrop either way. Built once per button,
+        -- re-sized per pass; the kit not in use steps aside.
+        local blizzMaskInfo
+        local function ApplyBlizzPreviewButton(entry, bf, icon, classic, filled)
+            local bT, bB, bL, bR = entry.borders[1], entry.borders[2], entry.borders[3], entry.borders[4]
+            bT:Hide(); bB:Hide(); bL:Hide(); bR:Hide()
+            if entry._bdPreview then entry._bdPreview:Hide() end
+            if entry.shapeBorderTex then entry.shapeBorderTex:Hide() end
+            if entry.shapeMask and entry._prevMasked then
+                pcall(icon.RemoveMaskTexture, icon, entry.shapeMask)
+                entry.shapeMask:Hide()
+                entry._prevMasked = false
+            end
+            icon:ClearAllPoints()
+            icon:SetAllPoints(bf)
+            local w, h = bf:GetSize()
+            if classic then
+                if entry.blizzMask then entry.blizzMask:Hide() end
+                if entry.blizzRing then entry.blizzRing:Hide() end
+                local cring = entry.classicRing
+                if not cring then
+                    cring = bf:CreateTexture(nil, "ARTWORK", nil, 2)
+                    UnsnapTex(cring)
+                    entry.classicRing = cring
+                end
+                local art = ns.AB_CLASSIC
+                cring:SetTexture(filled and art.slot or art.empty)
+                cring:SetTexCoord(0, 1, 0, 1)
+                cring:ClearAllPoints()
+                cring:SetPoint("CENTER", bf, "CENTER", 0, -h / 36)
+                cring:SetSize(66 * w / 36, 66 * h / 36)
+                cring:Show()
+                return
+            end
+            if entry.classicRing then entry.classicRing:Hide() end
+            local mask = entry.blizzMask
+            if not mask then
+                mask = bf:CreateMaskTexture()
+                mask:SetAtlas("UI-HUD-ActionBar-IconFrame-Mask")
+                icon:AddMaskTexture(mask)
+                entry.blizzMask = mask
+                -- Above the icon, below the OVERLAY texts (a NormalTexture on
+                -- the live button sits under its font strings the same way).
+                local ring = bf:CreateTexture(nil, "ARTWORK", nil, 2)
+                ring:SetAtlas("UI-HUD-ActionBar-IconFrame")
+                UnsnapTex(ring)
+                entry.blizzRing = ring
+            end
+            if blizzMaskInfo == nil then
+                blizzMaskInfo = C_Texture.GetAtlasInfo("UI-HUD-ActionBar-IconFrame-Mask") or false
+            end
+            local sx, sy = w / 45, h / 45
+            mask:ClearAllPoints()
+            mask:SetPoint("CENTER", icon, "CENTER", 0, 0)
+            if blizzMaskInfo then
+                mask:SetSize(blizzMaskInfo.width * sx, blizzMaskInfo.height * sy)
+            else
+                mask:SetSize(w, h)
+            end
+            mask:Show()
+            local ring = entry.blizzRing
+            ring:ClearAllPoints()
+            ring:SetPoint("TOPLEFT", bf, "TOPLEFT", 0, 0)
+            ring:SetSize(46 * sx, 45 * sy)
+            ring:Show()
+        end
+
         -- Preview background texture (behind all buttons)
         local previewBG = pf:CreateTexture(nil, "BACKGROUND", nil, -1)
         local previewBGBorder = CreateFrame("Frame", nil, pf, "BackdropTemplate")
@@ -596,13 +696,19 @@ initFrame:SetScript("OnEvent", function(self)
 
             local leftmost = 1
             local spacing   = settings.buttonPadding or 2
-            local resolvedBrdSize = ns.ResolveBorderThickness(settings)
+            local resolvedBrdSize, resolvedBrdPx = ns.ResolveBorderThickness(settings)
             local brdOn     = resolvedBrdSize > 0
             local brdSize   = resolvedBrdSize
+            local brdPx     = resolvedBrdPx   -- the exact size the live buttons resolve (nil = legacy)
             local brdColor  = settings.borderColor or { r = 0, g = 0, b = 0, a = 1 }
             local brdClassColor = settings.borderClassColor
             local zoom = ((settings.iconZoom or EAB.db.profile.iconZoom or 5.5)) / 100
             local square    = EAB.db.profile.squareIcons
+            -- Stock styles: stock button art (see ApplyBlizzPreviewButton);
+            -- shapes, zoom and EUI borders do not apply, as on the live bars.
+            local abStyle   = EllesmereUI.BlizzStyle.Active("actionbars")
+            local blizzAB   = abStyle ~= "eui"
+            local classicAB = abStyle == "classic"
             local hideKB    = settings.hideKeybind
 
             -- Font path (global setting)
@@ -634,13 +740,13 @@ initFrame:SetScript("OnEvent", function(self)
             local scaledBtnW = SnapS(btnW * (self._blizzEditScale or 1))
             local scaledBtnH = SnapS(btnH * (self._blizzEditScale or 1))
             -- Expand button size for custom shapes (mirrors SHAPE_BTN_EXPAND in main file)
-            if btnShape ~= "none" and btnShape ~= "cropped" then
+            if not blizzAB and btnShape ~= "none" and btnShape ~= "cropped" then
                 local shapeExp = SnapS(ns.SHAPE_BTN_EXPAND * (self._blizzEditScale or 1))
                 scaledBtnW = scaledBtnW + shapeExp
                 scaledBtnH = scaledBtnH + shapeExp
             end
             -- Shrink button height for "cropped" mode (10% top + 10% bottom)
-            if btnShape == "cropped" then
+            if not blizzAB and btnShape == "cropped" then
                 scaledBtnH = SnapS(scaledBtnH * 0.80)
             end
 
@@ -691,7 +797,14 @@ initFrame:SetScript("OnEvent", function(self)
                 -- Bottom padding so the last row is fully visible when scrolled down
                 local paddedH = Snap(gridH + 20 + bgTopInset + bgBottomInset + scaledBtnH)
                 self:SetHeight(paddedH)
-                self._wrapper:SetHeight(maxH)
+                -- Snap the viewport to a whole number of rows so the cap never slices
+                -- a row in half; topInset is the space above row 1 (matches gridStartY).
+                local topInset = Snap(10) + bgTopInset
+                local rowStep = scaledBtnH + scaledPad
+                local visibleRows = math.max(1, math.floor((maxH / self._previewScale - topInset + scaledPad) / rowStep + 0.001))
+                visibleRows = math.min(visibleRows, gridRows)
+                local cappedLocalH = Snap(topInset + visibleRows * scaledBtnH + (visibleRows - 1) * scaledPad)
+                self._wrapper:SetHeight(math.min(maxH, cappedLocalH * self._previewScale))
             else
                 self._wrapper:SetHeight(parentH)
                 -- Reset scroll when content fits without scrolling
@@ -785,7 +898,7 @@ initFrame:SetScript("OnEvent", function(self)
                         icon:SetTexCoord(0, 1, 0, 1)
                     else
                         icon:SetTexture(iconTex)
-                        if square or zoom > 0 or btnShape == "cropped" then
+                        if not blizzAB and (square or zoom > 0 or btnShape == "cropped") then
                             local z = zoom
                             if btnShape == "cropped" then
                                 -- Preserve aspect ratio: trim top/bottom by 10%
@@ -798,6 +911,14 @@ initFrame:SetScript("OnEvent", function(self)
                         end
                     end
 
+                    if blizzAB then
+                        ApplyBlizzPreviewButton(entry, bf, icon, classicAB, iconTex and true or false)
+                    else
+                    -- The styles' rings and mask step aside on the EUI look (the
+                    -- flag is a live read: a profile switch can flip it mid-page).
+                    if entry.blizzRing then entry.blizzRing:Hide() end
+                    if entry.blizzMask then entry.blizzMask:Hide() end
+                    if entry.classicRing then entry.classicRing:Hide() end
                     local bT, bB, bL, bR = entry.borders[1], entry.borders[2], entry.borders[3], entry.borders[4]
                     local brdTexKey = settings.borderTexture or "solid"
                     local brdIsSolid = (brdTexKey == "solid")
@@ -809,7 +930,10 @@ initFrame:SetScript("OnEvent", function(self)
                             local _, ct2 = UnitClass("player")
                             if ct2 then local cc2 = RAID_CLASS_COLORS[ct2]; if cc2 then cr, cg, cb = cc2.r, cc2.g, cc2.b end end
                         end
-                        local sz = SnapS(brdSize)
+                        -- The pixels the live strips draw (SnapBorderTextures): the exact size
+                        -- when set, else the step, as whole pixels at this button's scale.
+                        local onePx = EllesmereUI.PP.perfect / bf:GetEffectiveScale()
+                        local sz = math.max(onePx, math.floor((brdPx or brdSize) + 0.5) * onePx)
 
                         bT:SetColorTexture(cr, cg, cb, ca)
                         UnsnapTex(bT)
@@ -852,12 +976,30 @@ initFrame:SetScript("OnEvent", function(self)
                             entry._bdPreview:EnableMouse(false)
                         end
                         local bdPv = entry._bdPreview
-                        local EDGE_MAP = { 12, 16, 24, 32 }
-                        local edgeSize = EDGE_MAP[brdSize] or 12
+                        -- The live edge (ApplyBorderStyle) in this frame's units: the exact
+                        -- size as whole pixels at UIParent scale, else the step's edge. ratio
+                        -- cancels any scale between the preview button and UIParent so the
+                        -- edge is the game's size (1 today: the preview runs at UIParent scale).
+                        local gamePP = EllesmereUI.PP
+                        local EDGE_MAP = EllesmereUI.BORDER_EDGE_MAP
+                        local uiES = UIParent:GetEffectiveScale()
+                        local pvES = bf:GetEffectiveScale()
+                        local ratio = (pvES > 0.01 and uiES > 0) and (uiES / pvES) or 1
+                        local edgeSize
+                        if brdPx then
+                            edgeSize = math.max(1, math.floor(brdPx + 0.5)) * gamePP.mult * ratio
+                        else
+                            edgeSize = (EDGE_MAP[brdSize] or EDGE_MAP[1]) * ratio
+                        end
                         local thKey = settings.borderThickness or "thin"
                         local dox, doy, dsx, dsy = EllesmereUI.GetBorderDefaults("actionbars", brdTexKey, thKey)
-                        local adjX = settings.borderTextureOffset or dox
-                        local adjY = settings.borderTextureOffsetY or doy
+                        if brdPx then
+                            -- The step's defaults follow the exact edge (the user's own offsets stay).
+                            local f = (brdPx * gamePP.mult) / (EDGE_MAP[brdSize] or EDGE_MAP[1])
+                            dox, doy, dsx, dsy = gamePP.Snap(dox * f), gamePP.Snap(doy * f), gamePP.Snap(dsx * f), gamePP.Snap(dsy * f)
+                        end
+                        local adjX = (settings.borderTextureOffset or dox) * ratio
+                        local adjY = (settings.borderTextureOffsetY or doy) * ratio
                         local offX, offY
                         if EllesmereUI.BorderTextureUsesScaleOffset(brdTexKey) then
                             offX = (edgeSize / 2) + adjX
@@ -866,8 +1008,12 @@ initFrame:SetScript("OnEvent", function(self)
                             offX = adjX
                             offY = adjY
                         end
-                        local sx = settings.borderTextureShiftX or dsx
-                        local sy = settings.borderTextureShiftY or dsy
+                        local sx = (settings.borderTextureShiftX or dsx) * ratio
+                        local sy = (settings.borderTextureShiftY or dsy) * ratio
+                        -- Whole pixels at the preview's own scale, as ApplyBorderStyle snaps the live anchors.
+                        local snapES = (pvES > 0.01) and pvES or uiES
+                        offX, offY = gamePP.SnapForES(offX, snapES), gamePP.SnapForES(offY, snapES)
+                        sx, sy = gamePP.SnapForES(sx, snapES), gamePP.SnapForES(sy, snapES)
                         bdPv:ClearAllPoints()
                         bdPv:SetPoint("TOPLEFT", bf, "TOPLEFT", -offX + sx, offY + sy)
                         bdPv:SetPoint("BOTTOMRIGHT", bf, "BOTTOMRIGHT", offX + sx, -offY + sy)
@@ -973,6 +1119,7 @@ initFrame:SetScript("OnEvent", function(self)
                             end
                         end
                     end
+                    end -- close Blizzard Style / EUI look split
                     local keybindFS = entry.keybind
                     if hideKB then
                         keybindFS:SetText("")
@@ -990,10 +1137,12 @@ initFrame:SetScript("OnEvent", function(self)
                     keybindFS:SetTextColor(kbColor.r, kbColor.g, kbColor.b)
                     local kbOX = (settings.keybindOffsetX or 0) * totalScale
                     local kbOY = (settings.keybindOffsetY or 0) * totalScale
-                    keybindFS:ClearAllPoints()
-                    keybindFS:SetPoint("TOPRIGHT", bf, "TOPRIGHT", -1 + kbOX, -3 + kbOY)
-                    keybindFS:SetPoint("TOPLEFT", bf, "TOPLEFT", 4 + kbOX, -3 + kbOY)
-                    keybindFS:SetJustifyH("RIGHT")
+                    if not (settings.keybindAnchor and EAB.PlaceButtonText(keybindFS, bf, settings.keybindAnchor, kbOX, kbOY)) then
+                        keybindFS:ClearAllPoints()
+                        keybindFS:SetPoint("TOPRIGHT", bf, "TOPRIGHT", -1 + kbOX, -3 + kbOY)
+                        keybindFS:SetPoint("TOPLEFT", bf, "TOPLEFT", 4 + kbOX, -3 + kbOY)
+                        keybindFS:SetJustifyH("RIGHT")
+                    end
 
                     local countFS = entry.count
                     do
@@ -1007,8 +1156,11 @@ initFrame:SetScript("OnEvent", function(self)
                     countFS:SetTextColor(ctColor.r, ctColor.g, ctColor.b)
                     local ctOX = (settings.countOffsetX or 0) * totalScale
                     local ctOY = (settings.countOffsetY or 0) * totalScale
-                    countFS:ClearAllPoints()
-                    countFS:SetPoint("BOTTOMRIGHT", bf, "BOTTOMRIGHT", -1 + ctOX, 4 + ctOY)
+                    if not (settings.countAnchor and EAB.PlaceButtonText(countFS, bf, settings.countAnchor, ctOX, ctOY)) then
+                        countFS:ClearAllPoints()
+                        countFS:SetPoint("BOTTOMRIGHT", bf, "BOTTOMRIGHT", -1 + ctOX, 4 + ctOY)
+                        countFS:SetJustifyH("RIGHT")
+                    end
 
                     local macroFS = entry.macro
                     if macroFS then
@@ -1026,10 +1178,12 @@ initFrame:SetScript("OnEvent", function(self)
                         macroFS:SetTextColor(mcColor.r, mcColor.g, mcColor.b)
                         local mcOX = (settings.macroOffsetX or 0) * totalScale
                         local mcOY = (settings.macroOffsetY or 0) * totalScale
-                        macroFS:ClearAllPoints()
-                        macroFS:SetPoint("BOTTOMLEFT", bf, "BOTTOMLEFT", 1 + mcOX, 4 + mcOY)
-                        macroFS:SetPoint("BOTTOMRIGHT", bf, "BOTTOMRIGHT", -1 + mcOX, 4 + mcOY)
-                        macroFS:SetJustifyH("CENTER")
+                        if not (settings.macroAnchor and EAB.PlaceButtonText(macroFS, bf, settings.macroAnchor, mcOX, mcOY)) then
+                            macroFS:ClearAllPoints()
+                            macroFS:SetPoint("BOTTOMLEFT", bf, "BOTTOMLEFT", 1 + mcOX, 4 + mcOY)
+                            macroFS:SetPoint("BOTTOMRIGHT", bf, "BOTTOMRIGHT", -1 + mcOX, 4 + mcOY)
+                            macroFS:SetJustifyH("CENTER")
+                        end
                     end
                     end -- close alwaysShowButtons else
                 else
@@ -1073,11 +1227,12 @@ initFrame:SetScript("OnEvent", function(self)
                     local thicknessKey = settings.bgBorderThickness or "none"
                     local thickness = ns.BORDER_THICKNESS and ns.BORDER_THICKNESS[thicknessKey]
                     local borderSize = thickness and thickness.regular or 0
+                    local bgPx = EllesmereUI.BorderPx(settings.bgBorderThicknessPx, borderSize, settings.bgBorderTexture)
                     EllesmereUI.ApplyBorderStyle(previewBGBorder, borderSize,
                         bc.r, bc.g, bc.b, bc.a or 1, settings.bgBorderTexture or "solid",
                         settings.bgBorderOffsetX, settings.bgBorderOffsetY,
                         settings.bgBorderShiftX, settings.bgBorderShiftY,
-                        "actionbars", thicknessKey)
+                        "actionbars", thicknessKey, nil, bgPx)
                 end
             else
                 previewBG:Hide()
@@ -1171,6 +1326,12 @@ initFrame:SetScript("OnEvent", function(self)
     end
 
     local function CopyVisibilitySettings(dst, src, dstKey)
+        -- The merged Visibility control owns the option booleans too, so every copy
+        -- carries them alongside the mode selection.
+        local optKeys = EllesmereUI.VIS_OPT_KEYS
+        if optKeys then
+            for i = 1, #optKeys do dst[optKeys[i]] = src[optKeys[i]] or nil end
+        end
         if VisibilityCompat then
             -- Pet Bar ignores group modes: strip them from a copied multi-selection.
             VisibilityCompat.Copy(dst, src, dstKey == "PetBar")
@@ -1179,6 +1340,7 @@ initFrame:SetScript("OnEvent", function(self)
 
         local v = src.barVisibility or "always"
         dst.barVisibility = v
+        dst.visibilityMatch = src.visibilityMatch or nil
         dst.alwaysHidden = src.alwaysHidden
         dst.mouseoverEnabled = src.mouseoverEnabled
         dst.mouseoverAlpha = src.mouseoverAlpha
@@ -1194,6 +1356,25 @@ initFrame:SetScript("OnEvent", function(self)
     ---------------------------------------------------------------------------
     --  Menu, Bags & XP Bars page  (dedicated tab)
     ---------------------------------------------------------------------------
+    -- Shared by the data-bar page builder AND BuildSharedBarSettings below
+    -- (a local is only visible below its declaration, so it lives at this
+    -- common scope rather than inside either builder).
+    local function MakeCogBtn(rgn, showFn, anchorTo, iconPath)
+        local cogBtn = CreateFrame("Button", nil, rgn)
+        cogBtn:SetSize(26, 26)
+        cogBtn:SetPoint("RIGHT", anchorTo or rgn._control, "LEFT", -8, 0)
+        rgn._lastInline = cogBtn
+        cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
+        cogBtn:SetAlpha(0.4)
+        local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
+        cogTex:SetAllPoints()
+        cogTex:SetTexture(iconPath or EllesmereUI.COGS_ICON)
+        cogBtn:SetScript("OnEnter", function(self) self:SetAlpha(0.7) end)
+        cogBtn:SetScript("OnLeave", function(self) self:SetAlpha(0.4) end)
+        cogBtn:SetScript("OnClick", function(self) showFn(self) end)
+        return cogBtn
+    end
+
     local function BuildMenuBagsXPPage(pageName, parent, yOffset)
         local W = EllesmereUI.Widgets
         local y = yOffset
@@ -1215,10 +1396,11 @@ initFrame:SetScript("OnEvent", function(self)
             GetVisibilityKey(s) -- normalize legacy booleans into barVisibility
             return s.barVisibility == "never" or s.alwaysHidden == true
         end
-        local function BuildVisRow(barKey, leftLabel, disabledFn, disTip, trackNeverFlip)
+        -- Returns the row config rather than building it, so two bars can share one
+        -- row (rightVis) instead of each taking a half-empty one.
+        local function VisOpts(barKey, leftLabel, disabledFn, disTip, trackNeverFlip)
             local wasNever = trackNeverFlip and BarIsNever(barKey)
-            local visRow, visH = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
-                { getStore = function()
+            return  { getStore = function()
                       local s = EAB.db.profile.bars[barKey]
                       -- Normalize first: extra-bar defaults may carry only legacy booleans, no barVisibility key yet.
                       if s then GetVisibilityKey(s) end
@@ -1226,7 +1408,12 @@ initFrame:SetScript("OnEvent", function(self)
                   end,
                   legacyKey = "barVisibility",
                   label = leftLabel,
-                  caps = { partyIncludesRaid = false, luaDragonriding = true },
+                  -- noOverrideMouseover: this module's hover wiring reads the STORED
+                  -- mouseoverEnabled, which an override does not write, so a Mouseover
+                  -- override would silently behave like Always. Offered as locked rather
+                  -- than looking available and doing nothing.
+                  caps = { partyIncludesRaid = false, luaDragonriding = true,
+                           noOverrideMouseover = true },
                   applyScalarFn = function(s, mode) ApplyVisibilityKey(s, mode) end,
                   disabledFn = disabledFn, disabledTooltip = disTip, rawTooltip = disTip and true or nil,
                   onChanged = function()
@@ -1236,33 +1423,23 @@ initFrame:SetScript("OnEvent", function(self)
                       if trackNeverFlip and BarIsNever(barKey) ~= wasNever then
                           EllesmereUI:RefreshPage(true)
                       end
-                  end },
-                { type="dropdown", text="Visibility Options",
-                  values={ __placeholder = "..." }, order={ "__placeholder" },
-                  getValue=function() return "__placeholder" end,
-                  setValue=function() end });  y = y - visH
+                  end,
+                  -- Option axes recompile the secure driver through the same chain the
+                  -- old Visibility Options dropdown used. The gate refresh first: a lane
+                  -- click can be what just armed (or disarmed) the soft-target machinery,
+                  -- and the two calls below must see the current flags, not last click's.
+                  onOptionChanged = function()
+                      EAB:_RefreshSoftTargetGate()
+                      EAB:UpdateHousingVisibility()
+                      EAB:ApplyCombatVisibility()
+                  end }
+        end
 
-            -- Replace the dummy right dropdown with checkbox dropdown
-            local rightRgn = visRow._rightRegion
-            if rightRgn._control then rightRgn._control:Hide() end
-            local PP = EllesmereUI.PanelPP
-            if not EllesmereUI._prebuilding then
-            local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
-                rightRgn, 210, rightRgn:GetFrameLevel() + 2,
-                EllesmereUI.VIS_OPT_ITEMS,
-                function(k) return EAB.db.profile.bars[barKey][k] or false end,
-                function(k, v)
-                    EAB.db.profile.bars[barKey][k] = v
-                    EAB:UpdateHousingVisibility()
-                    EAB:ApplyCombatVisibility()
-                    EllesmereUI:RefreshPage()
-                end)
-            PP.Point(cbDD, "RIGHT", rightRgn, "RIGHT", -20, 0)
-            rightRgn._control = cbDD
-            rightRgn._lastInline = nil
-            EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
-            end
-
+        -- Single-bar row (data bar sections): one Visibility control, right slot free.
+        local function BuildVisRow(barKey, leftLabel, disabledFn, disTip, trackNeverFlip)
+            local visRow, visH = EllesmereUI.BuildVisibilityRow(W, parent, y,
+                VisOpts(barKey, leftLabel, disabledFn, disTip, trackNeverFlip))
+            y = y - visH
             return visRow
         end
 
@@ -1270,8 +1447,13 @@ initFrame:SetScript("OnEvent", function(self)
         --  MICRO MENU & BAGS
         -------------------------------------------------------------------
         _, h = W:SectionHeader(parent, "MICRO MENU & BAGS", y);  y = y - h
-        BuildVisRow("MicroBar", "Micro Menu Visibility")
-        BuildVisRow("BagBar",   "Bag Bar Visibility")
+        -- Both bars' Visibility in ONE row: same kind of control, and pairing them
+        -- leaves no half-empty slot behind now that Visibility Options is folded in.
+        do
+            local microOpts = VisOpts("MicroBar", "Micro Menu Visibility")
+            microOpts.rightVis = VisOpts("BagBar", "Bag Bar Visibility")
+            _, h = EllesmereUI.BuildVisibilityRow(W, parent, y, microOpts);  y = y - h
+        end
 
         _, h = W:Spacer(parent, y, 12);  y = y - h
 
@@ -1484,7 +1666,8 @@ initFrame:SetScript("OnEvent", function(self)
                       if ns.ApplyDataBarLayout then ns.ApplyDataBarLayout(barKey) end
                   end });  y = y - h
 
-            _, h = W:DualRow(parent, y,
+            local textRow
+            textRow, h = W:DualRow(parent, y,
                 { type="toggle", text="Click Through",
                   tooltip="Mouse clicks pass through the bar. Disable to allow the mouseover tooltip.",
                   getValue=function() return S().clickThrough end,
@@ -1498,6 +1681,28 @@ initFrame:SetScript("OnEvent", function(self)
                       S().textSize = v
                       if ns.ApplyDataBarLayout then ns.ApplyDataBarLayout(barKey) end
                   end });  y = y - h
+
+            if not EllesmereUI._prebuilding then
+                local rgn = textRow._rightRegion
+                local _, dbCogShowRaw = EllesmereUI.BuildCogPopup({
+                    title = "Bar Text Offsets",
+                    rows = {
+                        { type="slider", label="X Offset", min=-150, max=150, step=1,
+                          get=function() return S().textOffsetX or 0 end,
+                          set=function(v)
+                              S().textOffsetX = v
+                              if ns.ApplyDataBarLayout then ns.ApplyDataBarLayout(barKey) end
+                          end },
+                        { type="slider", label="Y Offset", min=-150, max=150, step=1,
+                          get=function() return S().textOffsetY or 0 end,
+                          set=function(v)
+                              S().textOffsetY = v
+                              if ns.ApplyDataBarLayout then ns.ApplyDataBarLayout(barKey) end
+                          end },
+                    },
+                })
+                MakeCogBtn(rgn, dbCogShowRaw, nil, EllesmereUI.DIRECTIONS_ICON)
+            end
 
             return visRow, sizeRow
         end
@@ -1547,10 +1752,6 @@ initFrame:SetScript("OnEvent", function(self)
         local W = EllesmereUI.Widgets
         local _, h
 
-        -- Must be scoped HERE, not shared with BuildMenuBagsXPPage's identically named local:
-        -- otherwise the Icon Size rows below resolve it as a nil GLOBAL and the disabled-slider tooltip silently never shows.
-        local BLIZZ_DIS_TIP = "This option does not work with Blizzard Bars. Please use Blizzard Edit Mode."
-
         ---------------------------------------------------------------
         --  Unified Get / Set / DB abstraction
         ---------------------------------------------------------------
@@ -1581,29 +1782,32 @@ initFrame:SetScript("OnEvent", function(self)
         local function SUpdatePreview()
             UpdatePreview()
         end
+
+        -- The stock spacing lives in the offset boxes, not in the placement. A
+        -- position pick swaps the old placement's spacing for the new one's on each
+        -- axis and keeps whatever the user added on top (Default carries none: its
+        -- stock lines hold their own spacing). Opting in, moving between positions
+        -- and going back to Default therefore never move the text by the spacing,
+        -- whatever the boxes held (a Cropped shape's preset included).
+        local function SSeedTextOffsets(kind, anchorKey, oxKey, oyKey, anchor)
+            local prev = SVal(anchorKey, nil)
+            if prev == anchor then return end
+            local px, py, nx, ny = 0, 0, 0, 0
+            if prev then px, py = EAB.StockTextOffsets(kind, prev) end
+            if anchor then nx, ny = EAB.StockTextOffsets(kind, anchor) end
+            SB()[oxKey] = SVal(oxKey, 0) - px + nx
+            SB()[oyKey] = SVal(oyKey, 0) - py + ny
+        end
         local function SUpdatePreviewAndResize()
             UpdatePreviewAndResize()
         end
-        local function MakeCogBtn(rgn, showFn, anchorTo, iconPath)
-            local cogBtn = CreateFrame("Button", nil, rgn)
-            cogBtn:SetSize(26, 26)
-            cogBtn:SetPoint("RIGHT", anchorTo or rgn._control, "LEFT", -8, 0)
-            rgn._lastInline = cogBtn
-            cogBtn:SetFrameLevel(rgn:GetFrameLevel() + 5)
-            cogBtn:SetAlpha(0.4)
-            local cogTex = cogBtn:CreateTexture(nil, "OVERLAY")
-            cogTex:SetAllPoints()
-            cogTex:SetTexture(iconPath or EllesmereUI.COGS_ICON)
-            cogBtn:SetScript("OnEnter", function(self) self:SetAlpha(0.7) end)
-            cogBtn:SetScript("OnLeave", function(self) self:SetAlpha(0.4) end)
-            cogBtn:SetScript("OnClick", function(self) showFn(self) end)
-            return cogBtn
-        end
-
         parent._showRowDivider = true
 
         local visOnly = IsVisOnly()
         local row
+        -- Declared out here, not in the `do` block that builds it: the Toggle Action Bar
+        -- keybind lives past that block's end and anchors into this row's right slot.
+        local visRow1
 
         -- Row / section references for click-navigation
         local iconsSectionHeader, textSectionHeader
@@ -1649,7 +1853,8 @@ initFrame:SetScript("OnEvent", function(self)
             end
 
             -- Pet Bar cannot express group modes: lock them with an explanation instead of offering silent no-ops.
-            local visCaps = { partyIncludesRaid = false }
+            -- noOverrideMouseover: see the caps on the bar row above.
+            local visCaps = { partyIncludesRaid = false, noOverrideMouseover = true }
             if SelectedKey() == "PetBar" then
                 visCaps.noGroupModes = true
                 visCaps.lockedTooltips = {
@@ -1662,8 +1867,7 @@ initFrame:SetScript("OnEvent", function(self)
             -- edge event; secure bars' drivers re-evaluate natively and never lock.
             if IsDataBar() then visCaps.luaDragonriding = true end
 
-            local visRow1
-            visRow1, h = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
+            visRow1, h = EllesmereUI.BuildVisibilityRow(W, parent, y,
                 { getStore = function()
                       local s = SB()
                       GetVisibilityKey(s)
@@ -1680,31 +1884,23 @@ initFrame:SetScript("OnEvent", function(self)
                       EAB:RefreshRuntimeVisibility()
                       EAB:RefreshMouseover()
                       EAB:ApplyCombatVisibility()
+                  end,
+                  -- Option axes recompile the secure driver through the same chain the
+                  -- old Visibility Options dropdown used. The gate refresh first: a lane
+                  -- click can be what just armed (or disarmed) the soft-target machinery,
+                  -- and the two calls below must see the current flags, not last click's.
+                  onOptionChanged = function()
+                      EAB:_RefreshSoftTargetGate()
+                      EAB:UpdateHousingVisibility()
+                      EAB:ApplyCombatVisibility()
                   end },
-                { type="dropdown", text="Visibility Options",
-                  values={ __placeholder = "..." }, order={ "__placeholder" },
-                  getValue=function() return "__placeholder" end,
-                  setValue=function() end });  y = y - h
+                -- Toggle Action Bar moved up into the slot the Visibility Options dropdown
+                -- left behind: the keybind flips this bar shown/hidden, the same question the
+                -- Visibility control answers. It carries the `not visOnly` gate its old row
+                -- had, so visibility-only bars still get no toggle keybind.
+                (not visOnly) and { type="label", text="Toggle Action Bar" }
+                    or { type="label", text="" });  y = y - h
 
-            -- Replace the dummy right dropdown with checkbox dropdown
-            do
-                local rightRgn = visRow1._rightRegion
-                if rightRgn._control then rightRgn._control:Hide() end
-                local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
-                    rightRgn, 210, rightRgn:GetFrameLevel() + 2,
-                    EllesmereUI.VIS_OPT_ITEMS,
-                    function(k) return SB()[k] or false end,
-                    function(k, v)
-                        SB()[k] = v
-                        EAB:UpdateHousingVisibility()
-                        EAB:ApplyCombatVisibility()
-                        EllesmereUI:RefreshPage()
-                    end)
-                PP.Point(cbDD, "RIGHT", rightRgn, "RIGHT", -20, 0)
-                rightRgn._control = cbDD
-                rightRgn._lastInline = nil
-                EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
-            end
             do
                 local rgn = visRow1._leftRegion
                 EllesmereUI.BuildSyncIcon({
@@ -1725,7 +1921,7 @@ initFrame:SetScript("OnEvent", function(self)
                         local src = SB()
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             local dst = EAB.db.profile.bars[key]
-                            if not EllesmereUI.VisSelectionEquals(src, "barVisibility", dst, "barVisibility") then return false end
+                            if not EllesmereUI.VisFullEquals(src, "barVisibility", dst, "barVisibility") then return false end
                             if (src.dragShow or false) ~= (dst.dragShow or false) then return false end
                         end
                         return true
@@ -1800,22 +1996,9 @@ initFrame:SetScript("OnEvent", function(self)
             end
         end
 
+        -- Bar Opacity keeps this row (and its sync icon, now on the left region) with
+        -- Always Show Buttons as its partner; Toggle Action Bar sits in the Visibility row.
         row, h = W:DualRow(parent, y,
-            { type="toggle", text="Always Show Buttons",
-              getValue=function()
-                  local v = SGet("alwaysShowButtons")
-                  if v == nil then return true end
-                  return v
-              end,
-              setValue=function(v)
-                  SSet("alwaysShowButtons", v, function(k)
-                      EAB:ApplyAlwaysShowButtons(k)
-                      EAB:ApplyPaddingForBar(k)
-                      EAB:ApplyBackgroundForBar(k)
-                  end)
-                  SUpdatePreview()
-              end,
-              tooltip="Show button backgrounds even if a spell is not assigned to that slot." },
             { type="slider", text="Bar Opacity", min=0, max=100, step=5,
               getValue=function()
                   local bs = SB()
@@ -1832,9 +2015,24 @@ initFrame:SetScript("OnEvent", function(self)
                       SSet("mouseoverAlpha", v / 100, function(k) EAB:ApplyBarOpacity(k) end)
                   end
                   SUpdatePreview()
-              end });  y = y - h
+              end },
+            { type="toggle", text="Always Show Buttons",
+              getValue=function()
+                  local v = SGet("alwaysShowButtons")
+                  if v == nil then return true end
+                  return v
+              end,
+              setValue=function(v)
+                  SSet("alwaysShowButtons", v, function(k)
+                      EAB:ApplyAlwaysShowButtons(k)
+                      EAB:ApplyPaddingForBar(k)
+                      EAB:ApplyBackgroundForBar(k)
+                  end)
+                  SUpdatePreview()
+              end,
+              tooltip="Show button backgrounds even if a spell is not assigned to that slot." });  y = y - h
         do
-            local rgn = row._rightRegion
+            local rgn = row._leftRegion
             EllesmereUI.BuildSyncIcon({
                 region  = rgn,
                 tooltip = "Apply Bar Opacity to all Bars",
@@ -1876,18 +2074,19 @@ initFrame:SetScript("OnEvent", function(self)
         if not visOnly then
             local ctRow
             ctRow, h = W:DualRow(parent, y,
-                { type="label", text="Toggle Action Bar" },
                 { type="toggle", text="Click Through",
                   getValue=function()
                       return SGet("clickThrough")
                   end,
                   setValue=function(v)
                       SSet("clickThrough", v, function(k) EAB:ApplyClickThroughForBar(k) end)
-                  end });  y = y - h
-            -- "Toggle Action Bar" keybind (left region): bound key flips the bar shown/hidden at
-            -- runtime without writing saved visibility. Enabled only for Always/Never; out of combat only.
+                  end },
+                { type="label", text="" });  y = y - h
+            -- "Toggle Action Bar" keybind: bound key flips the bar shown/hidden at runtime
+            -- without writing saved visibility. Enabled only for Always/Never; out of combat
+            -- only. Its label sits in the Visibility row, so the button goes there too.
             do
-                local rgn = ctRow._leftRegion
+                local rgn = visRow1._rightRegion
                 local kbBtn = CreateFrame("Button", nil, rgn)
                 PP.Size(kbBtn, 126, 29)
                 PP.Point(kbBtn, "RIGHT", rgn, "RIGHT", -20, 0)
@@ -1953,18 +2152,34 @@ initFrame:SetScript("OnEvent", function(self)
                 kbBtn:SetScript("OnKeyDown", function(self, key)
                     if not listening then self:SetPropagateKeyboardInput(true); return end
                     if key == "LSHIFT" or key == "RSHIFT" or key == "LCTRL" or key == "RCTRL"
-                       or key == "LALT" or key == "RALT" then
+                       or key == "LALT" or key == "RALT" or key == "LMETA" or key == "RMETA" then
                         self:SetPropagateKeyboardInput(true); return
                     end
                     self:SetPropagateKeyboardInput(false)
                     if key == "ESCAPE" then
                         listening = false; self:EnableKeyboard(false); RefreshLabel(); return
                     end
-                    local mods = ""
-                    if IsShiftKeyDown() then mods = mods .. "SHIFT-" end
-                    if IsControlKeyDown() then mods = mods .. "CTRL-" end
-                    if IsAltKeyDown() then mods = mods .. "ALT-" end
-                    SB().toggleVisKey = mods .. key
+                    -- Blizzard's canonical chord order is ALT-CTRL-SHIFT-KEY,
+                    -- and CreateKeyChordStringUsingMetaKeyState is what
+                    -- produces it. Hand-rolling the modifiers built
+                    -- SHIFT-CTRL-ALT-KEY, a chord string the engine never
+                    -- generates, so any bind using more than one modifier was
+                    -- stored in a form nothing could match. Single-modifier
+                    -- binds happen to agree, which is why this survived.
+                    local fullKey
+                    if CreateKeyChordStringUsingMetaKeyState then
+                        fullKey = CreateKeyChordStringUsingMetaKeyState(key)
+                    else
+                        local mods = ""
+                        if IsAltKeyDown() then mods = mods .. "ALT-" end
+                        if IsControlKeyDown() then mods = mods .. "CTRL-" end
+                        if IsShiftKeyDown() then mods = mods .. "SHIFT-" end
+                        if IsMetaKeyDown and IsMetaKeyDown() then
+                            mods = mods .. "META-"
+                        end
+                        fullKey = mods .. key
+                    end
+                    SB().toggleVisKey = fullKey
                     EAB:RebuildVisToggleBindings()
                     listening = false
                     self:EnableKeyboard(false)
@@ -2009,7 +2224,7 @@ initFrame:SetScript("OnEvent", function(self)
                 })
             end
             do
-                local rgn = ctRow._rightRegion
+                local rgn = ctRow._leftRegion
                 EllesmereUI.BuildSyncIcon({
                     region  = rgn,
                     tooltip = "Apply Click Through to all Bars",
@@ -2055,15 +2270,15 @@ initFrame:SetScript("OnEvent", function(self)
             local iconSizeRow
             iconSizeRow, h = W:DualRow(parent, y,
                 { type="slider", text="Icon Size", min=16, max=120, step=1,
+                  -- Every style sizes from this slider (stock styles scale Blizzard's
+                  -- native-size button to it); only a size match locks it.
                   disabled=function()
                       local k = SelectedKey()
                       if EllesmereUI.GetWidthMatchTarget and EllesmereUI.GetWidthMatchTarget(k) then return true end
                       if EllesmereUI.GetHeightMatchTarget and EllesmereUI.GetHeightMatchTarget(k) then return true end
-                      return EAB.db.profile.useBlizzardStyle or false
+                      return false
                   end,
                   disabledTooltip=function()
-                      -- Blizzard Style wins the message: sizing is Edit Mode's despite any stale match link, so "unmatch to edit" would be a dead end.
-                      if EAB.db.profile.useBlizzardStyle then return BLIZZ_DIS_TIP end
                       local k = SelectedKey()
                       local wt = EllesmereUI.GetWidthMatchTarget and EllesmereUI.GetWidthMatchTarget(k)
                       local ht = EllesmereUI.GetHeightMatchTarget and EllesmereUI.GetHeightMatchTarget(k)
@@ -2072,7 +2287,7 @@ initFrame:SetScript("OnEvent", function(self)
                           local name = (EllesmereUI.GetBarLabel and EllesmereUI.GetBarLabel(target)) or target
                           return EllesmereUI.Lf("Size matched to %1$s. Unmatch in Unlock Mode to edit.", name)
                       end
-                      return BLIZZ_DIS_TIP
+                      return nil
                   end,
                   rawTooltip=true,
                   getValue=function()
@@ -2780,22 +2995,65 @@ initFrame:SetScript("OnEvent", function(self)
                               settings.bgBorderOffsetY = nil
                               settings.bgBorderShiftX = nil
                               settings.bgBorderShiftY = nil
+                              -- A style pick resets the border: a set exact size goes with it (false travels, nil would not).
+                              if settings.bgBorderThicknessPx then settings.bgBorderThicknessPx = false end
                               settings.bgBorderBehind = behind
                               settings.bgBorderColor = { r=color.r, g=color.g, b=color.b, a=1 }
                               EAB:ApplyBackgroundForBar(k)
                           end)
                           SUpdatePreview()
-                          EllesmereUI:RefreshPage()
+                          -- Full rebuild: the Width/Height Offset row exists only for a textured style.
+                          EllesmereUI:RefreshPage(true)
                       end },
-                    { type="dropdown", text="Border Size",
+                    EllesmereUI.BorderPxSliderCfg{ text="Border Size",
                       disabled=BgDisabled,
                       disabledTooltip="Bar Background Border",
-                      values=ns.BORDER_THICKNESS_LABELS, order=ns.BORDER_THICKNESS_ORDER,
-                      getValue=function() return SVal("bgBorderThickness", "none") end,
-                      setValue=function(v)
-                          SSet("bgBorderThickness", v, function(k) EAB:ApplyBackgroundForBar(k) end)
+                      -- The step ApplyBackgroundForBar renders with: a thickness with no
+                      -- entry (unknown, or the number an old SharedMedia pick stored) is 0, hidden.
+                      getStep=function()
+                          local entry = ns.BORDER_THICKNESS[SVal("bgBorderThickness", "none")]
+                          return entry and entry.regular or 0
+                      end,
+                      setStep=function(step) SB().bgBorderThickness = EllesmereUI.BORDER_LABEL_OF_STEP[step] end,
+                      getTex=function() return SVal("bgBorderTexture", "solid") end,
+                      getPx=function() return SGet("bgBorderThicknessPx") end,
+                      setPx=function(v) SB().bgBorderThicknessPx = v end,
+                      apply=function()
+                          EAB:ApplyBackgroundForBar(SelectedKey())
+                          EllesmereUI:RefreshPage()
                           SUpdatePreview()
                       end });  y = y - h
+
+                -- Width Offset | Height Offset: the textured border's outward offsets, their
+                -- own row while a textured style is selected (Solid has none; the style
+                -- setter rebuilds the page). Shown = the override, else the "actionbars"
+                -- registry default for the thickness key ApplyBackgroundForBar passes.
+                do
+                    local bgTex = SVal("bgBorderTexture", "solid")
+                    if bgTex ~= "" and bgTex ~= "solid" then
+                        local ocfgL, ocfgR = EllesmereUI.BorderOffsetRowCfgs{
+                            addonKey="actionbars",
+                            disabled=BgDisabled,
+                            disabledTooltip="Bar Background Border",
+                            getTex=function() return SVal("bgBorderTexture", "solid") end,
+                            getStep=function()
+                                local entry = ns.BORDER_THICKNESS[SVal("bgBorderThickness", "none")]
+                                return entry and entry.regular or 0
+                            end,
+                            getSizeKey=function() return SVal("bgBorderThickness", "none") end,
+                            getPx=function() return SGet("bgBorderThicknessPx") end,
+                            getX=function() return SGet("bgBorderOffsetX") end,
+                            setX=function(v) SB().bgBorderOffsetX = v end,
+                            getY=function() return SGet("bgBorderOffsetY") end,
+                            setY=function(v) SB().bgBorderOffsetY = v end,
+                            apply=function()
+                                EAB:ApplyBackgroundForBar(SelectedKey())
+                                EllesmereUI:RefreshPage()
+                                SUpdatePreview()
+                            end }
+                        _, h = W:DualRow(parent, y, ocfgL, ocfgR);  y = y - h
+                    end
+                end
 
                 do
                     local region = bgBorderRow._rightRegion
@@ -2823,6 +3081,11 @@ initFrame:SetScript("OnEvent", function(self)
                         local source = SB()
                         local target = EAB.db.profile.bars[key]
                         target.bgBorderThickness = source.bgBorderThickness
+                        do
+                            local v = source.bgBorderThicknessPx
+                            if v == nil and target.bgBorderThicknessPx ~= nil then v = false end
+                            target.bgBorderThicknessPx = v
+                        end
                         local color = source.bgBorderColor
                         if color then
                             target.bgBorderColor = { r=color.r, g=color.g, b=color.b, a=color.a }
@@ -2838,10 +3101,12 @@ initFrame:SetScript("OnEvent", function(self)
                         end,
                         isSynced=function()
                             local thickness = SVal("bgBorderThickness", "none")
+                            local thicknessPx = SGet("bgBorderThicknessPx") or false   -- nil and false render alike
                             local color = SGet("bgBorderColor") or { r=0, g=0, b=0, a=1 }
                             for _, key in ipairs(GROUP_BAR_ORDER) do
                                 local target = EAB.db.profile.bars[key]
                                 if (target.bgBorderThickness or "none") ~= thickness then return false end
+                                if (target.bgBorderThicknessPx or false) ~= thicknessPx then return false end
                                 local targetColor = target.bgBorderColor or { r=0, g=0, b=0, a=1 }
                                 if targetColor.r ~= color.r or targetColor.g ~= color.g
                                     or targetColor.b ~= color.b or targetColor.a ~= color.a then return false end
@@ -2863,43 +3128,26 @@ initFrame:SetScript("OnEvent", function(self)
 
                 do
                     local region = bgBorderRow._leftRegion
+                    -- The offsets/shifts the background border renders with when none is
+                    -- set: its registry defaults (looked up as before), scaled to an exact
+                    -- size when one is set, as ApplyBackgroundForBar draws them.
+                    local function BgBorderDefaults()
+                        local texture = SVal("bgBorderTexture", "solid")
+                        local thickness = SVal("bgBorderThickness", "thin")
+                        local entry = ns.BORDER_THICKNESS[SVal("bgBorderThickness", "none")]
+                        local step = entry and entry.regular or 0
+                        local px = EllesmereUI.BorderPx(SGet("bgBorderThicknessPx"), step, texture)
+                        return ShownBorderDefaults(texture, thickness, step, px)
+                    end
                     local _, showOffsetPopup = EllesmereUI.BuildCogPopup({
-                        title="Border Offset",
+                        title="Border Options",
                         captureRegion=region,
                         rows={
-                            { type="slider", label="Offset X", min=-10, max=10, step=1,
-                              get=function()
-                                  local value = SGet("bgBorderOffsetX")
-                                  if value ~= nil then return value end
-                                  local texture = SVal("bgBorderTexture", "solid")
-                                  local thickness = SVal("bgBorderThickness", "thin")
-                                  local defaultX = EllesmereUI.GetBorderDefaults("actionbars", texture, thickness)
-                                  return defaultX
-                              end,
-                              set=function(v)
-                                  SSet("bgBorderOffsetX", v, function(k) EAB:ApplyBackgroundForBar(k) end)
-                                  SUpdatePreview()
-                              end },
-                            { type="slider", label="Offset Y", min=-10, max=10, step=1,
-                              get=function()
-                                  local value = SGet("bgBorderOffsetY")
-                                  if value ~= nil then return value end
-                                  local texture = SVal("bgBorderTexture", "solid")
-                                  local thickness = SVal("bgBorderThickness", "thin")
-                                  local _, defaultY = EllesmereUI.GetBorderDefaults("actionbars", texture, thickness)
-                                  return defaultY
-                              end,
-                              set=function(v)
-                                  SSet("bgBorderOffsetY", v, function(k) EAB:ApplyBackgroundForBar(k) end)
-                                  SUpdatePreview()
-                              end },
                             { type="slider", label="Shift X", min=-10, max=10, step=1,
                               get=function()
                                   local value = SGet("bgBorderShiftX")
                                   if value ~= nil then return value end
-                                  local texture = SVal("bgBorderTexture", "solid")
-                                  local thickness = SVal("bgBorderThickness", "thin")
-                                  local _, _, defaultX = EllesmereUI.GetBorderDefaults("actionbars", texture, thickness)
+                                  local _, _, defaultX = BgBorderDefaults()
                                   return defaultX
                               end,
                               set=function(v)
@@ -2910,9 +3158,7 @@ initFrame:SetScript("OnEvent", function(self)
                               get=function()
                                   local value = SGet("bgBorderShiftY")
                                   if value ~= nil then return value end
-                                  local texture = SVal("bgBorderTexture", "solid")
-                                  local thickness = SVal("bgBorderThickness", "thin")
-                                  local _, _, _, defaultY = EllesmereUI.GetBorderDefaults("actionbars", texture, thickness)
+                                  local _, _, _, defaultY = BgBorderDefaults()
                                   return defaultY
                               end,
                               set=function(v)
@@ -3041,9 +3287,11 @@ initFrame:SetScript("OnEvent", function(self)
             --  ICON APPEARANCE
             -------------------------------------------------------------------
             iconsSectionHeader, h = W:SectionHeader(parent, SECTION_ICON_APPEARANCE, y);  y = y - h
+            y = EllesmereUI.BlizzStyle.Note(parent, y, "actionbars")
 
+            -- Stock mode (Blizzard Style or Classic WoW UI): the shared gate.
             local function BlizzStyleOn()
-                return EAB.db.profile.useBlizzardStyle or false
+                return EllesmereUI.BlizzStyle.Get("actionbars")
             end
 
             -- "No custom shape" also covers "cropped" and unset.
@@ -3071,45 +3319,13 @@ initFrame:SetScript("OnEvent", function(self)
             local abBsRow
             do
                 local texValues, texOrder = EllesmereUI.GetBorderTextureDropdown()
-                abBsRow, h = W:DualRow(parent, y,
-                    { type="dropdown", text="Border Style",
-                      disabled=function() return BlizzStyleOn() or ShapeIsCustom() end,
-                      disabledTooltip=function() if ShapeIsCustom() then return "This option requires a non-custom button shape" end return "This option requires Blizzard Style Action Bars to be disabled" end,
-                      rawTooltip=true,
-                      values=texValues, order=texOrder,
-                      getValue=function() return SGet("borderTexture") or "solid" end,
-                      setValue=function(v)
-                          local defTh = EllesmereUI.GetBorderDefaultSize("actionbars", v)
-                          SSet("borderTexture", v, function(k)
-                              EAB.db.profile.bars[k].borderTextureOffset = nil
-                              EAB.db.profile.bars[k].borderTextureOffsetY = nil
-                              EAB.db.profile.bars[k].borderTextureShiftX = nil
-                              EAB.db.profile.bars[k].borderTextureShiftY = nil
-                              local _bcol, _bbehind = EllesmereUI.GetBorderStyleSelectDefaults(v)
-                              EAB.db.profile.bars[k].borderColor = { r = _bcol.r, g = _bcol.g, b = _bcol.b, a = 1 }
-                              EAB.db.profile.bars[k].borderClassColor = false
-                              EAB.db.profile.bars[k].borderBehind = _bbehind
-                              if defTh then
-                                  EAB.db.profile.bars[k].borderThickness = defTh
-                                  local entry = ns.BORDER_THICKNESS[defTh]
-                                  if entry then
-                                      local shape = EAB.db.profile.bars[k].buttonShape or "none"
-                                      if shape ~= "none" and shape ~= "cropped" then
-                                          EAB.db.profile.bars[k].shapeBorderSize = entry.shape
-                                          EAB.db.profile.bars[k].shapeBorderEnabled = entry.shape > 0
-                                      else
-                                          EAB.db.profile.bars[k].borderSize = entry.regular
-                                          EAB.db.profile.bars[k].borderEnabled = entry.regular > 0
-                                      end
-                                  end
-                              end
-                              EAB:ApplyBordersForBar(k)
-                              EAB:ApplyShapesForBar(k)
-                          end)
-                          SUpdatePreview()
-                          EllesmereUI:RefreshPage()
-                      end },
-                    { type="dropdown", text="Border Size",
+                -- Border Size: a custom shape's ring is on/off, so it keeps the None/Strong
+                -- dropdown; every other shape gets the pixel slider over the same key and
+                -- its borderThicknessPx companion. The shape setter rebuilds the page so the
+                -- slot follows the shape; a bar switch already rebuilds.
+                local sizeCfg
+                if ShapeIsCustom() then
+                    sizeCfg = { type="dropdown", text="Border Size",
                       disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
                       values=ns.BORDER_THICKNESS_LABELS, order=ns.BORDER_THICKNESS_ORDER,
                       itemDisabled=function(val)
@@ -3142,50 +3358,131 @@ initFrame:SetScript("OnEvent", function(self)
                               EAB:ApplyShapesForBar(k)
                           end)
                           SUpdatePreview()
-                      end });  y = y - h
+                      end }
+                else
+                    sizeCfg = EllesmereUI.BorderPxSliderCfg{ text="Border Size",
+                      disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
+                      -- The step the buttons render with (ResolveBorderThickness's regular
+                      -- column): an unknown or numeric thickness is thin.
+                      getStep=function()
+                          local entry = ns.BORDER_THICKNESS[SGet("borderThickness") or "thin"] or ns.BORDER_THICKNESS.thin
+                          return entry.regular
+                      end,
+                      -- Exactly what the dropdown wrote for a non-custom shape: the label and its mirrors.
+                      setStep=function(step)
+                          local s = SB()
+                          local label = EllesmereUI.BORDER_LABEL_OF_STEP[step]
+                          s.borderThickness = label
+                          local entry = ns.BORDER_THICKNESS[label]
+                          if entry then
+                              s.borderSize = entry.regular
+                              s.borderEnabled = entry.regular > 0
+                          end
+                      end,
+                      getTex=function() return SGet("borderTexture") or "solid" end,
+                      getPx=function() return SGet("borderThicknessPx") end,
+                      setPx=function(v) SB().borderThicknessPx = v end,
+                      apply=function()
+                          local k = SelectedKey()
+                          EAB:ApplyBordersForBar(k)
+                          EAB:ApplyShapesForBar(k)
+                          EllesmereUI:RefreshPage()
+                          SUpdatePreview()
+                      end }
+                end
+                abBsRow, h = W:DualRow(parent, y,
+                    EllesmereUI.BlizzStyle.Gate("actionbars", { type="dropdown", text="Border Style",
+                      disabled=function() return BlizzStyleOn() or ShapeIsCustom() end,
+                      disabledTooltip=function() if ShapeIsCustom() then return "This option requires a non-custom button shape" end return EllesmereUI.DisabledTooltip(EllesmereUI.BlizzStyle.Label("actionbars"), "disabled") end,
+                      rawTooltip=true,
+                      values=texValues, order=texOrder,
+                      getValue=function() return SGet("borderTexture") or "solid" end,
+                      setValue=function(v)
+                          local defTh = EllesmereUI.GetBorderDefaultSize("actionbars", v)
+                          -- An unregistered SharedMedia border answers the NUMBER 1; this key stores labels.
+                          if type(defTh) == "number" then defTh = EllesmereUI.BORDER_LABEL_OF_STEP[defTh] or "thin" end
+                          SSet("borderTexture", v, function(k)
+                              EAB.db.profile.bars[k].borderTextureOffset = nil
+                              EAB.db.profile.bars[k].borderTextureOffsetY = nil
+                              EAB.db.profile.bars[k].borderTextureShiftX = nil
+                              EAB.db.profile.bars[k].borderTextureShiftY = nil
+                              -- A style pick resets the size to the style's default: a set exact size goes with it (false travels, nil would not).
+                              if EAB.db.profile.bars[k].borderThicknessPx then EAB.db.profile.bars[k].borderThicknessPx = false end
+                              local _bcol, _bbehind = EllesmereUI.GetBorderStyleSelectDefaults(v)
+                              EAB.db.profile.bars[k].borderColor = { r = _bcol.r, g = _bcol.g, b = _bcol.b, a = 1 }
+                              EAB.db.profile.bars[k].borderClassColor = false
+                              EAB.db.profile.bars[k].borderBehind = _bbehind
+                              if defTh then
+                                  EAB.db.profile.bars[k].borderThickness = defTh
+                                  local entry = ns.BORDER_THICKNESS[defTh]
+                                  if entry then
+                                      local shape = EAB.db.profile.bars[k].buttonShape or "none"
+                                      if shape ~= "none" and shape ~= "cropped" then
+                                          EAB.db.profile.bars[k].shapeBorderSize = entry.shape
+                                          EAB.db.profile.bars[k].shapeBorderEnabled = entry.shape > 0
+                                      else
+                                          EAB.db.profile.bars[k].borderSize = entry.regular
+                                          EAB.db.profile.bars[k].borderEnabled = entry.regular > 0
+                                      end
+                                  end
+                              end
+                              EAB:ApplyBordersForBar(k)
+                              EAB:ApplyShapesForBar(k)
+                          end)
+                          SUpdatePreview()
+                          -- Full rebuild: the Width/Height Offset row exists only for a textured style.
+                          EllesmereUI:RefreshPage(true)
+                      end }),
+                    EllesmereUI.BlizzStyle.Gate("actionbars", sizeCfg));  y = y - h
+                -- Width Offset | Height Offset: the textured border's outward offsets, their
+                -- own row while a textured style is selected (Solid has none; the style
+                -- setter rebuilds the page). Shown = the override, else the "actionbars"
+                -- registry default for the step and thickness key ApplyBordersForBar and the
+                -- shape repaint pass (ResolveBorderThickness), scaled to an exact size as drawn.
+                do
+                    local btnTex = SGet("borderTexture") or "solid"
+                    if btnTex ~= "" and btnTex ~= "solid" then
+                        local ocfgL, ocfgR = EllesmereUI.BorderOffsetRowCfgs{
+                            addonKey="actionbars",
+                            disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
+                            getTex=function() return SGet("borderTexture") or "solid" end,
+                            getStep=function() return (ns.ResolveBorderThickness(SB())) end,
+                            getSizeKey=function() return SGet("borderThickness") or "thin" end,
+                            getPx=function() return SGet("borderThicknessPx") end,
+                            getX=function() return SGet("borderTextureOffset") end,
+                            setX=function(v) SB().borderTextureOffset = v end,
+                            getY=function() return SGet("borderTextureOffsetY") end,
+                            setY=function(v) SB().borderTextureOffsetY = v end,
+                            apply=function()
+                                EAB:ApplyBordersForBar(SelectedKey())
+                                EllesmereUI:RefreshPage()
+                                SUpdatePreview()
+                            end }
+                        _, h = W:DualRow(parent, y,
+                            EllesmereUI.BlizzStyle.Gate("actionbars", ocfgL),
+                            EllesmereUI.BlizzStyle.Gate("actionbars", ocfgR));  y = y - h
+                    end
+                end
                 do
                     local rgn = abBsRow._leftRegion
+                    -- The offsets/shifts the buttons render with when none is set: the
+                    -- step's registry defaults (looked up as before), scaled to an exact
+                    -- size when one is set, as ApplyButtonBorders draws them.
+                    local function ButtonBorderDefaults()
+                        local tex = SGet("borderTexture") or "solid"
+                        local th = SGet("borderThickness") or "thin"
+                        local step, px = ns.ResolveBorderThickness(SB())
+                        return ShownBorderDefaults(tex, th, step, px)
+                    end
                     local _, cogShow = EllesmereUI.BuildCogPopup({
-                        title = "Border Offset",
+                        title = "Border Options",
                         captureRegion = rgn,
                         rows = {
-                            { type = "slider", label = "Offset X", min = -10, max = 10, step = 1,
-                              get = function()
-                                  local v = SGet("borderTextureOffset")
-                                  if v then return v end
-                                  local tex = SGet("borderTexture") or "solid"
-                                  local th = SGet("borderThickness") or "thin"
-                                  local dox = EllesmereUI.GetBorderDefaults("actionbars", tex, th)
-                                  return dox
-                              end,
-                              set = function(v)
-                                  SSet("borderTextureOffset", v, function(k)
-                                      EAB:ApplyBordersForBar(k)
-                                  end)
-                                  SUpdatePreview()
-                              end },
-                            { type = "slider", label = "Offset Y", min = -10, max = 10, step = 1,
-                              get = function()
-                                  local v = SGet("borderTextureOffsetY")
-                                  if v then return v end
-                                  local tex = SGet("borderTexture") or "solid"
-                                  local th = SGet("borderThickness") or "thin"
-                                  local _, doy = EllesmereUI.GetBorderDefaults("actionbars", tex, th)
-                                  return doy
-                              end,
-                              set = function(v)
-                                  SSet("borderTextureOffsetY", v, function(k)
-                                      EAB:ApplyBordersForBar(k)
-                                  end)
-                                  SUpdatePreview()
-                              end },
                             { type = "slider", label = "Shift X", min = -10, max = 10, step = 1,
                               get = function()
                                   local v = SGet("borderTextureShiftX")
                                   if v then return v end
-                                  local tex = SGet("borderTexture") or "solid"
-                                  local th = SGet("borderThickness") or "thin"
-                                  local _, _, dsx = EllesmereUI.GetBorderDefaults("actionbars", tex, th)
+                                  local _, _, dsx = ButtonBorderDefaults()
                                   return dsx
                               end,
                               set = function(v)
@@ -3198,9 +3495,7 @@ initFrame:SetScript("OnEvent", function(self)
                               get = function()
                                   local v = SGet("borderTextureShiftY")
                                   if v then return v end
-                                  local tex = SGet("borderTexture") or "solid"
-                                  local th = SGet("borderThickness") or "thin"
-                                  local _, _, _, dsy = EllesmereUI.GetBorderDefaults("actionbars", tex, th)
+                                  local _, _, _, dsy = ButtonBorderDefaults()
                                   return dsy
                               end,
                               set = function(v)
@@ -3387,10 +3682,17 @@ initFrame:SetScript("OnEvent", function(self)
                     tooltip = "Apply Border Size and Color to all Bars",
                     onClick = function()
                         local th = SB().borderThickness
+                        local thPx = SB().borderThicknessPx   -- copied as is (string, false or nil)
                         local c = SB().borderColor
                         local cc = SB().borderClassColor
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             EAB.db.profile.bars[key].borderThickness = th
+                            do
+                                local t = EAB.db.profile.bars[key]
+                                local v = thPx
+                                if v == nil and t.borderThicknessPx ~= nil then v = false end
+                                t.borderThicknessPx = v
+                            end
                             local entry = ns.BORDER_THICKNESS[th]
                             if entry then
                                 local shape = EAB.db.profile.bars[key].buttonShape or "none"
@@ -3414,11 +3716,13 @@ initFrame:SetScript("OnEvent", function(self)
                     end,
                     isSynced = function()
                         local th = SB().borderThickness or "thin"
+                        local thPx = SB().borderThicknessPx or false   -- nil and false render alike
                         local cc = SB().borderClassColor or false
                         local c = SB().borderColor
                         local cr, cg, cb, ca = c and c.r or 0, c and c.g or 0, c and c.b or 0, c and c.a or 1
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             if (EAB.db.profile.bars[key].borderThickness or "thin") ~= th then return false end
+                            if (EAB.db.profile.bars[key].borderThicknessPx or false) ~= thPx then return false end
                             if (EAB.db.profile.bars[key].borderClassColor or false) ~= cc then return false end
                             local bc = EAB.db.profile.bars[key].borderColor
                             if (bc and bc.r or 0) ~= cr or (bc and bc.g or 0) ~= cg or (bc and bc.b or 0) ~= cb or (bc and bc.a or 1) ~= ca then return false end
@@ -3432,10 +3736,17 @@ initFrame:SetScript("OnEvent", function(self)
                         getCurrentKey = function() return SelectedKey() end,
                         onApply       = function(checkedKeys)
                             local th = SB().borderThickness
+                            local thPx = SB().borderThicknessPx   -- copied as is (string, false or nil)
                             local c = SB().borderColor
                             local cc = SB().borderClassColor
                             for _, key in ipairs(checkedKeys) do
                                 EAB.db.profile.bars[key].borderThickness = th
+                                do
+                                local t = EAB.db.profile.bars[key]
+                                local v = thPx
+                                if v == nil and t.borderThicknessPx ~= nil then v = false end
+                                t.borderThicknessPx = v
+                            end
                                 local entry = ns.BORDER_THICKNESS[th]
                                 if entry then
                                     local shape = EAB.db.profile.bars[key].buttonShape or "none"
@@ -3463,7 +3774,7 @@ initFrame:SetScript("OnEvent", function(self)
 
             local classColorBorderRow
             classColorBorderRow, h = W:DualRow(parent, y,
-                { type="dropdown", text="Custom Button Shape",
+                EllesmereUI.BlizzStyle.Gate("actionbars", { type="dropdown", text="Custom Button Shape",
                   disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
                   values=SHAPE_VALUES, order=SHAPE_ORDER,
                   itemDisabled=function(val)
@@ -3495,21 +3806,16 @@ initFrame:SetScript("OnEvent", function(self)
                               EAB.db.profile.bars[k].borderSize = entry.regular
                               EAB.db.profile.bars[k].borderEnabled = true
                           end
-                          -- Default keybind/count text for cropped vs normal
+                          -- Default keybind/count text for cropped vs normal (offsets keep a
+                          -- positioned text's corner spacing)
                           if v == "cropped" then
                               EAB.db.profile.bars[k].keybindFontSize = 11
-                              EAB.db.profile.bars[k].keybindOffsetX = 0
-                              EAB.db.profile.bars[k].keybindOffsetY = 1
                               EAB.db.profile.bars[k].countFontSize = 11
-                              EAB.db.profile.bars[k].countOffsetX = 0
-                              EAB.db.profile.bars[k].countOffsetY = -1
+                              EAB.ApplyShapeTextOffsets(EAB.db.profile.bars[k], 0, 1, 0, -1)
                           else
                               EAB.db.profile.bars[k].keybindFontSize = 12
-                              EAB.db.profile.bars[k].keybindOffsetX = 0
-                              EAB.db.profile.bars[k].keybindOffsetY = 0
                               EAB.db.profile.bars[k].countFontSize = 12
-                              EAB.db.profile.bars[k].countOffsetX = 0
-                              EAB.db.profile.bars[k].countOffsetY = 0
+                              EAB.ApplyShapeTextOffsets(EAB.db.profile.bars[k], 0, 0, 0, 0)
                           end
                           EAB:ApplyShapesForBar(k)
                           EAB:ApplyPaddingForBar(k)
@@ -3519,9 +3825,11 @@ initFrame:SetScript("OnEvent", function(self)
                       end)
                       EAB:RefreshProcGlows()
                       SUpdatePreview()
-                      EllesmereUI:RefreshPage()
-                  end },
-                { type="slider", text="Icon Zoom", min=0, max=10, step=0.5,
+                      -- Full rebuild: the Border Size slot is a dropdown for a custom shape
+                      -- and the pixel slider otherwise, and only a rebuild swaps it.
+                      EllesmereUI:RefreshPage(true)
+                  end }),
+                EllesmereUI.BlizzStyle.Gate("actionbars", { type="slider", text="Icon Zoom", min=0, max=10, step=0.5,
                   disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
                   getValue=function() return SVal("iconZoom", EAB.db.profile.iconZoom or 5.5) end,
                   setValue=function(v)
@@ -3530,7 +3838,7 @@ initFrame:SetScript("OnEvent", function(self)
                           EAB:ApplyShapesForBar(k)
                       end)
                       SUpdatePreview()
-                  end });  y = y - h
+                  end }));  y = y - h
             borderRow = classColorBorderRow
             do
                 local rgn = classColorBorderRow._leftRegion
@@ -3555,11 +3863,11 @@ initFrame:SetScript("OnEvent", function(self)
                                 bs.borderEnabled = true
                             end
                             if v == "cropped" then
-                                bs.keybindFontSize = 11; bs.keybindOffsetX = 0; bs.keybindOffsetY = 1
-                                bs.countFontSize = 11; bs.countOffsetX = 0; bs.countOffsetY = -1
+                                bs.keybindFontSize = 11; bs.countFontSize = 11
+                                EAB.ApplyShapeTextOffsets(bs, 0, 1, 0, -1)
                             else
-                                bs.keybindFontSize = 12; bs.keybindOffsetX = 0; bs.keybindOffsetY = 0
-                                bs.countFontSize = 12; bs.countOffsetX = 0; bs.countOffsetY = 0
+                                bs.keybindFontSize = 12; bs.countFontSize = 12
+                                EAB.ApplyShapeTextOffsets(bs, 0, 0, 0, 0)
                             end
                             EAB:ApplyShapesForBar(key)
                             EAB:ApplyPaddingForBar(key)
@@ -3600,11 +3908,11 @@ initFrame:SetScript("OnEvent", function(self)
                                     bs.borderEnabled = true
                                 end
                                 if v == "cropped" then
-                                    bs.keybindFontSize = 11; bs.keybindOffsetX = 0; bs.keybindOffsetY = 1
-                                    bs.countFontSize = 11; bs.countOffsetX = 0; bs.countOffsetY = -1
+                                    bs.keybindFontSize = 11; bs.countFontSize = 11
+                                    EAB.ApplyShapeTextOffsets(bs, 0, 1, 0, -1)
                                 else
-                                    bs.keybindFontSize = 12; bs.keybindOffsetX = 0; bs.keybindOffsetY = 0
-                                    bs.countFontSize = 12; bs.countOffsetX = 0; bs.countOffsetY = 0
+                                    bs.keybindFontSize = 12; bs.countFontSize = 12
+                                    EAB.ApplyShapeTextOffsets(bs, 0, 0, 0, 0)
                                 end
                                 EAB:ApplyShapesForBar(key)
                                 EAB:ApplyPaddingForBar(key)
@@ -3762,7 +4070,7 @@ initFrame:SetScript("OnEvent", function(self)
 
             local slotBgRow
             slotBgRow, h = W:DualRow(parent, y,
-                { type="slider", text="Icon Background", min=0, max=100, step=1,
+                EllesmereUI.BlizzStyle.Gate("actionbars", { type="slider", text="Icon Background", min=0, max=100, step=1,
                   tooltip="Controls the opacity of the flat color background behind action button icons.",
                   disabled=BlizzStyleOn, disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
                   getValue=function()
@@ -3773,7 +4081,7 @@ initFrame:SetScript("OnEvent", function(self)
                   setValue=function(v)
                       EAB.db.profile.slotBgOpacity = v
                       EAB:ApplySlotBackgroundColor()
-                  end },
+                  end }),
                 { type="toggle", text="One Button Assist Icon",
                   tooltip="Shows the rotation-helper ring on the button holding the One Button Assist action.",
                   getValue=function() return EAB.db.profile.obaIconEnabled ~= false end,
@@ -3796,7 +4104,7 @@ initFrame:SetScript("OnEvent", function(self)
                 })
                 MakeCogBtn(rgn, obaCogShow)
             end
-            -- Inline swatch: icon background color (left). Dimmed while Blizzard style is on (no slot background exists) or at 0 opacity.
+            -- Inline swatch: icon background color (left). Dimmed while a stock style is on (no slot background exists) or at 0 opacity.
             do
                 local rgn = slotBgRow._leftRegion
                 local function SbgOff()
@@ -3826,8 +4134,11 @@ initFrame:SetScript("OnEvent", function(self)
                 end)
                 sbgSwatch:SetScript("OnEnter", function(self)
                     if SbgOff() then
-                        local why = BlizzStyleOn() and "Blizzard Style Action Bars" or "Set Icon Background above 0"
-                        EllesmereUI.ShowWidgetTooltip(self, EllesmereUI.DisabledTooltip(why))
+                        if BlizzStyleOn() then
+                            EllesmereUI.ShowWidgetTooltip(self, EllesmereUI.DisabledTooltip(EllesmereUI.BlizzStyle.Label("actionbars"), "disabled"))
+                        else
+                            EllesmereUI.ShowWidgetTooltip(self, EllesmereUI.DisabledTooltip("Set Icon Background above 0"))
+                        end
                     end
                 end)
                 sbgSwatch:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
@@ -4351,11 +4662,13 @@ initFrame:SetScript("OnEvent", function(self)
                         local sz = s.keybindFontSize or 12
                         local ox = s.keybindOffsetX or 0
                         local oy = s.keybindOffsetY or 0
+                        local an = s.keybindAnchor
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             if c then EAB.db.profile.bars[key].keybindFontColor = { r=c.r, g=c.g, b=c.b } end
                             EAB.db.profile.bars[key].keybindFontSize = sz
                             EAB.db.profile.bars[key].keybindOffsetX = ox
                             EAB.db.profile.bars[key].keybindOffsetY = oy
+                            EAB.db.profile.bars[key].keybindAnchor = an or false
                             EAB:ApplyFontsForBar(key)
                         end
                         EllesmereUI:RefreshPage()
@@ -4371,6 +4684,7 @@ initFrame:SetScript("OnEvent", function(self)
                             if (b.keybindFontSize or 12) ~= sz then return false end
                             if (b.keybindOffsetX or 0) ~= ox then return false end
                             if (b.keybindOffsetY or 0) ~= oy then return false end
+                            if (b.keybindAnchor or nil) ~= (s.keybindAnchor or nil) then return false end
                             if c then
                                 local bc = b.keybindFontColor
                                 if not bc or bc.r ~= c.r or bc.g ~= c.g or bc.b ~= c.b then return false end
@@ -4389,11 +4703,13 @@ initFrame:SetScript("OnEvent", function(self)
                             local sz = s.keybindFontSize or 12
                             local ox = s.keybindOffsetX or 0
                             local oy = s.keybindOffsetY or 0
+                            local an = s.keybindAnchor
                             for _, key in ipairs(checkedKeys) do
                                 if c then EAB.db.profile.bars[key].keybindFontColor = { r=c.r, g=c.g, b=c.b } end
                                 EAB.db.profile.bars[key].keybindFontSize = sz
                                 EAB.db.profile.bars[key].keybindOffsetX = ox
                                 EAB.db.profile.bars[key].keybindOffsetY = oy
+                                EAB.db.profile.bars[key].keybindAnchor = an or false
                                 EAB:ApplyFontsForBar(key)
                             end
                             EllesmereUI:RefreshPage()
@@ -4424,6 +4740,16 @@ initFrame:SetScript("OnEvent", function(self)
                 local _, kbCogShowRaw = EllesmereUI.BuildCogPopup({
                     title = "Keybind Text Offsets",
                     rows = {
+                        { type="dropdown", label="Position",
+                          values=TEXT_ANCHOR_LABELS, order=TEXT_ANCHOR_DROPDOWN_ORDER,
+                          get=function() return SVal("keybindAnchor", "default") end,
+                          set=function(v)
+                              local anchor = v ~= "default" and v or nil
+                              SSeedTextOffsets("keybind", "keybindAnchor", "keybindOffsetX", "keybindOffsetY", anchor)
+                              -- Default is stored false, not nil: profile sync copies only keys that exist.
+                              SSet("keybindAnchor", anchor or false, function(k) EAB:ApplyFontsForBar(k) end)
+                              SUpdatePreview()
+                          end },
                         { type="slider", label="X Offset", min=-150, max=150, step=1,
                           get=function() return SVal("keybindOffsetX", 0) end,
                           set=function(v)
@@ -4504,11 +4830,13 @@ initFrame:SetScript("OnEvent", function(self)
                         local sz = s.macroFontSize or 12
                         local ox = s.macroOffsetX or 0
                         local oy = s.macroOffsetY or 0
+                        local an = s.macroAnchor
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             if c then EAB.db.profile.bars[key].macroFontColor = { r=c.r, g=c.g, b=c.b } end
                             EAB.db.profile.bars[key].macroFontSize = sz
                             EAB.db.profile.bars[key].macroOffsetX = ox
                             EAB.db.profile.bars[key].macroOffsetY = oy
+                            EAB.db.profile.bars[key].macroAnchor = an or false
                             EAB:ApplyFontsForBar(key)
                         end
                         EllesmereUI:RefreshPage()
@@ -4524,6 +4852,7 @@ initFrame:SetScript("OnEvent", function(self)
                             if (b.macroFontSize or 12) ~= sz then return false end
                             if (b.macroOffsetX or 0) ~= ox then return false end
                             if (b.macroOffsetY or 0) ~= oy then return false end
+                            if (b.macroAnchor or nil) ~= (s.macroAnchor or nil) then return false end
                             if c then
                                 local bc = b.macroFontColor
                                 if not bc or bc.r ~= c.r or bc.g ~= c.g or bc.b ~= c.b then return false end
@@ -4542,11 +4871,13 @@ initFrame:SetScript("OnEvent", function(self)
                             local sz = s.macroFontSize or 12
                             local ox = s.macroOffsetX or 0
                             local oy = s.macroOffsetY or 0
+                            local an = s.macroAnchor
                             for _, key in ipairs(checkedKeys) do
                                 if c then EAB.db.profile.bars[key].macroFontColor = { r=c.r, g=c.g, b=c.b } end
                                 EAB.db.profile.bars[key].macroFontSize = sz
                                 EAB.db.profile.bars[key].macroOffsetX = ox
                                 EAB.db.profile.bars[key].macroOffsetY = oy
+                                EAB.db.profile.bars[key].macroAnchor = an or false
                                 EAB:ApplyFontsForBar(key)
                             end
                             EllesmereUI:RefreshPage()
@@ -4577,6 +4908,15 @@ initFrame:SetScript("OnEvent", function(self)
                 local _, mcCogShowRaw = EllesmereUI.BuildCogPopup({
                     title = "Macro Text Offsets",
                     rows = {
+                        { type="dropdown", label="Position",
+                          values=TEXT_ANCHOR_LABELS, order=TEXT_ANCHOR_DROPDOWN_ORDER,
+                          get=function() return SVal("macroAnchor", "default") end,
+                          set=function(v)
+                              local anchor = v ~= "default" and v or nil
+                              SSeedTextOffsets("macro", "macroAnchor", "macroOffsetX", "macroOffsetY", anchor)
+                              SSet("macroAnchor", anchor or false, function(k) EAB:ApplyFontsForBar(k) end)
+                              SUpdatePreview()
+                          end },
                         { type="slider", label="X Offset", min=-150, max=150, step=1,
                           get=function() return SVal("macroOffsetX", 0) end,
                           set=function(v)
@@ -4618,11 +4958,13 @@ initFrame:SetScript("OnEvent", function(self)
                         local sz = s.countFontSize or 12
                         local ox = s.countOffsetX or 0
                         local oy = s.countOffsetY or 0
+                        local an = s.countAnchor
                         for _, key in ipairs(GROUP_BAR_ORDER) do
                             if c then EAB.db.profile.bars[key].countFontColor = { r=c.r, g=c.g, b=c.b } end
                             EAB.db.profile.bars[key].countFontSize = sz
                             EAB.db.profile.bars[key].countOffsetX = ox
                             EAB.db.profile.bars[key].countOffsetY = oy
+                            EAB.db.profile.bars[key].countAnchor = an or false
                             EAB:ApplyFontsForBar(key)
                         end
                         EllesmereUI:RefreshPage()
@@ -4638,6 +4980,7 @@ initFrame:SetScript("OnEvent", function(self)
                             if (b.countFontSize or 12) ~= sz then return false end
                             if (b.countOffsetX or 0) ~= ox then return false end
                             if (b.countOffsetY or 0) ~= oy then return false end
+                            if (b.countAnchor or nil) ~= (s.countAnchor or nil) then return false end
                             if c then
                                 local bc = b.countFontColor
                                 if not bc or bc.r ~= c.r or bc.g ~= c.g or bc.b ~= c.b then return false end
@@ -4656,11 +4999,13 @@ initFrame:SetScript("OnEvent", function(self)
                             local sz = s.countFontSize or 12
                             local ox = s.countOffsetX or 0
                             local oy = s.countOffsetY or 0
+                            local an = s.countAnchor
                             for _, key in ipairs(checkedKeys) do
                                 if c then EAB.db.profile.bars[key].countFontColor = { r=c.r, g=c.g, b=c.b } end
                                 EAB.db.profile.bars[key].countFontSize = sz
                                 EAB.db.profile.bars[key].countOffsetX = ox
                                 EAB.db.profile.bars[key].countOffsetY = oy
+                                EAB.db.profile.bars[key].countAnchor = an or false
                                 EAB:ApplyFontsForBar(key)
                             end
                             EllesmereUI:RefreshPage()
@@ -4691,6 +5036,15 @@ initFrame:SetScript("OnEvent", function(self)
                 local _, ctCogShowRaw = EllesmereUI.BuildCogPopup({
                     title = "Charges Text Offsets",
                     rows = {
+                        { type="dropdown", label="Position",
+                          values=TEXT_ANCHOR_LABELS, order=TEXT_ANCHOR_DROPDOWN_ORDER,
+                          get=function() return SVal("countAnchor", "default") end,
+                          set=function(v)
+                              local anchor = v ~= "default" and v or nil
+                              SSeedTextOffsets("count", "countAnchor", "countOffsetX", "countOffsetY", anchor)
+                              SSet("countAnchor", anchor or false, function(k) EAB:ApplyFontsForBar(k) end)
+                              SUpdatePreview()
+                          end },
                         { type="slider", label="X Offset", min=-150, max=150, step=1,
                           get=function() return SVal("countOffsetX", 0) end,
                           set=function(v)
@@ -4994,6 +5348,27 @@ initFrame:SetScript("OnEvent", function(self)
         local y = yOffset
         local _, h
 
+        -- Temporary: on a client that cannot run the secure handlers the bars
+        -- are built on (the WoW Forever beta) the module runs in a reduced
+        -- mode, said before anything else on the page. Skipped while the
+        -- search index prebuilds the page off screen; the height still comes
+        -- off y in both passes so everything below lands identically.
+        if not EllesmereUI.SecureSnippetsOK() then
+            if not EllesmereUI._prebuilding then
+                local PPw = EllesmereUI.PanelPP or EllesmereUI.PP
+                local warnFrame = CreateFrame("Frame", nil, parent)
+                PPw.Size(warnFrame, parent:GetWidth() - EllesmereUI.CONTENT_PAD * 2, 56)
+                PPw.Point(warnFrame, "TOPLEFT", parent, "TOPLEFT", EllesmereUI.CONTENT_PAD, y)
+                local warnFS = EllesmereUI.MakeFont(warnFrame, 13, "", 1, 0.35, 0.35, 1)
+                warnFS:SetPoint("TOPLEFT", warnFrame, "TOPLEFT", 0, 0)
+                warnFS:SetPoint("RIGHT", warnFrame, "RIGHT", 0, 0)
+                warnFS:SetJustifyH("LEFT")
+                warnFS:SetWordWrap(true)
+                warnFS:SetText(EllesmereUI.L("The current WoW Forever client has a bug that prevents some Action Bars functionality. Bars, buttons and keybinds work; page switching on stance and form changes, conditional bar hiding and empty-slot handling do not. This resolves itself once Blizzard fixes the client."))
+            end
+            y = y - 56
+        end
+
         activePreview = nil
 
         -- Consume any pending bar selection from Element Options navigation.
@@ -5102,24 +5477,27 @@ initFrame:SetScript("OnEvent", function(self)
                     end
                 end)
 
-            local isBlizz = EAB.db and EAB.db.profile and EAB.db.profile.useBlizzardStyle
+            -- A stock style on (Blizzard or Classic) offers the way back to the
+            -- EUI look; off, the way to Blizzard Style. Classic WoW UI is the
+            -- Style page's; a write here sets exactly one flag.
+            local isStock = EllesmereUI.BlizzStyle.Get("actionbars")
             local styleBtn = CreateFrame("Button", nil, rowFrame)
             PP.Size(styleBtn, BTN_W, BTN_H)
             PP.Point(styleBtn, "LEFT", rowFrame, "CENTER", GAP / 2, 0)
             styleBtn:SetFrameLevel(rowFrame:GetFrameLevel() + 1)
             local _, _, styleLbl = EllesmereUI.MakeStyledButton(styleBtn,
-                isBlizz and "EUI Style Action Bars" or "Blizzard Style Action Bars", 14,
+                isStock and "EUI Style Action Bars" or "Blizzard Style Action Bars", 14,
                 EllesmereUI.WB_COLOURS, function()
-                    local old = EAB.db.profile.useBlizzardStyle or false
-                    local new = not old
+                    local toBlizz = not EllesmereUI.BlizzStyle.Get("actionbars")
                     EllesmereUI:ShowConfirmPopup({
                         title       = "Reload Required",
                         message     = "Changing icon style requires a UI reload to apply.",
                         confirmText = "Reload Now",
                         cancelText  = "Cancel",
+                        reload      = true,
                         onConfirm   = function()
-                            EAB.db.profile.useBlizzardStyle = new
-                            ReloadUI()
+                            EAB.db.profile.useBlizzardStyle = toBlizz
+                            EAB.db.profile.useClassicStyle  = false
                         end,
                     })
                 end)
@@ -5446,9 +5824,9 @@ initFrame:SetScript("OnEvent", function(self)
         _, h = W:DualRow(parent, y,
             { type="colorpicker", text="Bar Interactions Color",
               tooltip=INTERACTIONS_TIP,
-              disabled=function() return EAB.db.profile.useBlizzardStyle or p.pushedUseClassColor end,
+              disabled=function() return EllesmereUI.BlizzStyle.Get("actionbars") or p.pushedUseClassColor end,
               disabledTooltip=function()
-                  if EAB.db.profile.useBlizzardStyle then return "This option requires Blizzard Style Action Bars to be disabled" end
+                  if EllesmereUI.BlizzStyle.Get("actionbars") then return EllesmereUI.DisabledTooltip(EllesmereUI.BlizzStyle.Label("actionbars"), "disabled") end
                   return "This option requires Class Colors to be disabled"
               end,
               rawTooltip=true,
@@ -5463,8 +5841,8 @@ initFrame:SetScript("OnEvent", function(self)
               hasAlpha=true },
             { type="toggle", text="Class Colored Bar Interactions",
               tooltip=INTERACTIONS_TIP,
-              disabled=function() return EAB.db.profile.useBlizzardStyle end,
-              disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
+              disabled=function() return EllesmereUI.BlizzStyle.Get("actionbars") end,
+              disabledTooltip=EllesmereUI.BlizzStyle.Label("actionbars"), requireState="disabled",
               getValue=function() return p.pushedUseClassColor end,
               setValue=function(v)
                   SetUnifiedClassColor(v)
@@ -5473,8 +5851,8 @@ initFrame:SetScript("OnEvent", function(self)
         row, h = W:DualRow(parent, y,
             { type="dropdown", text="Pushed Type",
               tooltip="The overlay that appears on the icon when you press and hold a spell button",
-              disabled=function() return EAB.db.profile.useBlizzardStyle end,
-              disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
+              disabled=function() return EllesmereUI.BlizzStyle.Get("actionbars") end,
+              disabledTooltip=EllesmereUI.BlizzStyle.Label("actionbars"), requireState="disabled",
               values=pushedTypeValues, order=pushedTypeOrder,
               getValue=function() return p.pushedTextureType or 2 end,
               setValue=function(v)
@@ -5485,8 +5863,8 @@ initFrame:SetScript("OnEvent", function(self)
               end },
             { type="dropdown", text="Highlight Type",
               tooltip="The overlay that appears on the icon when you hover your mouse over a spell button",
-              disabled=function() return EAB.db.profile.useBlizzardStyle end,
-              disabledTooltip="Blizzard Style Action Bars", requireState="disabled",
+              disabled=function() return EllesmereUI.BlizzStyle.Get("actionbars") end,
+              disabledTooltip=EllesmereUI.BlizzStyle.Label("actionbars"), requireState="disabled",
               values=highlightTypeValues, order=highlightTypeOrder,
               getValue=function() return p.highlightTextureType or 2 end,
               setValue=function(v)
@@ -5647,9 +6025,9 @@ initFrame:SetScript("OnEvent", function(self)
         row, h = W:DualRow(parent, y,
             { type="dropdown", text="Custom Proc Glow",
               values=procGlowValues, order=procGlowOrder,
-              disabled=function() return EAB.db.profile.useBlizzardStyle or hasCustomShape end,
+              disabled=function() return EllesmereUI.BlizzStyle.Get("actionbars") or hasCustomShape end,
               disabledTooltip=function()
-                  if EAB.db.profile.useBlizzardStyle then return "This option requires Blizzard Style Action Bars to be disabled" end
+                  if EllesmereUI.BlizzStyle.Get("actionbars") then return EllesmereUI.DisabledTooltip(EllesmereUI.BlizzStyle.Label("actionbars"), "disabled") end
                   return "Custom shapes always use Shape Glow -- change your bar shape to None or Cropped to pick a different glow"
               end,
               rawTooltip=true,
@@ -5739,6 +6117,73 @@ initFrame:SetScript("OnEvent", function(self)
             glowSwatch:SetMouseClickEnabled(not initOff)
         end
         y = y - h
+
+        -- Assisted Highlight. Blizzard's ring sits on the same button edge as
+        -- the proc glow and has no size control of its own, so we offer two
+        -- ways to tell them apart: push the ring clear with an outset, or drop
+        -- the ring for a flat tint that leaves the edge to the proc glow.
+        -- Values mirror p.assistGlowStyle: 1 = ring, 2 = overlay, 3 = both.
+        local function AssistOff()
+            return not (GetCVarBool and GetCVarBool("assistedCombatHighlight"))
+        end
+        local assistRow
+        assistRow, h = W:DualRow(parent, y,
+            { type="dropdown", text="Assisted Highlight",
+              values={ [1]="Glow Ring", [2]="Button Overlay", [3]="Ring + Overlay" },
+              order={ 1, 2, 3 },
+              tooltip="How Blizzard's next-spell suggestion is drawn on the button. Button Overlay replaces the blue ring with a flat tint, leaving the button edge free for the proc glow.",
+              disabled=AssistOff,
+              disabledTooltip="This option requires Blizzard's Assisted Highlight to be enabled",
+              rawTooltip=true,
+              getValue=function() return p.assistGlowStyle or 1 end,
+              setValue=function(v)
+                  p.assistGlowStyle = v
+                  if ns.UpdateAssistHighlights then ns.UpdateAssistHighlights() end
+                  -- Deferred like the proc-glow dropdown above: a synchronous
+                  -- rebuild tears the dropdown down inside its own click handler.
+                  C_Timer.After(0, function() EllesmereUI:RefreshPage() end)
+              end },
+            { type="slider", text="Overlay Opacity", min=0, max=100, step=1,
+              tooltip="Opacity of the Button Overlay tint.",
+              disabled=function() return AssistOff() or (p.assistGlowStyle or 1) == 1 end,
+              disabledTooltip="This option requires the Button Overlay style",
+              rawTooltip=true,
+              getValue=function() return p.assistGlowOverlayAlpha or 30 end,
+              setValue=function(v)
+                  p.assistGlowOverlayAlpha = v
+                  if ns.UpdateAssistHighlights then ns.UpdateAssistHighlights() end
+              end });  y = y - h
+
+        -- Inline swatch: overlay tint color, next to the opacity slider it belongs to.
+        if not EllesmereUI._prebuilding then
+            EllesmereUI.BuildInlineSwatches(assistRow._rightRegion, {
+                { tooltip = "Button Overlay Color", hasAlpha = false,
+                  getValue = function()
+                      local c = p.assistGlowOverlayColor or { r = 0.15, g = 0.5, b = 1 }
+                      return c.r, c.g, c.b
+                  end,
+                  setValue = function(r, g, b)
+                      p.assistGlowOverlayColor = { r = r, g = g, b = b }
+                      if ns.UpdateAssistHighlights then ns.UpdateAssistHighlights() end
+                  end },
+            }, {
+                disabled = function() return AssistOff() or (p.assistGlowStyle or 1) == 1 end,
+                disabledTooltip = "This option requires the Button Overlay style",
+            })
+        end
+
+        _, h = W:DualRow(parent, y,
+            { type="slider", text="Assisted Highlight Outset", min=-10, max=30, step=1,
+              tooltip="Moves the blue Assisted Highlight ring outward (or inward at negative values) so it no longer overlaps the proc glow on the same button. With Ring + Overlay the tint resizes along with it, so the two stay flush.",
+              disabled=function() return AssistOff() or (p.assistGlowStyle or 1) == 2 end,
+              disabledTooltip="This option requires a style that draws the glow ring",
+              rawTooltip=true,
+              getValue=function() return p.assistGlowOutset or 0 end,
+              setValue=function(v)
+                  p.assistGlowOutset = v
+                  if ns.UpdateAssistHighlights then ns.UpdateAssistHighlights() end
+              end },
+            { type="spacer" });  y = y - h
 
         return math.abs(y)
     end

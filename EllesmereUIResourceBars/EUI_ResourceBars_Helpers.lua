@@ -116,7 +116,11 @@ ns.IsEntryBarType = function(entry)
 end
 local SpecName = function(specID)
 	if specID == 0 then return "All Specs" end
-	local _, name, _, _, _, _, className = GetSpecializationInfoByID(specID)
+	-- The by-id lookup has no namespaced form and is absent on WoW Forever.
+	local _, name, className
+	if GetSpecializationInfoByID then
+		_, name, _, _, _, _, className = GetSpecializationInfoByID(specID)
+	end
 	if name and className then return name .. " " .. className end
 	return name or ("Spec " .. specID)
 end
@@ -131,7 +135,7 @@ end
 -- Helper: returns true if the current class/spec uses a bar-type secondary (no pips)
 ns.IsBarTypeSecondary = function()
 	local _, cf = UnitClass("player")
-	local spec = GetSpecialization()
+	local spec = C_SpecializationInfo.GetSpecialization()
 	local gsr = _G._ERB_GetSecondaryResource
 	local info = gsr and gsr()
 	if info and info.power == "IRONFUR_BAR" then return true end            -- Guardian Ironfur bar
@@ -194,6 +198,54 @@ ns.HasCRAllSpecs = function()
 		end
 	end
 	return false
+end
+
+-- An entry counts as configured when its single threshold is on (a missing flag
+-- means on, for migrated entries) or when multi-band coloring replaces it. The
+-- band fallbacks mirror ResolveThresholdSpecEntry's ResolveBandConfig: both the
+-- enable flag and the band list fall back to the bar table.
+local function ThresholdEntryConfigured(bd, entry)
+	if entry.thresholdEnabled ~= false then return true end
+	local multi = entry.multiBandEnabled
+	if multi == nil then multi = bd.multiBandEnabled end
+	if not multi then return false end
+	local bands = (entry.bands and #entry.bands > 0) and entry.bands or bd.bands
+	return (bands and #bands > 0) and true or false
+end
+
+-- Threshold notice: the spec names holding a configured threshold on a bar table,
+-- for the info badge on the Threshold Settings button. pageSpecID is set on the
+-- Advanced per-spec pages, where thresholdSpecs is collapsed to a single
+-- implied-spec entry (specIDs = {0}) and the page's own spec is the real scope --
+-- druid form mode lives there too, its per-form entries carry no specIDs at all.
+-- Returns nil when nothing is configured, else the comma-joined name list plus
+-- whether one of those entries applies to the spec being played.
+ns.ThresholdNoticeInfo = function(bd, pageSpecID)
+	local entries = bd and bd.thresholdSpecs
+	if not entries or #entries == 0 then return nil end
+	local activeSpecID = _G._ERB_ResolveSpecIDCached and _G._ERB_ResolveSpecIDCached()
+	local names, seen, active = {}, {}, false
+	for _, entry in ipairs(entries) do
+		if ThresholdEntryConfigured(bd, entry) then
+			local label, hitsActive
+			if pageSpecID then
+				label = SpecName(pageSpecID)
+				hitsActive = (pageSpecID == activeSpecID)
+			elseif entry.specIDs and #entry.specIDs > 0 then
+				label = ns.EntryLabel(entry)
+				for _, sid in ipairs(entry.specIDs) do
+					if sid == 0 or sid == activeSpecID then hitsActive = true; break end
+				end
+			end
+			if label and not seen[label] then
+				seen[label] = true
+				names[#names + 1] = label
+			end
+			if hitsActive then active = true end
+		end
+	end
+	if #names == 0 then return nil end
+	return table.concat(names, ", "), active
 end
 
 -- Enumerate every choosable talent in the active loadout (class + spec trees),

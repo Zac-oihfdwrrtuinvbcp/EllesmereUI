@@ -41,6 +41,57 @@ local AttachEditorScroll
 
 -- Selection state: {kind="buff"|"debuff", id=barId|"default"} or nil.
 local pabSel = { kind = "buff", id = "default" }
+-- Editing-spec bucket: "allspecs" (the legacy bar arrays), a group bucket
+-- key, or a concrete "spec<ID>". Session-sticky like pabSel.
+local pabSpecSel = "allspecs"
+-- Inherited-bar selection ({kind, group, id}); wins over pabSel while set.
+local pabInhSel = nil
+
+-- Exported selection setter for What's New deep links (same pattern as
+-- EllesmereUI._setUnitFrameUnit / _setMiniUnit): the sidebar selection is a
+-- session-sticky file local defaulting to the Buffs bar, so a nav targeting a
+-- debuff-side section must pre-select the right pane or the section scan
+-- silently misses.
+--
+-- `bucket` = the bar's owning editing-spec bucket, passed by unlock mode's
+-- "Element Options". The view is session-sticky too and BuildPage validates the
+-- selection against the current view's bucket only, so a bar from another bucket
+-- would be dropped back to the default tile. Same move as the inherited pane's
+-- "Edit in <group>" link.
+EllesmereUI._setPABSelection = function(kind, id, bucket)
+    pabSel = { kind = kind, id = id or "default" }
+    pabInhSel = nil
+    if bucket then
+        pabSpecSel = bucket
+    elseif pabSel.id == "default" and pabSpecSel ~= "allspecs"
+        and not (type(pabSpecSel) == "string" and pabSpecSel:match("^spec%d")) then
+        -- The two built-in bars are All Specs content: they are listed in the All
+        -- Specs view and in concrete spec views, but never in a group bucket, so a
+        -- stale group view would drop this selection. Concrete spec views list
+        -- them, so those stay untouched.
+        pabSpecSel = "allspecs"
+    end
+end
+
+-- Editing-spec group buckets (labels/icons mirror the RaidFrames roster in
+-- EUI_RaidFrames_BuffManager.lua -- different addon namespace, keep the two
+-- lists in sync).
+local SPEC_GROUP_BUCKETS = {
+    { key = "allspecs",  name = "All Specs",
+        icon = "Interface\\Icons\\Achievement_GuildPerk_EverybodysFriend" },
+    { key = "nonhealer", name = "All Non Healers/Aug",
+        icon = "Interface\\Icons\\Achievement_GuildPerk_EverybodysFriend" },
+    { key = "tanks",     name = "All Tanks",
+        icon = "Interface\\Icons\\Ability_Warrior_DefensiveStance" },
+    { key = "dps",       name = "All DPS (Non-Aug)",
+        icon = "Interface\\Icons\\Ability_DualWield" },
+    { key = "healers",   name = "All Healers/Aug",
+        icon = "Interface\\Icons\\Spell_Holy_Renew" },
+}
+local SPEC_GROUP_INFO = {}
+for i = 1, #SPEC_GROUP_BUCKETS do
+    SPEC_GROUP_INFO[SPEC_GROUP_BUCKETS[i].key] = SPEC_GROUP_BUCKETS[i]
+end
 -- Filter Editor's own selected-filter state (independent of pabSel, since
 -- the editor is a modal that can be opened from any buff-side detail pane).
 local pabFilterSel
@@ -68,10 +119,80 @@ local FONT_OUTLINE_VALUES = {
     outline = "Outline", thick = "Thick Outline",
 }
 local FONT_OUTLINE_ORDER = { "default", "none", "outline", "thick" }
-local GROW_DIR_VALUES = { LEFT = "Left", RIGHT = "Right", UP = "Up", DOWN = "Down" }
-local GROW_DIR_ORDER = { "LEFT", "RIGHT", "UP", "DOWN" }
-local ICON_WRAP_VALUES = { LEFT = "Left", RIGHT = "Right" }
-local ICON_WRAP_ORDER = { "LEFT", "RIGHT" }
+local GROW_DIR_VALUES = { LEFT = "Left", RIGHT = "Right", CENTER_HORIZONTAL = "Centered Horizontal", CENTER_VERTICAL = "Centered Vertical", UP = "Up", DOWN = "Down" }
+local GROW_DIR_ORDER = { "LEFT", "RIGHT", "CENTER_HORIZONTAL", "CENTER_VERTICAL", "UP", "DOWN" }
+local ICON_WRAP_VALUES = { LEFT = "Left", RIGHT = "Right", UP = "Up", DOWN = "Down" }
+local ICON_WRAP_ORDER = { "LEFT", "RIGHT", "UP", "DOWN" }
+
+-- Same shape vocabulary and media set as Action Bars' Custom Button Shape
+-- (EUI_ActionBars_Options.lua), minus "cropped" -- PAB has no equivalent
+-- "cropped square" concept.
+local SHAPE_VALUES = {
+    none = "None", square = "Square", circle = "Circle",
+    csquare = "Curved Square", diamond = "Diamond", hexagon = "Hexagon",
+    portrait = "Portrait", shield = "Shield",
+}
+local SHAPE_ORDER = { "none", "square", "circle", "csquare", "diamond", "hexagon", "portrait", "shield" }
+
+-- Levels map 1:1 to Action Bars' ns.BORDER_THICKNESS regular values (thin=1, normal=2,
+-- heavy=3, strong=4), so cfg.borderSize stays the same plain 0-4 number used elsewhere
+-- (regular border thickness, per-filter Icon Effects override).
+local BORDER_SIZE_LEVELS = { "none", "thin", "normal", "heavy", "strong" }
+local BORDER_SIZE_VALUES = { none = "None", thin = "Thin", normal = "Normal", heavy = "Heavy", strong = "Strong" }
+local BORDER_SIZE_NUM = { none = 0, thin = 1, normal = 2, heavy = 3, strong = 4 }
+local BORDER_SIZE_KEY = { [0] = "none", [1] = "thin", [2] = "normal", [3] = "heavy", [4] = "strong" }
+-- Levels with no distinct shape-border rendering (PabShapeBorderSize collapses them
+-- all to "off"); Strong is the only one worth keeping enabled once a shape is active.
+local BORDER_SIZE_SHAPE_DISABLED = { thin = true, normal = true, heavy = true }
+local BORDER_SIZE_DEFAULT_SHAPE = "strong"
+
+-- Every PAB bar (default Buffs/Debuffs plus any custom ones), for the sync-icon
+-- "Apply to: All | Multiple" rows. entry.cfg is the live table, not a copy.
+local function PabAllBarEntries()
+    local s = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+    if not s then return {} end
+    local list = {}
+    list[#list + 1] = { key = "buffs", label = "Buffs", isBuff = true, cfg = ns.PAB_DefaultBuffsCfg(s) }
+    list[#list + 1] = { key = "debuffs", label = "Debuffs", isBuff = false, cfg = ns.PAB_DefaultDebuffsCfg(s) }
+    local buffBars = ns.PAB_CustomBuffBars and ns.PAB_CustomBuffBars()
+    if buffBars then
+        for i = 1, #buffBars do
+            local bar = buffBars[i]
+            list[#list + 1] = { key = "custombuff_" .. bar.id, label = bar.name or "Buff Bar", isBuff = true, cfg = bar }
+        end
+    end
+    local debuffBars = ns.PAB_CustomDebuffBars and ns.PAB_CustomDebuffBars()
+    if debuffBars then
+        for i = 1, #debuffBars do
+            local bar = debuffBars[i]
+            list[#list + 1] = { key = "customdebuff_" .. bar.id, label = bar.name or "Debuff Bar", isBuff = false, cfg = bar }
+        end
+    end
+    return list
+end
+
+-- Which PabAllBarEntries() row a given (cfg, isBuff) pair is.
+local function PabBarKeyOf(cfg, isBuff)
+    local s = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+    if s then
+        if cfg == ns.PAB_DefaultBuffsCfg(s) then return "buffs" end
+        if cfg == ns.PAB_DefaultDebuffsCfg(s) then return "debuffs" end
+    end
+    if cfg.id then return (isBuff and "custombuff_" or "customdebuff_") .. cfg.id end
+    return ""
+end
+
+-- Restyles one bar live after the caller has written fields onto entry.cfg.
+local function PabApplyBarEntry(entry)
+    if entry.key == "buffs" or entry.key == "debuffs" then
+        if ns.PAB_Restyle then ns.PAB_Restyle() end
+        if ns.PAB_ApplyLiveConfig then ns.PAB_ApplyLiveConfig(entry.isBuff) end
+    elseif entry.isBuff then
+        if ns.PAB_ReloadCustomBuffBar then ns.PAB_ReloadCustomBuffBar(entry.cfg.id) end
+    else
+        if ns.PAB_ReloadCustomDebuffBar then ns.PAB_ReloadCustomDebuffBar(entry.cfg.id) end
+    end
+end
 
 -- Native AuraContainerSortMethod/AuraContainerSortDirection enum names
 -- (in-game dump: AuraContainerSortMethod = {Default=0,
@@ -186,66 +307,30 @@ end
 --     ns.PAB_Filters() list order (map iteration via bar.filters alone is
 --     unordered -- would make the tile flicker between refreshes). If 3+
 --     filters are selected the 3rd shown name is truncated to its first 3
---     characters + "..." as an overflow hint. Falls back to the old
---     resolved-count phrasing when no filters are selected at all (e.g. a
---     bar with only Extra Spells and Show All Buffs off).
+--     characters + "..." as an overflow hint. Falls back to the Extra
+--     Spells count when no filters are selected at all (e.g. a bar with
+--     only Extra Spells and Show All Buffs off) -- the ASSIGNED count, not
+--     the resolved one, which expands curated spell families.
 local function TruncateFilterName(name)
     return (name or ""):sub(1, 3) .. "..."
 end
 
--- Both defined in EllesmereUIUnitFrames_PlayerAuraBars.lua next to the cfg they
--- read, so this page and the unlock-mode mover label cannot drift apart. The
--- module returns raw English keys; only the options page translates them.
-local function IsWeaponEnchantsOnly(cfg)
-    return ns.PAB_IsWeaponEnchantsOnly ~= nil
-        and ns.PAB_IsWeaponEnchantsOnly(cfg)
-end
-
+-- Defined in EllesmereUIUnitFrames_PlayerAuraBars.lua next to the cfg it
+-- reads, so this page and the unlock-mode mover label cannot drift apart. The
+-- module returns the raw English key; only the options page translates it.
 local function DefaultBuffBarName(cfg)
     return L(ns.PAB_DefaultBuffsName and ns.PAB_DefaultBuffsName(cfg) or "Buffs")
 end
 
--- Weapon-enchants-only is a fundamentally different shape of bar -- at most
--- three cells (main hand / off hand / ranged, see EUI_UnitFrames_
--- WeaponEnchants.lua's SLOTS, which matches Blizzard's own
--- UpdateTemporaryEnchantmentBuffs) instead of a wrapping buff grid. Resize the
--- grid to fit on the way in and restore it on the way out.
---
--- The user's own iconsPerRow/maxRows/maxTotal are stashed rather than assumed:
--- restoring hardcoded defaults would silently eat a customized grid. Storing
--- nil for an unset key is intentional -- the stash is then empty and restoring
--- puts the keys back to nil, i.e. ComputeGrid's own 11/3/32 buff fallbacks.
---
--- Returns true when it actually crossed the boundary. Callers use that to pick
--- a FORCE page rebuild: crossing rewrites the three grid sliders and the bar's
--- name, and none of those are RegisterWidgetRefresh clients, so the usual
--- lightweight refresh would leave them showing stale numbers.
-local function SyncWeaponEnchantsGrid(cfg)
-    if not cfg then return false end
-    if IsWeaponEnchantsOnly(cfg) then
-        if cfg.enchGridSaved then return false end
-        cfg.enchGridSaved = { iconsPerRow = cfg.iconsPerRow,
-            maxRows = cfg.maxRows, maxTotal = cfg.maxTotal }
-        cfg.iconsPerRow, cfg.maxRows, cfg.maxTotal = 3, 1, 3
-        return true
-    end
-    if not cfg.enchGridSaved then return false end
-    local saved = cfg.enchGridSaved
-    cfg.iconsPerRow, cfg.maxRows, cfg.maxTotal =
-        saved.iconsPerRow, saved.maxRows, saved.maxTotal
-    cfg.enchGridSaved = nil
-    return true
-end
-
 local function BuildBuffBarSubtitle(bar)
     local extraCount = bar.spells and #bar.spells or 0
+    local nHidden = 0
+    if bar.negFilters then for _ in pairs(bar.negFilters) do nHidden = nHidden + 1 end end
 
     if bar.showAllBuffs ~= false or bar.hasDuration == true then
-        local nf = 0
-        if bar.filters then for _ in pairs(bar.filters) do nf = nf + 1 end end
         local txt = (bar.showAllBuffs ~= false) and L("All Buffs") or L("Has Duration")
         if extraCount > 0 then txt = txt .. " + " .. extraCount .. " " .. L("spells") end
-        if nf > 0 then txt = txt .. ", " .. nf .. " " .. L("hidden") end
+        if nHidden > 0 then txt = txt .. ", " .. nHidden .. " " .. L("hidden") end
         return txt
     end
 
@@ -257,15 +342,17 @@ local function BuildBuffBarSubtitle(bar)
                 local f = allFilters[i]
                 if bar.filters[f.id] then
                     totalSelected = totalSelected + 1
-                    if #names < 3 then names[#names + 1] = f.name end
+                    -- L() before the truncate below: preset filters carry raw
+                    -- English names (see PAB's BM2_FILTER_SEED), and truncating
+                    -- first would leave the tail untranslatable.
+                    if #names < 3 then names[#names + 1] = L(f.name) end
                 end
             end
         end
     end
 
     if #names == 0 then
-        local resolved = ns.PAB_ResolveSpells and ns.PAB_ResolveSpells(bar) or (bar.spells or {})
-        return tostring(#resolved) .. " " .. L("spells")
+        return tostring(extraCount) .. " " .. L("spells")
     end
 
     if totalSelected >= 3 then
@@ -275,6 +362,9 @@ local function BuildBuffBarSubtitle(bar)
     local label = table.concat(names, ", ")
     if extraCount > 0 then
         label = label .. " + " .. extraCount .. " " .. L("spells")
+    end
+    if nHidden > 0 then
+        label = label .. ", " .. nHidden .. " " .. L("hidden")
     end
     return label
 end
@@ -287,13 +377,19 @@ end
 local function BuildDebuffBarSubtitle(bar)
     local nc = 0
     if bar.classFilters then for _ in pairs(bar.classFilters) do nc = nc + 1 end end
+    local nHidden = 0
+    if bar.negClassFilters then for _ in pairs(bar.negClassFilters) do nHidden = nHidden + 1 end end
     if bar.showAllDebuffs ~= false then
-        if nc > 0 then
-            return L("All Debuffs") .. ", " .. nc .. " " .. L("hidden")
+        if nHidden > 0 then
+            return L("All Debuffs") .. ", " .. nHidden .. " " .. L("hidden")
         end
         return L("All Debuffs")
     end
-    return tostring(nc) .. " " .. (nc == 1 and L("class") or L("classes"))
+    local txt = tostring(nc) .. " " .. (nc == 1 and L("class") or L("classes"))
+    if nHidden > 0 then
+        txt = txt .. ", " .. nHidden .. " " .. L("hidden")
+    end
+    return txt
 end
 
 -------------------------------------------------------------------------------
@@ -306,6 +402,13 @@ end
 --  ApplyLiveConfig() for default bars, PAB_ReloadCustomBuffBar/DebuffBar
 --  for custom bars).
 -------------------------------------------------------------------------------
+
+-- Empty-selection warning for the buff/debuff Filters dropdowns: the shared
+-- builder EllesmereUI.AttachEmptyFilterWarn (EllesmereUI_Widgets.lua), also
+-- used by the RF Debuff Manager's base Filters dropdown. hasContentFn here
+-- is the engine's own content predicate (broad mode / Show lane / Extra
+-- Spells / enchants / fx-forced classes), so a bar that still renders
+-- anything never warns.
 
 -- "Assigned Buffs": Filters checkbox dropdown (references the shared PAB Filters
 -- registry, EllesmereUIUnitFrames_PlayerAuraBars.lua) + Extra Spells checkbox
@@ -333,25 +436,23 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
     --                      its own, MUTUALLY EXCLUSIVE with All Buffs:
     --                      the catch-all narrowed to duration-carrying
     --                      buffs via candidateFilters.maxDuration)
-    --   [ ] Weapon Enchants (cfg.showWeaponEnchants, default-bar only --
-    --                      the enchant cells publish from the default
-    --                      Buffs bar alone. INDEPENDENT of the two modes
-    --                      above and of the real filters: oils/imbues are
-    --                      not auras, so they come from their own source
-    --                      rather than the catch-all group, and a mode
-    --                      flip must not clear it)
+    --   (weapon enchants have no row of their own: the default Buffs
+    --    bar's enchant cells ride All Buffs / Has Duration --
+    --    ns.PAB_EnchantsOn)
     --   ------------------ (isHeader divider)
     --   [ ] <real filters, alphabetical>
     --
-    -- Real-filter semantics are mode-dependent (same model as every debuff Filters
-    -- dropdown): while All Buffs is on, a checked filter SUBTRACTS its resolved spells
-    -- from the bar (catch-all excludeSpellIDs, see BuffBarChain); with it off, checked
-    -- filters ADD their spells. Toggling All Buffs clears the selection -- a subtract
-    -- set and an add set never mean the same thing. The pinned pseudo-filters are never
-    -- locked and are not ns.PAB_Filters() entries, so they never appear in the Filter
-    -- Editor sidebar. (An Own Only pseudo-filter was tried and removed: the PLAYER
-    -- token did not filter reliably on live engine groups, and the filter registry
-    -- covers the need better.)
+    -- Real-filter rows are TWO-LANE (same model as every filter dropdown in the
+    -- suite): the left checkbox SHOWS a filter (cfg.filters, add mode only -- while a
+    -- broad mode is on everything already shows, so the lane is dimmed), the right red
+    -- box HIDES it (cfg.negFilters -- catch-all excludeSpellIDs under a broad mode,
+    -- dropped from the spells-group union in add mode; see BuffBarChain /
+    -- PAB_ResolveSpells). Lanes are mutually exclusive per filter and PERSIST across
+    -- mode flips. The pinned pseudo-filters are never locked and are not
+    -- ns.PAB_Filters() entries, so they never appear in the Filter Editor sidebar.
+    -- (An Own Only pseudo-filter was tried and removed: the PLAYER token did not
+    -- filter reliably on live engine groups, and the filter registry covers the need
+    -- better.)
     --
     -- Extra Spells (direct SpellIDs) shares this same row and stays
     -- additive in both modes -- see the RIGHT-region block below.
@@ -370,13 +471,23 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
     ); sy = sy - hh
 
     local PAB_ALL_BUFFS_KEY, PAB_HAS_DURATION_KEY = "__allBuffs", "__hasDuration"
-    local PAB_WEAPON_ENCH_KEY = "__weaponEnchants"
+
+    -- Empty selections are LEGAL (user directive 2026-08-15, reversing the
+    -- phase-2 no-empty rule on PAB): any content source can be unchecked,
+    -- including the last one. AttachEmptyFilterWarn owns the loud feedback
+    -- (red dropdown border + persistent bubble + close-pulse) while the bar
+    -- displays nothing.
+    local function BuffBarHasContent()
+        if not ns.PAB_BuffBarHasContent then return true end
+        return ns.PAB_BuffBarHasContent(cfg, isDefault) and true or false
+    end
 
     -- LEFT: Filters checkbox dropdown, "Edit Filters" pinned top action.
     do
         local rgn = ffRow._leftRegion
         if rgn._control then rgn._control:Hide() end
         local function AllBuffsOn() return cfg.showAllBuffs ~= false end
+        local function BroadOn() return cfg.showAllBuffs ~= false or cfg.hasDuration == true end
         local function FilterItems()
             local filters = DedupedFilterItems()
             local items = {
@@ -409,80 +520,71 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
                       })
                   end },
                 { key = PAB_ALL_BUFFS_KEY, label = "All Buffs",
-                  tooltip = "Show every buff. While this is on, checked filters below are hidden from the bar instead of added." },
+                  tooltip = "Show every buff. Use the Hide lane below to remove specific filters." },
                 { key = PAB_HAS_DURATION_KEY, label = "Has Duration",
-                  tooltip = "Show every buff that has a duration (hides permanent buffs). While this is on, checked filters below are hidden instead of added." },
+                  tooltip = "Show every buff that has a duration (hides permanent buffs). Use the Hide lane below to remove specific filters." },
             }
-            -- Default Buffs bar only: the enchant cells publish from that bar
-            -- alone, so the row would be a dead switch on custom buff bars.
-            if isDefault then
-                items[#items + 1] = { key = PAB_WEAPON_ENCH_KEY, label = "Weapon Enchants",
-                  tooltip = "Show weapon oil and imbue icons at the front of this bar. They are weapon enchants rather than auras, so they show independently of the options above -- and the aura grid is shifted inward to make room for them, with every row shifting over by the same amount." }
-            end
-            items[#items + 1] = { isHeader = true, label = "" }
+            items[#items + 1] = { isHeader = true, label = "Show", rightLabel = "Hide" }
             for i = 1, #filters do
-                items[#items + 1] = { key = filters[i].id, label = filters[i].name }
+                items[#items + 1] = { key = filters[i].id, label = filters[i].name,
+                    dual = true, showLockedFn = BroadOn }
             end
             return items
         end
+        local warnClosed
         local cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
             rgn, 190, rgn:GetFrameLevel() + 2,
             FilterItems,
-            function(k)
+            function(k, neg)
                 if k == PAB_ALL_BUFFS_KEY then return AllBuffsOn() end
                 if k == PAB_HAS_DURATION_KEY then return cfg.hasDuration == true end
-                if k == PAB_WEAPON_ENCH_KEY then return cfg.showWeaponEnchants == true end
-                cfg.filters = cfg.filters or {}
-                return cfg.filters[k] == true
+                if neg then
+                    local nf = cfg.negFilters
+                    return nf and nf[k] == true
+                end
+                local f = cfg.filters
+                return f and f[k] == true
             end,
-            function(k, v)
+            function(k, v, neg)
                 if k == PAB_ALL_BUFFS_KEY then
                     cfg.showAllBuffs = v
-                    -- Mode flip: clear the real-filter selection both ways
-                    -- (a subtract set and an add set never mean the same
-                    -- thing). Mutually exclusive with Has Duration -- both
-                    -- are broad-content modes. Extra Spells stay untouched.
+                    -- Mutually exclusive with Has Duration -- both are broad-content
+                    -- modes. The show/hide lanes PERSIST across mode flips (the hide
+                    -- lane subtracts in both modes; the show lane simply goes dormant
+                    -- while broad content is on). Extra Spells stay untouched.
                     cfg.hasDuration = nil
-                    cfg.filters = nil
-                    local gridChanged = SyncWeaponEnchantsGrid(cfg)
                     apply()
                     -- Non-force, same as every other row: the open menu
                     -- refreshes its own checks/locks in place, so a mode
-                    -- flip must not tear the page down under it. The one
-                    -- exception is crossing the enchants-only boundary, which
-                    -- rewrites grid sliders and the bar name (see
-                    -- SyncWeaponEnchantsGrid).
-                    EllesmereUI:RefreshPage(gridChanged and true or nil)
+                    -- flip must not tear the page down under it.
+                    EllesmereUI:RefreshPage()
                     return
                 end
                 if k == PAB_HAS_DURATION_KEY then
                     cfg.hasDuration = v or nil
                     -- Mutually exclusive with All Buffs (a broad-content mode of its
-                    -- own); mode flips clear the filter selection, same as All Buffs.
+                    -- own); lanes persist, same as All Buffs.
                     if v then cfg.showAllBuffs = false end
-                    cfg.filters = nil
-                    local gridChanged = SyncWeaponEnchantsGrid(cfg)
                     apply()
-                    EllesmereUI:RefreshPage(gridChanged and true or nil)
+                    EllesmereUI:RefreshPage()
                     return
                 end
-                if k == PAB_WEAPON_ENCH_KEY then
-                    -- Its own content source (oils/imbues are not auras), so it
-                    -- neither clears nor is cleared by the two modes above and
-                    -- never touches cfg.filters -- which is also why the mode
-                    -- rows' `cfg.filters = nil` resets leave it standing.
-                    cfg.showWeaponEnchants = v and true or nil
-                    SyncWeaponEnchantsGrid(cfg)
-                    apply()
-                    -- Force: entering/leaving enchants-only rewrites the grid
-                    -- sliders (Icons per Row / Max Rows / Max Total) and the
-                    -- bar's name, none of which are RegisterWidgetRefresh
-                    -- clients -- a lightweight pass would leave them stale.
-                    EllesmereUI:RefreshPage(true)
-                    return
+                -- Two-lane real-filter write: checking one lane clears the other;
+                -- emptied lane tables drop to nil (saved-variable hygiene).
+                if neg then
+                    cfg.negFilters = cfg.negFilters or {}
+                    cfg.negFilters[k] = v or nil
+                    if not next(cfg.negFilters) then cfg.negFilters = nil end
+                    if v and cfg.filters then cfg.filters[k] = nil end
+                else
+                    cfg.filters = cfg.filters or {}
+                    cfg.filters[k] = v or nil
+                    if v and cfg.negFilters then
+                        cfg.negFilters[k] = nil
+                        if not next(cfg.negFilters) then cfg.negFilters = nil end
+                    end
                 end
-                cfg.filters = cfg.filters or {}
-                cfg.filters[k] = v or nil
+                if cfg.filters and not next(cfg.filters) then cfg.filters = nil end
                 apply()
                 -- Non-force: runs only the registered lightweight refresh callbacks
                 -- (e.g. the sidebar tile's subtitleFn) in-place, unlike
@@ -490,10 +592,14 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
                 -- and close this open dropdown mid multi-select.
                 EllesmereUI:RefreshPage()
             end,
-            nil, 12)
+            nil, 12, nil, nil, function()
+                if warnClosed then warnClosed() end
+            end)
         PP.Point(cbDD, "RIGHT", rgn, "RIGHT", -20, 0)
         rgn._control = cbDD; rgn._lastInline = nil
         EllesmereUI.RegisterWidgetRefresh(cbRefresh)
+        warnClosed = EllesmereUI.AttachEmptyFilterWarn(rgn, cbDD,
+            L("You are displaying NO buffs at all."), BuffBarHasContent)
     end
 
     -- RIGHT: Extra Spells checkbox dropdown (direct cfg.spells only, see
@@ -579,13 +685,24 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
                 if v then
                     if not HasDirect(k) then cfg.spells[#cfg.spells + 1] = k end
                 else
+                    -- Unchecking drops the whole curated family, not just this id:
+                    -- PAB_ResolveSpells expands a family from any member, so a
+                    -- differently-named sibling left in the list would keep the buff
+                    -- tracked behind an unchecked box. Same family = same table.
+                    local fam = ns.PAB_SPELL_FAMILY and ns.PAB_SPELL_FAMILY[k]
                     for i = #cfg.spells, 1, -1 do
-                        if cfg.spells[i] == k then table.remove(cfg.spells, i) end
+                        local id = cfg.spells[i]
+                        if id == k or (fam and ns.PAB_SPELL_FAMILY[id] == fam) then
+                            table.remove(cfg.spells, i)
+                        end
                     end
                 end
                 apply()
                 -- Same reasoning as the Filters dropdown above: lightweight
-                -- refresh only, so this checkbox dropdown stays open.
+                -- refresh only, so this checkbox dropdown stays open. The
+                -- Filters dropdown's empty warning re-evaluates through the
+                -- widget-refresh pass, so emptying a bar from THIS dropdown
+                -- lights it up too.
                 EllesmereUI:RefreshPage()
             end,
             nil, 10, true)
@@ -597,10 +714,14 @@ local function BuildAssignedBuffsFields(frame, fontPath, sy, cfg, apply, isDefau
     return sy
 end
 
--- "Assigned Debuffs": Show All Debuffs toggle + Base Filters (class-token) checkbox
--- dropdown, blocked while Show All is on. Mirrors RaidFrames' DebuffManager
--- BuildBaseDetailDM "ASSIGNED DEBUFFS" row (same blocking- overlay pattern). Used by
--- BOTH the default Debuffs bar and every custom debuff bar.
+-- "Assigned Debuffs": unified Filters dropdown (same model as Raid Frames' Debuff
+-- Manager base grid): pinned "All Debuffs" row above a Show/Hide caption row, then
+-- TWO-LANE class rows -- ONE control, live in both modes. The left checkbox SHOWS a
+-- class (cfg.classFilters, add mode; dimmed while All Debuffs is on), the right red
+-- box HIDES it (cfg.negClassFilters -- hidden chain links / inverted candidates in
+-- both modes, see DebuffSubtractFn/BuildChain). Lanes are mutually exclusive per
+-- class and persist across mode flips. Used by BOTH the default Debuffs bar and
+-- every custom debuff bar.
 local function BuildAssignedDebuffsFields(frame, fontPath, sy, cfg, apply)
     local W = EllesmereUI.Widgets
     local PP = EllesmereUI.PanelPP
@@ -608,12 +729,6 @@ local function BuildAssignedDebuffsFields(frame, fontPath, sy, cfg, apply)
 
     _, hh = W:SectionHeader(frame, "ASSIGNED DEBUFFS", sy); sy = sy - hh
 
-    -- Unified Filters dropdown (same model as Raid Frames' Debuff Manager base grid):
-    -- pinned "All Debuffs" row above a divider, then the category filters -- ONE
-    -- control, live in both modes. While All Debuffs is on, checked classes are
-    -- SUBTRACTED from the bar (hidden); with it off they add, exactly as the old Base
-    -- Filters dropdown did. Toggling All Debuffs clears the selection -- a subtract set
-    -- and an add set never mean the same thing, so neither carries across modes.
     local safRow
     safRow, hh = W:DualRow(frame, sy,
         {
@@ -621,53 +736,158 @@ local function BuildAssignedDebuffsFields(frame, fontPath, sy, cfg, apply)
             values = { __placeholder = "..." }, order = { "__placeholder" },
             getValue = function() return "__placeholder" end, setValue = function() end
         },
-        { type = "label", text = "" }
+        EllesmereUI.MaxDurationDropdown(
+            function() return cfg.maxDurSec end,
+            function(v) cfg.maxDurSec = v end,
+            apply)
     ); sy = sy - hh
     do
         local rgn = safRow._leftRegion
         if rgn._control then rgn._control:Hide() end
         local PAB_ALL_DEBUFFS_KEY = "__allDebuffs"
+        local PAB_DEBUFF_HAS_DUR_KEY = "__debuffHasDuration"
+        local PAB_MATCH_ANY_KEY = "__matchAny"
+        local PAB_MATCH_ALL_KEY = "__matchAll"
+        local function AllOn() return cfg.showAllDebuffs ~= false end
+        local function MatchAll() return cfg.debuffMatch == "all" end
+        -- Hovering a dimmed Show box explains the dim (the lane is inert
+        -- while All Debuffs already shows everything). Has Duration is an
+        -- AND-modifier, not a mode: it never locks the lane.
+        local lockedTip = L("All Debuffs is selected, so every debuff already shows. Use the red Hide box to exclude these instead.")
         local function FilterItems()
             local items = {
                 { key = PAB_ALL_DEBUFFS_KEY, label = "All Debuffs",
-                  tooltip = "Show every debuff. While this is on, checked filters below are hidden from the bar instead of added." },
-                { isHeader = true, label = "" },
+                  tooltip = "Show every debuff. Use the Hide lane below to remove specific filters." },
+                { key = PAB_DEBUFF_HAS_DUR_KEY, label = "Has Duration",
+                  tooltip = "Only show debuffs that have a duration, excluding permanent ones. Combines with the filters below; checked alone it shows every timed debuff." },
+                -- Modifiers, not filters: how the Show picks combine (engine side:
+                -- DebuffChainFor). A radio pair over cfg.debuffMatch (nil = Match
+                -- Any, the union), kept out of the summary; locked while All
+                -- Debuffs leaves nothing to combine. Never in ns.PAB_ClassItems:
+                -- the player frame's dropdown shares that list.
+                { isHeader = true, label = EllesmereUI.L("Match Mode") },
+                { key = PAB_MATCH_ANY_KEY, label = EllesmereUI.L("Match Any Filter"), isModifier = true,
+                  lockedFn = AllOn,
+                  lockedTooltip = EllesmereUI.L("Uncheck All Debuffs to choose how the Show filters combine."),
+                  tooltip = EllesmereUI.L("Shows debuffs that match any checked Show filter (the default).") },
+                { key = PAB_MATCH_ALL_KEY, label = EllesmereUI.L("Match All Filters"), isModifier = true,
+                  lockedFn = AllOn,
+                  lockedTooltip = EllesmereUI.L("Uncheck All Debuffs to choose how the Show filters combine."),
+                  tooltip = EllesmereUI.L("Shows only debuffs that match every checked Show filter (dispel types count as one); opposites like Non-Player Auras with Cast By You show nothing.") },
+                { isHeader = true, label = "Show", rightLabel = "Hide" },
             }
             local classItems = ns.PAB_ClassItems and ns.PAB_ClassItems(false) or {}
-            for i = 1, #classItems do items[#items + 1] = classItems[i] end
+            for i = 1, #classItems do
+                local ci = classItems[i]
+                if ci.isHeader then
+                    items[#items + 1] = { isHeader = true, label = ci.label }
+                else
+                    items[#items + 1] = { key = ci.key, label = ci.label, tooltip = ci.tooltip,
+                        dual = true, showLockedFn = AllOn,
+                        showLockedTooltip = lockedTip }
+                end
+            end
             return items
         end
+        -- Non-Player / From Any Player share one engine field: a check in either
+        -- lane clears the sibling from both lanes.
+        local function ClearExclusive(k)
+            local other = ns.PAB_ExclusiveSkey and ns.PAB_ExclusiveSkey[k]
+            if not other then return end
+            if cfg.classFilters then
+                cfg.classFilters[other] = nil
+                if not next(cfg.classFilters) then cfg.classFilters = nil end
+            end
+            if cfg.negClassFilters then
+                cfg.negClassFilters[other] = nil
+                if not next(cfg.negClassFilters) then cfg.negClassFilters = nil end
+            end
+        end
+        local warnClosed
         local cbDD, cbRefresh = EllesmereUI.BuildVisOptsCBDropdown(
             rgn, 190, rgn:GetFrameLevel() + 2,
             FilterItems,
-            function(k)
-                if k == PAB_ALL_DEBUFFS_KEY then return cfg.showAllDebuffs ~= false end
-                cfg.classFilters = cfg.classFilters or {}
-                return cfg.classFilters[k] == true
+            function(k, neg)
+                if k == PAB_ALL_DEBUFFS_KEY then return AllOn() end
+                if k == PAB_DEBUFF_HAS_DUR_KEY then return cfg.hasDuration == true end
+                if k == PAB_MATCH_ANY_KEY or k == PAB_MATCH_ALL_KEY then
+                    return (k == PAB_MATCH_ALL_KEY) == MatchAll()
+                end
+                if neg then
+                    local nf = cfg.negClassFilters
+                    return nf and nf[k] == true
+                end
+                local f = cfg.classFilters
+                return f and f[k] == true
             end,
-            function(k, v)
+            function(k, v, neg)
                 if k == PAB_ALL_DEBUFFS_KEY then
                     -- Stores the raw boolean directly (nil must mean "on",
-                    -- same convention as showAllBuffs).
+                    -- same convention as showAllBuffs). Lanes persist across
+                    -- mode flips (the hide lane subtracts in both modes).
                     cfg.showAllDebuffs = v
-                    -- Mode flip: clear the selection (see doc comment).
-                    cfg.classFilters = nil
                     apply()
                     EllesmereUI:RefreshPage()
                     return
                 end
-                cfg.classFilters = cfg.classFilters or {}
-                cfg.classFilters[k] = v or nil
+                if k == PAB_DEBUFF_HAS_DUR_KEY then
+                    -- AND-modifier (native maxDuration on every debuff group;
+                    -- permanents excluded): combines with All Debuffs or any
+                    -- class-filter selection; alone it acts as the timed
+                    -- catch-all (DebuffCatchAllOn).
+                    cfg.hasDuration = v or nil
+                    apply()
+                    EllesmereUI:RefreshPage()
+                    return
+                end
+                if k == PAB_MATCH_ANY_KEY or k == PAB_MATCH_ALL_KEY then
+                    -- Radio pair: the clicked row always wins (the toggled value
+                    -- is ignored), so clicking the active row keeps it. nil =
+                    -- Match Any keeps untouched bars byte-identical.
+                    local want = (k == PAB_MATCH_ALL_KEY) and "all" or nil
+                    if cfg.debuffMatch == want then return end
+                    cfg.debuffMatch = want
+                    apply()
+                    EllesmereUI:RefreshPage()
+                    return
+                end
+                -- Two-lane class write: checking one lane clears the other;
+                -- emptied lane tables drop to nil (saved-variable hygiene).
+                if v then ClearExclusive(k) end
+                if neg then
+                    cfg.negClassFilters = cfg.negClassFilters or {}
+                    cfg.negClassFilters[k] = v or nil
+                    if not next(cfg.negClassFilters) then cfg.negClassFilters = nil end
+                    if v and cfg.classFilters then cfg.classFilters[k] = nil end
+                else
+                    cfg.classFilters = cfg.classFilters or {}
+                    cfg.classFilters[k] = v or nil
+                    if v and cfg.negClassFilters then
+                        cfg.negClassFilters[k] = nil
+                        if not next(cfg.negClassFilters) then cfg.negClassFilters = nil end
+                    end
+                end
+                if cfg.classFilters and not next(cfg.classFilters) then cfg.classFilters = nil end
                 apply()
                 -- Non-force: runs only the registered lightweight refresh
                 -- callbacks (e.g. the sidebar tile's subtitleFn) in place,
                 -- without closing this open dropdown.
                 EllesmereUI:RefreshPage()
             end,
-            nil, 12)
+            nil, 12, nil, nil, function() if warnClosed then warnClosed() end end,
+            -- The summary joins picks the way they combine.
+            { separatorFn = function() return (MatchAll() and not AllOn()) and " & " or ", " end })
         PP.Point(cbDD, "RIGHT", rgn, "RIGHT", -20, 0)
         rgn._control = cbDD; rgn._lastInline = nil
         EllesmereUI.RegisterWidgetRefresh(cbRefresh)
+        warnClosed = EllesmereUI.AttachEmptyFilterWarn(rgn, cbDD,
+            L("You are displaying NO debuffs at all."),
+            function()
+                if not ns.PAB_DebuffBarHasContent then return true end
+                -- Match All picks that can never match together build nothing.
+                if ns.PAB_DebuffMatchEmpty and ns.PAB_DebuffMatchEmpty(cfg) then return false end
+                return ns.PAB_DebuffBarHasContent(cfg) and true or false
+            end)
     end
 
     return sy
@@ -690,7 +910,7 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
     local sizeRow
     sizeRow, hh = W:DualRow(frame, sy,
         {
-            type = "slider", text = "Icon Size", min = 16, max = 60, step = 1, trackWidth = 120,
+            type = "slider", text = "Icon Size", min = 16, max = 400, step = 1, trackWidth = 120,
             getValue = function() return cfg.iconSize or 32 end,
             setValue = function(v) cfg.iconSize = v; apply() end
         },
@@ -698,7 +918,20 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
             type = "dropdown", text = "Growth Direction",
             values = GROW_DIR_VALUES, order = GROW_DIR_ORDER,
             getValue = function() return cfg.growDirection or "LEFT" end,
-            setValue = function(v) cfg.growDirection = v; apply() end
+            setValue = function(v)
+                -- Change the wrap direction to be a valid value from the new growth direction
+                if v == "UP" or v == "DOWN" then
+                    if cfg.iconWrapDirection ~= "LEFT" and cfg.iconWrapDirection ~= "RIGHT" then
+                        cfg.iconWrapDirection = "LEFT"
+                    end
+                elseif v == "LEFT" or v == "RIGHT" then
+                    if cfg.iconWrapDirection ~= "UP" and cfg.iconWrapDirection ~= "DOWN" then
+                        cfg.iconWrapDirection = "DOWN"
+                    end
+                end
+
+                cfg.growDirection = v; apply()
+            end
         }
     ); sy = sy - hh
 
@@ -729,9 +962,9 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
         ns._PAMakeCogBtn(rgn, cogShow)
     end
     do
-        -- Icon Wrap: only meaningful for vertical growth (Up/Down) -- decides which
+        -- Icon Wrap: only meaningful for vertical growth (Up/Down) and horizontal growth (Left/Right) -- decides which
         -- side additional columns stack toward when Icons Per Row/Column > 1. Cog-only,
-        -- no separate dropdown row, and only shown while Growth Direction is Up/Down.
+        -- no separate dropdown row, and only shown while Growth Direction is Up/Down or Left/Right.
         local rgn = sizeRow._rightRegion
         local _, cogShow = EllesmereUI.BuildCogPopup({
             title = "Growth",
@@ -739,13 +972,22 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
                 { type = "dropdown", label = "Icon Wrap",
                   values = ICON_WRAP_VALUES, order = ICON_WRAP_ORDER,
                   get = function() return cfg.iconWrapDirection or "LEFT" end,
-                  set = function(v) cfg.iconWrapDirection = v; apply() end },
+                  set = function(v) cfg.iconWrapDirection = v; apply() end,
+                  itemDisabled = function(v)
+                      if cfg.growDirection == "LEFT" or cfg.growDirection == "RIGHT" then
+                        return v == "LEFT" or v == "RIGHT"
+                      elseif cfg.growDirection == "UP" or cfg.growDirection == "DOWN" then
+                        return v == "UP" or v == "DOWN"
+                      end
+                      return false
+                  end,
+                 },
             },
         })
         local cogBtn = ns._PAMakeCogBtn(rgn, cogShow)
         local function UpdateWrapCogVisibility()
             local dir = cfg.growDirection or "LEFT"
-            cogBtn:SetShown(dir == "UP" or dir == "DOWN")
+            cogBtn:SetShown(dir == "UP" or dir == "DOWN" or dir == "LEFT" or dir == "RIGHT")
         end
         EllesmereUI.RegisterWidgetRefresh(UpdateWrapCogVisibility)
         UpdateWrapCogVisibility()
@@ -790,7 +1032,7 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
         rgn._lastInline = swatch
         EllesmereUI.RegisterWidgetRefresh(updateSwatch)
         AttachCog(rgn, "Duration Text", {
-            { type = "slider", label = "Text Size", min = 6, max = 24, step = 1,
+            { type = "slider", label = "Text Size", min = 6, max = 60, step = 1,
               get = function() return cfg.durationTextSize or 11 end,
               set = function(v) cfg.durationTextSize = v; apply() end },
             { type = "slider", label = "Offset X", min = -50, max = 50, step = 1,
@@ -806,6 +1048,9 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
             { type = "toggle", label = "Show S for Seconds",
               get = function() return cfg.durationShowSeconds == true end,
               set = function(v) cfg.durationShowSeconds = v and true or nil; apply() end },
+            { type = "slider", label = "Precise Below (minutes, 0 = off)", min = 0, max = 60, step = 1,
+              get = function() return cfg.durationPrecisionThreshold and cfg.durationPrecisionThreshold / 60 or 0 end,
+              set = function(v) cfg.durationPrecisionThreshold = v > 0 and math.floor(v * 60 + 0.5) or nil; apply() end },
         })
     end
     do
@@ -819,7 +1064,7 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
         rgn._lastInline = swatch
         EllesmereUI.RegisterWidgetRefresh(updateSwatch)
         AttachCog(rgn, "Stacks Text", {
-            { type = "slider", label = "Text Size", min = 6, max = 24, step = 1,
+            { type = "slider", label = "Text Size", min = 6, max = 60, step = 1,
               get = function() return cfg.stackTextSize or 11 end,
               set = function(v) cfg.stackTextSize = v; apply() end },
             { type = "slider", label = "Offset X", min = -50, max = 50, step = 1,
@@ -838,32 +1083,242 @@ local function BuildCoreFields(frame, fontPath, sy, cfg, apply, isBuff)
     return sy
 end
 
--- "Display": Border Size [swatch] | Spacing; Icons per Row (+Max Rows/Max
--- Total/Row Spacing cog) | spacer.
+local function FontOutlineField(cfg, apply)
+    return {
+        type = "dropdown", text = "Font Outline",
+        values = FONT_OUTLINE_VALUES, order = FONT_OUTLINE_ORDER,
+        getValue = function() return cfg.fontOutline or "default" end,
+        setValue = function(v) cfg.fontOutline = v; apply() end,
+    }
+end
+
+-- "Display": Border Style (+shift/behind cog) | Border Size [swatch]; Width
+-- Offset | Height Offset (textured style only); Icons Per Row (+grid cog) |
+-- Spacing (+row-spacing cog); Icon Shape | Icon Zoom; remaining toggles are
+-- packed by polarity without placeholder slots.
 local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
     local W = EllesmereUI.Widgets
     local PP = EllesmereUI.PanelPP
     local _, hh = 0, 0
 
     _, hh = W:SectionHeader(frame, "DISPLAY", sy); sy = sy - hh
+    sy = EllesmereUI.BlizzStyle.Note(frame, sy, "playerauras")
 
-    local borderRow
-    borderRow, hh = W:DualRow(frame, sy,
+    local textureValues, textureOrder = EllesmereUI.GetBorderTextureDropdown()
+    -- Border Size: the pixel slider over cfg.borderSize and its borderSizePx
+    -- companion (EllesmereUI.BorderPxSliderCfg). A custom Icon Shape keeps the
+    -- None..Strong dropdown instead: its ring is on/off (PabShapeBorderSize), so a
+    -- pixel count means nothing there. The Icon Shape setter rebuilds the page when
+    -- the shape crosses none/custom, which swaps the control in this slot.
+    local sizeCfg
+    if cfg.iconShape and cfg.iconShape ~= "none" then
+        sizeCfg = {
+            type = "dropdown", text = "Border Size",
+            values = BORDER_SIZE_VALUES, order = BORDER_SIZE_LEVELS,
+            itemDisabled = function(v)
+                local shape = cfg.iconShape
+                return shape and shape ~= "none" and BORDER_SIZE_SHAPE_DISABLED[v] or false
+            end,
+            itemDisabledTooltip = function()
+                return "This option requires a non-custom shape to be selected"
+            end,
+            getValue = function() return BORDER_SIZE_KEY[cfg.borderSize or 1] or "thin" end,
+            setValue = function(v) cfg.borderSize = BORDER_SIZE_NUM[v] or 1; apply() end,
+        }
+    else
+        sizeCfg = EllesmereUI.BorderPxSliderCfg({
+            text = "Border Size", trackWidth = 120,
+            -- The step BuildStyle renders with (cfg.borderSize or 1), as a number.
+            getStep = function() return cfg.borderSize or 1 end,
+            setStep = function(step) cfg.borderSize = step end,
+            getTex = function() return cfg.borderTexture or "solid" end,
+            getPx = function() return cfg.borderSizePx end,
+            setPx = function(v) cfg.borderSizePx = v end,
+            apply = apply,
+        })
+    end
+    local styleRow
+    styleRow, hh = W:DualRow(frame, sy,
+        EllesmereUI.BlizzStyle.Gate("playerauras", {
+            type = "dropdown", text = "Border Style",
+            disabled = function()
+                return cfg.iconShape and cfg.iconShape ~= "none"
+            end,
+            disabledTooltip = "This option requires a non-custom shape to be selected",
+            rawTooltip = true,
+            values = textureValues, order = textureOrder,
+            getValue = function() return cfg.borderTexture or "solid" end,
+            setValue = function(v)
+                cfg.borderTexture = v
+                cfg.borderTextureOffset = nil
+                cfg.borderTextureOffsetY = nil
+                cfg.borderTextureShiftX = nil
+                cfg.borderTextureShiftY = nil
+                local color, behind = EllesmereUI.GetBorderStyleSelectDefaults(v)
+                cfg.borderR, cfg.borderG, cfg.borderB, cfg.borderA = color.r, color.g, color.b, 1
+                cfg.borderBehind = behind
+                local defaultSize = EllesmereUI.GetBorderDefaultSize("unitframes", v)
+                if defaultSize then cfg.borderSize = defaultSize end
+                -- A style pick resets the size: the exact size paired with the old
+                -- step and texture goes with it (false, never nil, once it was set).
+                if cfg.borderSizePx then cfg.borderSizePx = false end
+                apply()
+                -- The Width Offset | Height Offset row below exists only for a
+                -- textured style: a Solid/textured crossing rebuilds the page.
+                EllesmereUI:RefreshPage(true)
+            end,
+        }),
+        EllesmereUI.BlizzStyle.Gate("playerauras", sizeCfg)
+    ); sy = sy - hh
+    do
+        local rgn = styleRow._leftRegion
+        local _, cogShow = EllesmereUI.BuildCogPopup({
+            title = "Border Options",
+            rows = {
+                { type = "slider", label = "Shift X", min = -10, max = 10, step = 1,
+                  get = function()
+                      if cfg.borderTextureShiftX ~= nil then return cfg.borderTextureShiftX end
+                      local _, _, x = EllesmereUI.GetBorderDefaults("unitframes", cfg.borderTexture or "solid", cfg.borderSize or 1)
+                      return x
+                  end,
+                  set = function(v)
+                      if v == 0 then v = nil end
+                      cfg.borderTextureShiftX = v; apply()
+                  end },
+                { type = "slider", label = "Shift Y", min = -10, max = 10, step = 1,
+                  get = function()
+                      if cfg.borderTextureShiftY ~= nil then return cfg.borderTextureShiftY end
+                      local _, _, _, y = EllesmereUI.GetBorderDefaults("unitframes", cfg.borderTexture or "solid", cfg.borderSize or 1)
+                      return y
+                  end,
+                  set = function(v)
+                      if v == 0 then v = nil end
+                      cfg.borderTextureShiftY = v; apply()
+                  end },
+                { type = "toggle", label = "Show Behind",
+                  get = function() return cfg.borderBehind == true end,
+                  set = function(v) cfg.borderBehind = v; apply() end },
+            },
+        })
+        local cogBtn = ns._PAMakeCogBtn(rgn, cogShow)
+        local function UpdateBorderCogVisibility()
+            cogBtn:SetShown((cfg.borderTexture or "solid") ~= "solid"
+                and not (cfg.iconShape and cfg.iconShape ~= "none")
+                and not EllesmereUI.BlizzStyle.Get("playerauras"))
+        end
+        EllesmereUI.RegisterWidgetRefresh(UpdateBorderCogVisibility)
+        UpdateBorderCogVisibility()
+
+        local keys, labels = {}, {}
+        for _, entry in ipairs(PabAllBarEntries()) do
+            keys[#keys + 1] = entry.key
+            labels[entry.key] = entry.label
+        end
+        local function CopyBorderStyleTo(entry)
+            local target = entry.cfg
+            target.borderTexture = cfg.borderTexture
+            target.borderTextureOffset = cfg.borderTextureOffset
+            target.borderTextureOffsetY = cfg.borderTextureOffsetY
+            target.borderTextureShiftX = cfg.borderTextureShiftX
+            target.borderTextureShiftY = cfg.borderTextureShiftY
+            target.borderBehind = cfg.borderBehind
+            target.borderR, target.borderG, target.borderB, target.borderA =
+                cfg.borderR, cfg.borderG, cfg.borderB, cfg.borderA
+            -- Border textures and custom shape masks are mutually exclusive in
+            -- the editor. A bulk style sync follows the same "last choice wins"
+            -- rule as a direct selection so it cannot create a locked combination.
+            if (cfg.borderTexture or "solid") ~= "solid" then
+                target.iconShape = "none"
+            end
+            PabApplyBarEntry(entry)
+        end
+        EllesmereUI.BuildSyncIcon({
+            region = rgn,
+            tooltip = "Apply Border Style to all Bars",
+            onClick = function()
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    if entry.cfg ~= cfg then CopyBorderStyleTo(entry) end
+                end
+                EllesmereUI:RefreshPage()
+            end,
+            isSynced = function()
+                local texture = cfg.borderTexture or "solid"
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    local c = entry.cfg
+                    if (c.borderTexture or "solid") ~= texture
+                        or c.borderTextureOffset ~= cfg.borderTextureOffset
+                        or c.borderTextureOffsetY ~= cfg.borderTextureOffsetY
+                        or c.borderTextureShiftX ~= cfg.borderTextureShiftX
+                        or c.borderTextureShiftY ~= cfg.borderTextureShiftY
+                        or (c.borderBehind == true) ~= (cfg.borderBehind == true) then
+                        return false
+                    end
+                end
+                return true
+            end,
+            flashTargets = function() return { rgn } end,
+            multiApply = {
+                elementKeys = keys,
+                elementLabels = labels,
+                getCurrentKey = function() return PabBarKeyOf(cfg, isBuff) end,
+                onApply = function(checkedKeys)
+                    local byKey = {}
+                    for _, entry in ipairs(PabAllBarEntries()) do byKey[entry.key] = entry end
+                    for _, key in ipairs(checkedKeys) do
+                        local entry = byKey[key]
+                        if entry then CopyBorderStyleTo(entry) end
+                    end
+                    EllesmereUI:RefreshPage()
+                end,
+            },
+        })
+    end
+
+    -- Width Offset | Height Offset: the textured border's outward offsets, their
+    -- own row right under the style row and present only for a textured style
+    -- (the Border Style setter rebuilds the page on a Solid/textured crossing).
+    -- addonKey/getSizeKey mirror what BuildStyle hands AuraKit ("unitframes",
+    -- sizeKey = the borderSize step), so the shown default is the drawn one.
+    do
+        local tex = cfg.borderTexture
+        if tex and tex ~= "" and tex ~= "solid" then
+            local ocfgL, ocfgR = EllesmereUI.BorderOffsetRowCfgs({
+                addonKey = "unitframes",
+                trackWidth = 120,
+                getTex = function() return cfg.borderTexture or "solid" end,
+                getStep = function() return cfg.borderSize or 1 end,
+                getSizeKey = function() return cfg.borderSize or 1 end,
+                getPx = function() return cfg.borderSizePx end,
+                getX = function() return cfg.borderTextureOffset end,
+                setX = function(v) cfg.borderTextureOffset = v end,
+                getY = function() return cfg.borderTextureOffsetY end,
+                setY = function(v) cfg.borderTextureOffsetY = v end,
+                apply = apply,
+            })
+            _, hh = W:DualRow(frame, sy,
+                EllesmereUI.BlizzStyle.Gate("playerauras", ocfgL),
+                EllesmereUI.BlizzStyle.Gate("playerauras", ocfgR)
+            ); sy = sy - hh
+        end
+    end
+
+    local rowRow
+    rowRow, hh = W:DualRow(frame, sy,
         {
-            type = "slider", text = "Border Size", min = 0, max = 4, step = 1, trackWidth = 120,
-            getValue = function() return cfg.borderSize or 1 end,
-            setValue = function(v) cfg.borderSize = v; apply() end
+            type = "slider", text = "Icons Per Row", min = 1, max = 20, step = 1, trackWidth = 120,
+            getValue = function() return cfg.iconsPerRow or (isBuff and 11 or 8) end,
+            setValue = function(v) cfg.iconsPerRow = v; apply() end
         },
         {
-            type = "slider", text = "Spacing", min = 0, max = 20, step = 1, trackWidth = 120,
+            type = "slider", text = "Spacing", min = -5, max = 20, step = 1, trackWidth = 120,
             getValue = function() return cfg.padding or 5 end,
             setValue = function(v) cfg.padding = v; apply() end
         }
     ); sy = sy - hh
     do
-        local rgn = borderRow._leftRegion
+        local rgn = styleRow._rightRegion
         local swatch, updateSwatch = EllesmereUI.BuildColorSwatch(
-            rgn, borderRow:GetFrameLevel() + 3,
+            rgn, styleRow:GetFrameLevel() + 3,
             function()
                 return (cfg.borderR or 0), (cfg.borderG or 0), (cfg.borderB or 0), (cfg.borderA or 1)
             end,
@@ -877,16 +1332,82 @@ local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
         EllesmereUI.RegisterWidgetRefresh(updateSwatch)
     end
     do
+        local rgn = styleRow._rightRegion
+        local keys, labels = {}, {}
+        for _, entry in ipairs(PabAllBarEntries()) do
+            keys[#keys + 1] = entry.key
+            labels[entry.key] = entry.label
+        end
+        local function CopyBorderTo(entry)
+            entry.cfg.borderSize = cfg.borderSize
+            -- The exact size travels with its step, verbatim (string/false/nil);
+            -- a target whose value was set is cleared with false, never nil.
+            local px = cfg.borderSizePx
+            if px == nil and entry.cfg.borderSizePx ~= nil then px = false end
+            entry.cfg.borderSizePx = px
+            -- A SHAPED target can't render Thin/Normal/Heavy (its shape border
+            -- has only off/Strong states; the dropdown disables those levels).
+            -- Snap to Strong so a sync can't strand a shaped bar on a level it
+            -- could never pick, silently losing its border and dispel ring.
+            local sz = entry.cfg.borderSize or 1
+            if entry.cfg.iconShape and entry.cfg.iconShape ~= "none"
+                and sz >= 1 and sz <= 3 then
+                entry.cfg.borderSize = BORDER_SIZE_NUM[BORDER_SIZE_DEFAULT_SHAPE]
+            end
+            entry.cfg.borderR, entry.cfg.borderG, entry.cfg.borderB, entry.cfg.borderA =
+                cfg.borderR, cfg.borderG, cfg.borderB, cfg.borderA
+            PabApplyBarEntry(entry)
+        end
+        EllesmereUI.BuildSyncIcon({
+            region  = rgn,
+            tooltip = "Apply Border Size and Color to all Bars",
+            onClick = function()
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    if entry.cfg ~= cfg then CopyBorderTo(entry) end
+                end
+                EllesmereUI:RefreshPage()
+            end,
+            isSynced = function()
+                local size = cfg.borderSize or 1
+                local r, g, b, a = cfg.borderR or 0, cfg.borderG or 0, cfg.borderB or 0, cfg.borderA or 1
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    local c = entry.cfg
+                    if (c.borderSize or 1) ~= size or (c.borderR or 0) ~= r or (c.borderG or 0) ~= g
+                        or (c.borderB or 0) ~= b or (c.borderA or 1) ~= a
+                        or (c.borderSizePx or false) ~= (cfg.borderSizePx or false) then
+                        return false
+                    end
+                end
+                return true
+            end,
+            flashTargets = function() return { rgn } end,
+            multiApply = {
+                elementKeys   = keys,
+                elementLabels = labels,
+                getCurrentKey = function() return PabBarKeyOf(cfg, isBuff) end,
+                onApply       = function(checkedKeys)
+                    local byKey = {}
+                    for _, entry in ipairs(PabAllBarEntries()) do byKey[entry.key] = entry end
+                    for _, key in ipairs(checkedKeys) do
+                        local entry = byKey[key]
+                        if entry then CopyBorderTo(entry) end
+                    end
+                    EllesmereUI:RefreshPage()
+                end,
+            },
+        })
+    end
+    do
         -- Row Spacing lives here, not in Icons Per Row's cog -- it's spacing between
         -- rows, same family as Spacing (icon-to-icon gap), not a grid-size concern like
         -- Icons Per Row/ Max Rows/Max Total.
-        local rgn = borderRow._rightRegion
+        local rgn = rowRow._rightRegion
         local _, cogShow = EllesmereUI.BuildCogPopup({
             title = "Spacing",
             rows = {
                 -- nil = 12px default -- deliberately
                 -- decoupled from Spacing/padding, no longer mirrors it.
-                { type = "slider", label = "Row Spacing", min = 0, max = 20, step = 1,
+                { type = "slider", label = "Row Spacing", min = -5, max = 20, step = 1,
                   get = function() return cfg.rowSpacing or 12 end,
                   set = function(v) cfg.rowSpacing = v; apply() end },
             },
@@ -894,20 +1415,6 @@ local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
         ns._PAMakeCogBtn(rgn, cogShow)
     end
 
-    local rowRow
-    rowRow, hh = W:DualRow(frame, sy,
-        {
-            type = "slider", text = "Icons Per Row", min = 1, max = 20, step = 1, trackWidth = 120,
-            getValue = function() return cfg.iconsPerRow or (isBuff and 11 or 8) end,
-            setValue = function(v) cfg.iconsPerRow = v; apply() end
-        },
-        {
-            type = "dropdown", text = "Font Outline",
-            values = FONT_OUTLINE_VALUES, order = FONT_OUTLINE_ORDER,
-            getValue = function() return cfg.fontOutline or "default" end,
-            setValue = function(v) cfg.fontOutline = v; apply() end
-        }
-    ); sy = sy - hh
     do
         -- Verified against EUI_RaidFrames_BuffManager.lua's "legacy layout"
         -- branch: perRowCfg paired with a blank spacer, cog on
@@ -926,6 +1433,111 @@ local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
             },
         })
         ns._PAMakeCogBtn(rgn, cogShow)
+    end
+
+    -- Icon Shape reuses the base Border Size/Color above -- no separate shape fields.
+    local shapeRow
+    shapeRow, hh = W:DualRow(frame, sy,
+        {
+            type = "dropdown", text = "Icon Shape",
+            values = SHAPE_VALUES, order = SHAPE_ORDER,
+            itemDisabled = function(v)
+                return v ~= "none" and (cfg.borderTexture or "solid") ~= "solid"
+            end,
+            itemDisabledTooltip = function(v)
+                if v ~= "none" and (cfg.borderTexture or "solid") ~= "solid" then
+                    return "This option requires the Border Style to be set to Solid"
+                end
+            end,
+            getValue = function() return cfg.iconShape or "none" end,
+            setValue = function(v)
+                local wasShaped = cfg.iconShape ~= nil and cfg.iconShape ~= "none"
+                cfg.iconShape = v
+                -- Entering shape mode with a now-disabled Border Size level selected:
+                -- snap to the shape default, same as Action Bars' own shape dropdown
+                -- resetting border thickness on every shape change.
+                local curKey = BORDER_SIZE_KEY[cfg.borderSize or 1] or "thin"
+                if v ~= "none" and BORDER_SIZE_SHAPE_DISABLED[curKey] then
+                    cfg.borderSize = BORDER_SIZE_NUM[BORDER_SIZE_DEFAULT_SHAPE]
+                end
+                apply()
+                -- The Border Size slots (here and in Icon Effects) hold a pixel
+                -- slider without a shape and the None..Strong dropdown with one, so
+                -- a none/custom crossing rebuilds the page to swap the control.
+                if wasShaped ~= (v ~= nil and v ~= "none") then
+                    EllesmereUI:RefreshPage(true)
+                end
+            end
+        },
+        EllesmereUI.BlizzStyle.Gate("playerauras", {
+            -- cfg.iconZoom stays a raw 0-1 fraction (SetTexCoord's own units); the
+            -- slider itself works in percent, like Action Bars' Icon Zoom.
+            -- Blizzard Style draws the whole icon (zoom 0).
+            type = "slider", text = "Icon Zoom", min = 0, max = 15, step = 0.5, trackWidth = 120,
+            getValue = function() return (cfg.iconZoom or 0.055) * 100 end,
+            setValue = function(v) cfg.iconZoom = v / 100; apply() end
+        })
+    ); sy = sy - hh
+    do
+        local rgn = shapeRow._leftRegion
+        local keys, labels = {}, {}
+        for _, entry in ipairs(PabAllBarEntries()) do
+            keys[#keys + 1] = entry.key
+            labels[entry.key] = entry.label
+        end
+        -- Same snap rule as the Icon Shape dropdown's own setValue: a bar
+        -- ENTERING shape mode while sitting on Thin/Normal/Heavy would render
+        -- no shape border at those levels (and the dropdown disables them), so
+        -- the sync snaps it to Strong exactly as a manual shape pick would.
+        local function CopyShapeTo(entry)
+            local shape = cfg.iconShape
+            entry.cfg.iconShape = shape
+            if shape and shape ~= "none" then
+                entry.cfg.borderTexture = "solid"
+                entry.cfg.borderTextureOffset = nil
+                entry.cfg.borderTextureOffsetY = nil
+                entry.cfg.borderTextureShiftX = nil
+                entry.cfg.borderTextureShiftY = nil
+                entry.cfg.borderBehind = false
+            end
+            local sz = entry.cfg.borderSize or 1
+            if shape and shape ~= "none" and sz >= 1 and sz <= 3 then
+                entry.cfg.borderSize = BORDER_SIZE_NUM[BORDER_SIZE_DEFAULT_SHAPE]
+            end
+            PabApplyBarEntry(entry)
+        end
+        EllesmereUI.BuildSyncIcon({
+            region  = rgn,
+            tooltip = "Apply Icon Shape to all Bars",
+            onClick = function()
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    if entry.cfg ~= cfg then CopyShapeTo(entry) end
+                end
+                EllesmereUI:RefreshPage()
+            end,
+            isSynced = function()
+                local shape = cfg.iconShape or "none"
+                for _, entry in ipairs(PabAllBarEntries()) do
+                    if (entry.cfg.iconShape or "none") ~= shape then return false end
+                end
+                return true
+            end,
+            flashTargets = function() return { rgn } end,
+            multiApply = {
+                elementKeys   = keys,
+                elementLabels = labels,
+                getCurrentKey = function() return PabBarKeyOf(cfg, isBuff) end,
+                onApply       = function(checkedKeys)
+                    local byKey = {}
+                    for _, entry in ipairs(PabAllBarEntries()) do byKey[entry.key] = entry end
+                    for _, key in ipairs(checkedKeys) do
+                        local entry = byKey[key]
+                        if entry then CopyShapeTo(entry) end
+                    end
+                    EllesmereUI:RefreshPage()
+                end,
+            },
+        })
     end
 
     local swipeRow
@@ -959,19 +1571,16 @@ local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
     end
 
     -- Buff bars only: debuffs are never player-cancelable, so the row would
-    -- be a dead switch there. (Weapon enchants used to share this row as a
-    -- second toggle; they are a content source rather than a display tweak,
-    -- so they now live as the "Weapon Enchants" pinned row in the Filters
-    -- dropdown -- see BuildAssignedBuffsFields.)
+    -- be a dead switch there.
     if isBuff then
         _, hh = W:DualRow(frame, sy,
+            FontOutlineField(cfg, apply),
             {
                 type = "toggle", text = "Right-Click to Cancel",
                 tooltip = "Right-clicking a buff icon cancels the buff. Turning this off makes the bar's icons click-through; tooltips still follow the Show Tooltips setting.",
                 getValue = function() return cfg.rightClickCancel ~= false end,
                 setValue = function(v) cfg.rightClickCancel = v; apply() end
-            },
-            { type = "label", text = "" }
+            }
         ); sy = sy - hh
     end
 
@@ -979,10 +1588,69 @@ local function BuildDisplayFields(frame, fontPath, sy, cfg, apply, isBuff)
 end
 
 -- Debuff-category bars only (default debuffs + custom debuff bars).
+local DISPEL_ICON_POS_VALUES = {
+    none        = "None",
+    topleft     = "Top Left",
+    top         = "Top",
+    topright    = "Top Right",
+    left        = "Left",
+    center      = "Center",
+    right       = "Right",
+    bottomleft  = "Bottom Left",
+    bottom      = "Bottom",
+    bottomright = "Bottom Right",
+}
+local DISPEL_ICON_POS_ORDER = { "none", "topleft", "top", "topright", "left", "center", "right", "bottomleft", "bottom", "bottomright" }
+
 local function BuildDispelColorFields(frame, fontPath, sy, cfg, apply)
     local W = EllesmereUI.Widgets
     local PP = EllesmereUI.PanelPP
     local _, hh = 0, 0
+
+    -- Dispel-type indicator icon on each debuff bar (engine-driven, mirrors
+    -- Raid Frames' "Type Icon Position"). "none" (default) = feature off.
+    _, hh = W:SectionHeader(frame, "DEBUFF DISPLAY", sy); sy = sy - hh
+    do
+        local function IconOn() return (cfg.dispelIconPosition or "none") ~= "none" end
+        local row
+        row, hh = W:DualRow(frame, sy,
+            { type = "dropdown", text = "Type Icon Position",
+              tooltip = "Shows the debuff's dispel type icon (Magic, Curse, Disease, Poison, Bleed) on the bar.",
+              values = DISPEL_ICON_POS_VALUES, order = DISPEL_ICON_POS_ORDER,
+              getValue = function() return cfg.dispelIconPosition or "none" end,
+              setValue = function(v)
+                  cfg.dispelIconPosition = v
+                  apply()
+                  EllesmereUI:RefreshPage()
+              end },
+            FontOutlineField(cfg, apply)
+        ); sy = sy - hh
+        local rgn = row._leftRegion
+        local _, cogShow = EllesmereUI.BuildCogPopup({
+            title = "Type Icon",
+            rows = {
+                { type = "slider", label = "Icon Size", min = 8, max = 48, step = 1,
+                  get = function() return cfg.dispelIconSize or 16 end,
+                  set = function(v) cfg.dispelIconSize = v; apply() end },
+                { type = "slider", label = "Offset X", min = -50, max = 50, step = 1,
+                  get = function() return cfg.dispelIconOffsetX or 0 end,
+                  set = function(v) cfg.dispelIconOffsetX = v; apply() end },
+                { type = "slider", label = "Offset Y", min = -50, max = 50, step = 1,
+                  get = function() return cfg.dispelIconOffsetY or 0 end,
+                  set = function(v) cfg.dispelIconOffsetY = v; apply() end },
+            },
+        })
+        local cogBtn = ns._PAMakeCogBtn(rgn, function(self)
+            if IconOn() then cogShow(self) end
+        end)
+        cogBtn:SetAlpha(IconOn() and 0.4 or 0.15)
+        cogBtn:SetScript("OnEnter", function(self) if IconOn() then self:SetAlpha(0.7) end end)
+        cogBtn:SetScript("OnLeave", function(self) self:SetAlpha(IconOn() and 0.4 or 0.15) end)
+    end
+
+    -- Blizzard Style paints the stock per-type border art, so the palette has
+    -- nothing to colour: the whole section stays out (fully gated rows hide).
+    if EllesmereUI.BlizzStyle.Get("playerauras") then return sy end
 
     _, hh = W:SectionHeader(frame, "DISPEL COLORS", sy); sy = sy - hh
 
@@ -1182,12 +1850,32 @@ local function BuildFxEffects(frame, sy, cfg, apply)
 
         -- Row 2: Border (+ swatch) | Size (icon size for the matched
         -- filters; 0 = the bar's own icon size).
+        -- Border: solid px only (no Border Style here), so a plain 0-4 slider view
+        -- over e.borderSize, the same number the dropdown wrote. A custom Icon
+        -- Shape keeps the None..Strong dropdown (the shape ring is on/off); the
+        -- Icon Shape setter rebuilds the page on a none/custom crossing.
+        local fxBorderCfg
+        if cfg.iconShape and cfg.iconShape ~= "none" then
+            fxBorderCfg = { type = "dropdown", text = "Border",
+              values = BORDER_SIZE_VALUES, order = BORDER_SIZE_LEVELS,
+              itemDisabled = function(v)
+                  local shape = cfg.iconShape
+                  return shape and shape ~= "none" and BORDER_SIZE_SHAPE_DISABLED[v] or false
+              end,
+              itemDisabledTooltip = function()
+                  return "This option requires a non-custom shape to be selected"
+              end,
+              getValue = function() return BORDER_SIZE_KEY[e.borderSize or 0] or "none" end,
+              setValue = function(v) e.borderSize = BORDER_SIZE_NUM[v] or 0; apply() end }
+        else
+            fxBorderCfg = { type = "slider", text = "Border", min = 0, max = 4, step = 1, trackWidth = 120,
+              getValue = function() return e.borderSize or 0 end,
+              setValue = function(v) e.borderSize = v; apply() end }
+        end
         local bRow
         bRow, hh = W:DualRow(frame, sy,
-            { type = "slider", text = "Border", min = 0, max = 4, step = 1, trackWidth = 120,
-              getValue = function() return e.borderSize or 0 end,
-              setValue = function(v) e.borderSize = v; apply() end },
-            { type = "slider", text = "Size", min = 0, max = 60, step = 1, trackWidth = 120,
+            fxBorderCfg,
+            { type = "slider", text = "Size", min = 0, max = 400, step = 1, trackWidth = 120,
               getValue = function() return e.size or 0 end,
               setValue = function(v)
                   e.size = (v and v > 0) and v or nil
@@ -1350,6 +2038,10 @@ local function BuildDefaultBarDetail(frame, fontPath, isBuff)
 
     local s = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
     if not s then return end
+    -- Defensive: the lane split + enable migration normally run in CreateBars,
+    -- but make the page unable to write pre-migration data even if it is ever
+    -- reachable without them.
+    if ns.PAB_EnsureBarEnable then ns.PAB_EnsureBarEnable(s) end
     local cfg = isBuff and ns.PAB_DefaultBuffsCfg(s) or ns.PAB_DefaultDebuffsCfg(s)
 
     local function ApplyBar()
@@ -1385,6 +2077,11 @@ end
 --  BuildTile, trimmed to the fields this page actually uses)
 -------------------------------------------------------------------------------
 
+-- opts.inheritedTooltip marks the INHERITED variant (a group bucket's bar
+-- shown on a concrete spec view): blue identity tint on title/subtitle, an
+-- always-on blue edge strip, hover tooltip. Callers pass no onDelete/
+-- onRename and wire onToggle to the per-spec disable.
+local INH_R, INH_G, INH_B = 0.55, 0.72, 1
 local function BuildTile(parentFrame, y, opts)
     local fontPath = opts.fontPath
     local tile = CreateFrame("Button", nil, parentFrame)
@@ -1400,9 +2097,18 @@ local function BuildTile(parentFrame, y, opts)
         local accent = tile:CreateTexture(nil, "ARTWORK", nil, 2)
         accent:SetSize(2, TILE_H)
         accent:SetPoint("TOPLEFT", tile, "TOPLEFT", 0, 0)
-        local ac = EllesmereUI.ELLESMERE_GREEN
-        if ac then accent:SetColorTexture(ac.r, ac.g, ac.b, 1)
-        else accent:SetColorTexture(0.05, 0.82, 0.62, 1) end
+        if opts.inheritedTooltip then
+            accent:SetColorTexture(INH_R, INH_G, INH_B, 1)
+        else
+            local ac = EllesmereUI.ELLESMERE_GREEN
+            if ac then accent:SetColorTexture(ac.r, ac.g, ac.b, 1)
+            else accent:SetColorTexture(0.05, 0.82, 0.62, 1) end
+        end
+    elseif opts.inheritedTooltip then
+        local edge = tile:CreateTexture(nil, "ARTWORK", nil, 2)
+        edge:SetSize(2, TILE_H)
+        edge:SetPoint("TOPLEFT", tile, "TOPLEFT", 0, 0)
+        edge:SetColorTexture(INH_R, INH_G, INH_B, 0.45)
     end
 
     local textRight = opts.showToggle and -52 or -16
@@ -1414,7 +2120,11 @@ local function BuildTile(parentFrame, y, opts)
     titleFS:SetJustifyH("LEFT")
     titleFS:SetWordWrap(false)
     titleFS:SetText(opts.title or "")
-    titleFS:SetTextColor(1, 1, 1)
+    if opts.inheritedTooltip then
+        titleFS:SetTextColor(INH_R, INH_G, INH_B)
+    else
+        titleFS:SetTextColor(1, 1, 1)
+    end
 
     if opts.subtitle or opts.subtitleFn then
         local sub = tile:CreateFontString(nil, "OVERLAY")
@@ -1424,7 +2134,11 @@ local function BuildTile(parentFrame, y, opts)
         sub:SetJustifyH("LEFT")
         sub:SetWordWrap(false)
         sub:SetText(opts.subtitleFn and opts.subtitleFn() or opts.subtitle)
-        sub:SetTextColor(0.4, 0.4, 0.4)
+        if opts.inheritedTooltip then
+            sub:SetTextColor(INH_R, INH_G, INH_B, 0.55)
+        else
+            sub:SetTextColor(0.4, 0.4, 0.4)
+        end
         -- subtitleFn (vs. a static subtitle string): re-read on every lightweight
         -- RefreshPage() pass, e.g. after a Filters/Extra Spells checkbox toggle in
         -- the detail pane -- those call apply() + RefreshPage() (non-force) rather
@@ -1439,11 +2153,24 @@ local function BuildTile(parentFrame, y, opts)
 
     tile:SetScript("OnEnter", function()
         if not opts.selected then bg:SetColorTexture(1, 1, 1, 0.04) end
+        if opts.inheritedTooltip then
+            EllesmereUI.ShowWidgetTooltip(tile, opts.inheritedTooltip)
+        end
     end)
     tile:SetScript("OnLeave", function()
         bg:SetColorTexture(1, 1, 1, opts.selected and 0.06 or 0)
+        if opts.inheritedTooltip then
+            EllesmereUI.HideWidgetTooltip()
+        end
     end)
-    tile:SetScript("OnClick", function()
+    -- Right-click routes to opts.onContext (the "Add To" menu) when the
+    -- caller provides it; tiles without it ignore right-clicks.
+    tile:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    tile:SetScript("OnClick", function(self, btn)
+        if btn == "RightButton" then
+            if opts.onContext then opts.onContext(tile) end
+            return
+        end
         if opts.onSelect then opts.onSelect() end
     end)
 
@@ -1453,6 +2180,12 @@ local function BuildTile(parentFrame, y, opts)
         toggleBtn:SetSize(32, toggleH)
         toggleBtn:SetPoint("TOPRIGHT", tile, "TOPRIGHT", -8, -8)
         toggleBtn:SetFrameLevel(tile:GetFrameLevel() + 2)
+        -- Inherited rows: the pill is the per-spec CONTROL and stays
+        -- full-brightness even when the row dims (opts.dimmed) or wears the
+        -- inherited tint -- SetAlpha on the tile inherits to children.
+        if opts.inheritedTooltip and toggleBtn.SetIgnoreParentAlpha then
+            toggleBtn:SetIgnoreParentAlpha(true)
+        end
         local toggleBg = toggleBtn:CreateTexture(nil, "BACKGROUND")
         toggleBg:SetAllPoints()
         local toggleKnob = toggleBtn:CreateTexture(nil, "ARTWORK")
@@ -1524,6 +2257,10 @@ local function BuildTile(parentFrame, y, opts)
     sep:SetPoint("BOTTOMRIGHT", tile, "BOTTOMRIGHT", 0, 0)
     sep:SetColorTexture(1, 1, 1, 0.04)
 
+    -- Dimmed rows (inherited tiles whose GROUP disabled the entry): the
+    -- whole tile fades; the pill stays the per-spec layer's own state.
+    if opts.dimmed then tile:SetAlpha(0.55) end
+
     return TILE_H
 end
 
@@ -1581,6 +2318,9 @@ end
 local function BuildBuffBarDetail(frame, fontPath, bar)
     local W = EllesmereUI.Widgets
     if not W then return end
+    -- Defensive lane split + enable migration, same as BuildDefaultBarDetail.
+    local sPAB = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+    if sPAB and ns.PAB_EnsureBarEnable then ns.PAB_EnsureBarEnable(sPAB) end
     local function ApplyBar() Apply(true, bar.id) end
 
     local scrollTop = 0
@@ -1589,7 +2329,7 @@ local function BuildBuffBarDetail(frame, fontPath, bar)
     end
     local body = WrapCompensatedBody(frame, scrollTop)
     local by = 0
-    by = BuildBarTitle(body, fontPath, bar.name or L("Buff Bar"), L("Custom buff bar"), by)
+    by = BuildBarTitle(body, fontPath, L(bar.name or "Buff Bar"), L("Custom buff bar"), by)
     by = BuildAssignedBuffsFields(body, fontPath, by, bar, ApplyBar)
     by = BuildCoreFields(body, fontPath, by, bar, ApplyBar, true)
     by = BuildDisplayFields(body, fontPath, by, bar, ApplyBar, true)
@@ -1605,6 +2345,9 @@ end
 local function BuildDebuffBarDetail(frame, fontPath, bar)
     local W = EllesmereUI.Widgets
     if not W then return end
+    -- Defensive lane split + enable migration, same as BuildDefaultBarDetail.
+    local sPAB = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+    if sPAB and ns.PAB_EnsureBarEnable then ns.PAB_EnsureBarEnable(sPAB) end
     local function ApplyBar() Apply(false, bar.id) end
 
     local scrollTop = 0
@@ -1613,7 +2356,7 @@ local function BuildDebuffBarDetail(frame, fontPath, bar)
     end
     local body = WrapCompensatedBody(frame, scrollTop)
     local by = 0
-    by = BuildBarTitle(body, fontPath, bar.name or L("Debuff Bar"), L("Custom debuff bar"), by)
+    by = BuildBarTitle(body, fontPath, L(bar.name or "Debuff Bar"), L("Custom debuff bar"), by)
     by = BuildAssignedDebuffsFields(body, fontPath, by, bar, ApplyBar)
     by = BuildCoreFields(body, fontPath, by, bar, ApplyBar, false)
     by = BuildDisplayFields(body, fontPath, by, bar, ApplyBar, false)
@@ -1828,12 +2571,9 @@ function ns.PABMP_ShowFilterEditor()
     local function Rebuild() ns.PABMP_ShowFilterEditor() end
     local function ApplyAll()
         if ns.PAB_ApplyLiveConfig then ns.PAB_ApplyLiveConfig(true) end
-        local list = ns.PAB_CustomBuffBars and ns.PAB_CustomBuffBars()
-        if list then
-            for i = 1, #list do
-                if ns.PAB_ReloadCustomBuffBar then ns.PAB_ReloadCustomBuffBar(list[i].id) end
-            end
-        end
+        -- Every custom bar, editing-spec buckets included: a filter edit
+        -- changes any bar assigned to it, whichever bucket owns the bar.
+        if ns.PAB_ReloadAllCustomBars then ns.PAB_ReloadAllCustomBars() end
     end
     local function EditorInput(opts)
         EllesmereUI:ShowInputPopup(opts)
@@ -1878,7 +2618,7 @@ function ns.PABMP_ShowFilterEditor()
         rl:SetPoint("LEFT", frow, "LEFT", 10, 0)
         rl:SetPoint("RIGHT", frow, "RIGHT", f.preset and -8 or -42, 0)
         rl:SetJustifyH("LEFT"); rl:SetWordWrap(false)
-        rl:SetText(f.name)
+        rl:SetText(L(f.name))
         if isSel then
             local accent = frow:CreateTexture(nil, "ARTWORK", nil, 2)
             accent:SetSize(2, 26)
@@ -1934,7 +2674,7 @@ function ns.PABMP_ShowFilterEditor()
             edit:SetScript("OnLeave", function(self) self:SetAlpha(0.5); EllesmereUI.HideWidgetTooltip() end)
             edit:SetScript("OnClick", function()
                 EditorInput({
-                    title = L("Rename Filter"), placeholder = f.name,
+                    title = L("Rename Filter"), placeholder = L(f.name),
                     confirmText = L("Rename"), cancelText = L("Cancel"),
                     onConfirm = function(text) ns.PAB_RenameFilter(f.id, text); Rebuild() end,
                 })
@@ -1994,7 +2734,7 @@ function ns.PABMP_ShowFilterEditor()
     local nm = EllesmereUI.MakeFont(left, 13, nil, 1, 1, 1)
     nm:SetAlpha(0.9)
     nm:SetPoint("TOPLEFT", left, "TOPLEFT", 2, -2)
-    nm:SetText(sel.name)
+    nm:SetText(L(sel.name))
     if not sel.preset then
         local ren = CreateFrame("Button", nil, left)
         ren:SetSize(54, 16)
@@ -2008,7 +2748,7 @@ function ns.PABMP_ShowFilterEditor()
         ren:SetScript("OnLeave", function() rl:SetAlpha(0.9) end)
         ren:SetScript("OnClick", function()
             EditorInput({
-                title = L("Rename Filter"), placeholder = sel.name,
+                title = L("Rename Filter"), placeholder = L(sel.name),
                 confirmText = L("Rename"), cancelText = L("Cancel"),
                 onConfirm = function(text) ns.PAB_RenameFilter(sel.id, text); Rebuild() end,
             })
@@ -2337,14 +3077,17 @@ local function ShowAddBarPopup(anchorBtn, kind, fontPath)
         local text = popup._nameBox:GetText()
         local name = (text and text ~= "") and text or nil
         local bar
+        -- New bars land in the EDITED editing-spec bucket ("allspecs" =
+        -- the legacy arrays, today's behavior).
         if kind == "buff" then
-            bar = ns.PAB_AddCustomBuffBar and ns.PAB_AddCustomBuffBar(name)
+            bar = ns.PAB_AddCustomBuffBar and ns.PAB_AddCustomBuffBar(name, pabSpecSel)
         else
-            bar = ns.PAB_AddCustomDebuffBar and ns.PAB_AddCustomDebuffBar(name)
+            bar = ns.PAB_AddCustomDebuffBar and ns.PAB_AddCustomDebuffBar(name, pabSpecSel)
         end
         popup:Hide()
         if bar then
             pabSel = { kind = kind, id = bar.id }
+            pabInhSel = nil
             Apply(kind == "buff", bar.id)
             EllesmereUI:RefreshPage(true)
         end
@@ -2387,10 +3130,37 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
     outerRoot:SetAllPoints(scrollFrame)
     outerRoot:SetFrameLevel(scrollFrame:GetFrameLevel() + 5)
     if ns._pabRoot then ns._pabRoot:Hide(); ns._pabRoot:SetParent(nil) end
+    if EllesmereUI._pickMenu then EllesmereUI._pickMenu:Hide() end
     ns._pabRoot = outerRoot
 
-    local buffBars = ns.PAB_CustomBuffBars and ns.PAB_CustomBuffBars() or {}
-    local debuffBars = ns.PAB_CustomDebuffBars and ns.PAB_CustomDebuffBars() or {}
+    -- Editing-spec bucket sanity: stale/unknown keys reset to All Specs.
+    if pabSpecSel ~= "allspecs" and not SPEC_GROUP_INFO[pabSpecSel]
+        and not (type(pabSpecSel) == "string" and pabSpecSel:match("^spec%d")) then
+        pabSpecSel = "allspecs"
+    end
+    local buffBars = ns.PAB_BucketBars and ns.PAB_BucketBars(true, pabSpecSel) or {}
+    local debuffBars = ns.PAB_BucketBars and ns.PAB_BucketBars(false, pabSpecSel) or {}
+
+    -- Group buckets this view inherits from (concrete "spec<ID>" views
+    -- only): their bars lead each section as read-only tiles.
+    local inhGroups = ns.PAB_InheritedGroupsFor and ns.PAB_InheritedGroupsFor(pabSpecSel) or nil
+
+    -- Inherited selection: resolve against the owning group's bucket; drop
+    -- it when the view no longer inherits that group or the bar is gone.
+    local pabInhBar = nil
+    if pabInhSel and inhGroups then
+        for gi = 1, #inhGroups do
+            if inhGroups[gi] == pabInhSel.group then
+                local gl = ns.PAB_BucketBars
+                    and ns.PAB_BucketBars(pabInhSel.kind == "buff", pabInhSel.group)
+                for i = 1, #(gl or {}) do
+                    if gl[i].id == pabInhSel.id then pabInhBar = gl[i] break end
+                end
+                break
+            end
+        end
+    end
+    if not pabInhBar then pabInhSel = nil end
 
     -- Validate selection against current data (bar may have been deleted
     -- elsewhere, e.g. profile switch). "default" is always valid (the two
@@ -2400,6 +3170,84 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
         local list = (pabSel.kind == "buff") and buffBars or debuffBars
         for i = 1, #list do if list[i].id == pabSel.id then ok = true end end
         if not ok then pabSel = { kind = "buff", id = "default" } end
+    end
+
+    -- Use Blizzard Buffs: the built-in bars stand down (Blizzard's native
+    -- display owns buffs/debuffs) and their sidebar tiles hide everywhere.
+    local sPABTop = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+    -- Defensive migrations (lane split + empty-bar -> All + disabled): the
+    -- default tiles below read cfg.enabled, so the enable migration must
+    -- have run.
+    if sPABTop and ns.PAB_EnsureBarEnable then ns.PAB_EnsureBarEnable(sPABTop) end
+    local useBlizz = (sPABTop and sPABTop.useBlizzardBuffs == true) or false
+    -- The default Buffs/Debuffs bars are ALL SPECS content: they list in the
+    -- All Specs view (editable) and on concrete spec views (specs show
+    -- everything the all-buckets apply to them), but NEVER in the other
+    -- group views -- groups don't inherit from each other (BM parity;
+    -- All-Specs content is already covered by the All Specs bucket).
+    local showDefaults = not useBlizz
+        and (pabSpecSel == "allspecs"
+            or (type(pabSpecSel) == "string" and pabSpecSel:match("^spec%d") ~= nil))
+    -- A "default" selection re-targets the first custom bar (or nothing)
+    -- whenever the default tiles are not listed in this view.
+    if not showDefaults and pabSel and pabSel.id == "default" then
+        local first = buffBars[1] or debuffBars[1]
+        if first then
+            pabSel = { kind = buffBars[1] and "buff" or "debuff", id = first.id }
+        else
+            pabSel = nil
+        end
+    end
+    -- Back on a defaults-listing view with nothing selected: re-seed the
+    -- default selection so the detail pane never stays blank.
+    if showDefaults and not pabSel then
+        pabSel = { kind = "buff", id = "default" }
+    end
+
+    -- Editing-spec roster, shared by the Editing Spec dropdown and the
+    -- right-click "Add To" menu: group buckets, then every spec in the game
+    -- as its own "spec<ID>" bucket.
+    local function BuildPabSpecRoster()
+        local values, order, icons = {}, {}, {}
+        for i = 1, #SPEC_GROUP_BUCKETS do
+            local g = SPEC_GROUP_BUCKETS[i]
+            values[g.key] = L(g.name)
+            order[#order + 1] = g.key
+            icons[g.key] = g.icon
+        end
+        order[#order + 1] = "---a"
+        for classID = 1, (GetNumClasses and GetNumClasses() or 0) do
+            local className = GetClassInfo(classID)
+            local numSpecs = GetNumSpecializationsForClassID
+                and GetNumSpecializationsForClassID(classID) or 0
+            for si = 1, numSpecs do
+                local specID, specName, _, sIcon = GetSpecializationInfoForClassID(classID, si)
+                if specID then
+                    local key = "spec" .. specID
+                    values[key] = (specName or "") .. " " .. (className or "")
+                    order[#order + 1] = key
+                    icons[key] = sIcon
+                end
+            end
+        end
+        return values, order, icons
+    end
+
+    -- Right-click "Add To" items: the roster minus dividers, the edited
+    -- bucket (= the source) disabled.
+    local function PabBucketMenuItems()
+        local values, order, icons = BuildPabSpecRoster()
+        local items = {}
+        for i = 1, #order do
+            local key = order[i]
+            if not key:match("^%-%-%-") then
+                items[#items + 1] = {
+                    key = key, label = values[key], icon = icons[key],
+                    disabled = key == pabSpecSel,
+                }
+            end
+        end
+        return items
     end
 
     -- Page-level "Player Aura Bars" header card removed (by request:
@@ -2421,79 +3269,324 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
     local sbBg = sidebarOuter:CreateTexture(nil, "BACKGROUND")
     sbBg:SetAllPoints()
     sbBg:SetColorTexture(0, 0, 0, 0.25)
-    local sidebarScroll = CreateFrame("ScrollFrame", nil, sidebarOuter)
-    sidebarScroll:SetAllPoints()
-    local sidebarChild = CreateFrame("Frame", nil, sidebarScroll)
-    sidebarChild:SetWidth(sidebarW)
-    sidebarScroll:SetScrollChild(sidebarChild)
-    sidebarScroll:EnableMouseWheel(true)
-    sidebarScroll:SetScript("OnMouseWheel", function(self, delta)
-        local maxS = max(0, sidebarChild:GetHeight() - self:GetHeight())
-        self:SetVerticalScroll(math.min(maxS, math.max(0, self:GetVerticalScroll() - delta * 40)))
-    end)
+    -------------------------------------------------------------------
+    --  SECTIONED SIDEBAR (fixed, no outer scroll): top options (Disable
+    --  All / Use Blizzard Buffs), Editing Spec, then two independently
+    --  scrollable halves (Buff Bars / Debuff Bars).
+    -------------------------------------------------------------------
+    local fixedY = -6
 
-    -- Master kill switch (small top-right corner button; Blizz UI Enhanced's "Disable
-    -- Window Skins" pattern). Reload-bound: the Blizzard corner-frame hide latches for
-    -- the session, so disabling re-covers the page with the activation overlay
-    -- immediately and offers the reload that restores the stock buff display.
-    if EllesmereUI.MakeStyledButton then
-        local disBtn = CreateFrame("Button", nil, sidebarOuter)
-        disBtn:SetSize(64, 18)
-        disBtn:SetPoint("TOPRIGHT", sidebarOuter, "TOPRIGHT", -6, -6)
-        disBtn:SetFrameLevel(sidebarOuter:GetFrameLevel() + 5)
-        EllesmereUI.MakeStyledButton(disBtn, "Disable", 10, EllesmereUI.WB_COLOURS, function()
+    -- Toggle row helper (label left, tile-style pill right).
+    local function OptionRow(y, label, state, tooltip, onToggle)
+        local row = CreateFrame("Frame", nil, sidebarOuter)
+        row:SetSize(sidebarW, 26)
+        row:SetPoint("TOPLEFT", sidebarOuter, "TOPLEFT", 0, y)
+        row:SetFrameLevel(sidebarOuter:GetFrameLevel() + 1)
+        row:EnableMouse(true)
+        local lbl = row:CreateFontString(nil, "OVERLAY")
+        lbl:SetFont(fontPath, 12, "")
+        lbl:SetPoint("LEFT", row, "LEFT", 12, 0)
+        lbl:SetPoint("RIGHT", row, "RIGHT", -52, 0)
+        lbl:SetJustifyH("LEFT")
+        lbl:SetWordWrap(false)
+        lbl:SetText(label)
+        lbl:SetTextColor(1, 1, 1)
+        local btn = CreateFrame("Button", nil, row)
+        btn:SetSize(32, 16)
+        btn:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+        btn:SetFrameLevel(row:GetFrameLevel() + 2)
+        local pillBg = btn:CreateTexture(nil, "BACKGROUND")
+        pillBg:SetAllPoints()
+        local knob = btn:CreateTexture(nil, "ARTWORK")
+        knob:SetSize(12, 12)
+        if state then
+            local acr, acg, acb = 0.05, 0.82, 0.62
+            if EllesmereUI.ResolveActiveAccent then
+                acr, acg, acb = EllesmereUI.ResolveActiveAccent()
+            end
+            pillBg:SetColorTexture(acr, acg, acb, 1)
+            knob:SetPoint("RIGHT", btn, "RIGHT", -2, 0)
+            knob:SetColorTexture(1, 1, 1, 1)
+        else
+            pillBg:SetColorTexture(0.25, 0.25, 0.25, 1)
+            knob:SetPoint("LEFT", btn, "LEFT", 2, 0)
+            knob:SetColorTexture(0.5, 0.5, 0.5, 1)
+        end
+        btn:SetScript("OnClick", function() onToggle(not state) end)
+        if tooltip then
+            row:SetScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(row, tooltip) end)
+            row:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+            btn:HookScript("OnEnter", function() EllesmereUI.ShowWidgetTooltip(row, tooltip) end)
+            btn:HookScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+        end
+        return y - 26
+    end
+
+    -- Disable All: full shutdown, applied live (bars torn down, movers
+    -- dropped, Blizzard's native display handed back); a reload is only
+    -- recommended cleanup. The page re-covers with the activation overlay,
+    -- whose enable action is the way back.
+    fixedY = OptionRow(fixedY, L("Disable All"),
+        not (ns.PAB_Enabled and ns.PAB_Enabled()),
+        L("Turns off Player Aura Bars completely."),
+        function(v)
+            if not v then return end
             if ns.PAB_SetEnabled then ns.PAB_SetEnabled(false) end
             EllesmereUI:RefreshPage(true)
             if EllesmereUI.ShowConfirmPopup then
                 EllesmereUI:ShowConfirmPopup({
-                    title       = "Reload Required",
-                    message     = L("Player Aura Bars are now disabled. A UI reload is required to restore Blizzard's default buff and debuff display."),
+                    title       = "Reload Recommended",
+                    message     = L("Player Aura Bars are disabled and Blizzard's default display is back. A UI reload is recommended to finish cleanup."),
                     confirmText = "Reload Now",
                     cancelText  = "Later",
-                    onConfirm   = function() ReloadUI() end,
+                    reload      = true,
                 })
             end
         end)
-        disBtn:HookScript("OnEnter", function(s)
-            EllesmereUI.ShowWidgetTooltip(s, L("Turns off Player Aura Bars. Requires a reload."))
+
+    -- Use Blizzard Buffs: the built-in Buffs/Debuffs bars stand down and
+    -- Blizzard's native display returns, all live; custom bars keep working.
+    fixedY = OptionRow(fixedY, L("Use Blizzard Buffs"), useBlizz,
+        L("Keeps Blizzard's own buff and debuff display and turns off the built-in Buffs and Debuffs bars. Custom bars keep working."),
+        function(v)
+            if not sPABTop then return end
+            sPABTop.useBlizzardBuffs = v and true or nil
+            if ns.PAB_ApplyUseBlizzard then ns.PAB_ApplyUseBlizzard() end
+            EllesmereUI:RefreshPage(true)
         end)
-        disBtn:HookScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+    -- No divider under the toggles (user call): just breathing room before
+    -- the Editing Spec block.
+    fixedY = fixedY - 9
+
+    local function SectionDivider(y)
+        local div = sidebarOuter:CreateTexture(nil, "ARTWORK")
+        div:SetHeight(1)
+        div:SetPoint("TOPLEFT", sidebarOuter, "TOPLEFT", 8, y - 4)
+        div:SetPoint("TOPRIGHT", sidebarOuter, "TOPRIGHT", -8, y - 4)
+        div:SetColorTexture(1, 1, 1, 0.08)
+        return y - 9
     end
 
-    local tileY = 0
-
-    -- Buff bars section: fixed "Buffs" default bar first, then custom bars.
+    -------------------------------------------------------------------
+    --  EDITING SPEC (fixed block): group buckets lead, then every spec
+    --  in the game as its own "spec<ID>" bucket. Bars in the selected
+    --  bucket render only on matching specs; concrete views list the
+    --  group bars as inherited read-only tiles below.
+    -------------------------------------------------------------------
     do
-        local hdr = sidebarChild:CreateFontString(nil, "OVERLAY")
+        local specLabel = sidebarOuter:CreateFontString(nil, "OVERLAY")
+        specLabel:SetFont(fontPath, 11, "")
+        specLabel:SetPoint("TOP", sidebarOuter, "TOPLEFT", floor(sidebarW / 2), fixedY - 8)
+        specLabel:SetText(L("EDITING SPEC"))
+        specLabel:SetTextColor(0.6, 0.6, 0.6)
+        fixedY = fixedY - 27
+
+        -- Roster shared with the right-click "Add To" menu (the menu
+        -- rebuilds it lazily per open).
+        local specDDValues, specDDOrder, specDDIcons = BuildPabSpecRoster()
+        specDDValues._menuOpts = {
+            maxHeight = 300,
+            icon = function(key) return specDDIcons[key] end,
+        }
+
+        local specDD = EllesmereUI.BuildDropdownControl(
+            sidebarOuter, sidebarW - 24, sidebarOuter:GetFrameLevel() + 2,
+            specDDValues, specDDOrder,
+            function() return pabSpecSel or "allspecs" end,
+            function(v)
+                pabSpecSel = v
+                pabSel = { kind = "buff", id = "default" }
+                pabInhSel = nil
+                EllesmereUI:RefreshPage(true)
+            end)
+        specDD:SetPoint("TOP", sidebarOuter, "TOPLEFT", floor(sidebarW / 2), fixedY)
+        fixedY = fixedY - 36
+    end
+    fixedY = SectionDivider(fixedY)
+
+    -------------------------------------------------------------------
+    --  Split halves (Buff Bars / Debuff Bars), each its own scroll; the
+    --  sidebar itself no longer scrolls.
+    -------------------------------------------------------------------
+    local fixedH = math.abs(fixedY)
+    -- Floor keeps the halves from collapsing/overlapping at pathological
+    -- window heights (the sidebar also clips its children).
+    local half = math.max(60, floor((visibleH - fixedH) / 2))
+    sidebarOuter:SetClipsChildren(true)
+
+    local function MakeSection(y, height, headerText)
+        local hdr = sidebarOuter:CreateFontString(nil, "OVERLAY")
         hdr:SetFont(fontPath, 11, "")
-        hdr:SetPoint("TOP", sidebarChild, "TOPLEFT", floor(sidebarW / 2), tileY - 13)
-        hdr:SetText(L("BUFF BARS"))
+        hdr:SetPoint("TOP", sidebarOuter, "TOPLEFT", floor(sidebarW / 2), y - 13)
+        hdr:SetText(headerText)
         hdr:SetTextColor(0.6, 0.6, 0.6)
-        tileY = tileY - 35
+        local scroll = CreateFrame("ScrollFrame", nil, sidebarOuter)
+        scroll:SetPoint("TOPLEFT", sidebarOuter, "TOPLEFT", 0, y - 32)
+        scroll:SetSize(sidebarW, math.max(10, height - 32))
+        scroll:SetClipsChildren(true)
+        local child = CreateFrame("Frame", nil, scroll)
+        child:SetWidth(sidebarW)
+        scroll:SetScrollChild(child)
+        -- The standard smooth scroll + auto-hiding 4px scrollbar.
+        local updateThumb = AttachEditorScroll(scroll, child)
+        return { child = child, scroll = scroll, top = y, height = height,
+            viewH = math.max(10, height - 32), updateThumb = updateThumb }
+    end
+
+    -- Finalizes one section: the Add button FLOWS under the tiles while
+    -- everything fits, and PINS to the section bottom (always visible) once
+    -- the list overflows -- the viewport then ends above the button band and
+    -- the scrollbar appears.
+    local ADD_AREA = 50 -- AddNewButton's consumed height (pad + button + pad)
+    local function FinishSection(sec, tilesY, label, onClick)
+        local contentH = math.abs(tilesY)
+        if contentH + ADD_AREA <= sec.viewH then
+            AddNewButton(sec.child, tilesY, sidebarW, label, onClick)
+            sec.child:SetHeight(math.max(10, contentH + ADD_AREA))
+        else
+            sec.scroll:SetHeight(math.max(10, sec.viewH - ADD_AREA))
+            sec.child:SetHeight(contentH + 6)
+            AddNewButton(sidebarOuter, sec.top - sec.height + ADD_AREA, sidebarW, label, onClick)
+        end
+        -- Prime the scrollbar's visibility (it otherwise first paints on the
+        -- first wheel/drag).
+        if sec.updateThumb then sec.updateThumb() end
+    end
+
+    local buffSec = MakeSection(fixedY, half, L("BUFF BARS"))
+    local buffChild = buffSec.child
+    -- 2% white wash over the whole Buff Bars half (header + list): visual
+    -- separation from the debuff half below (user call). BACKGROUND
+    -- sublevel 1 sits above the sidebar's own dark bg; tiles render above
+    -- both (their frames level higher). Top edge starts at fixedY + 4 --
+    -- flush against the divider LINE above (SectionDivider draws it 4px
+    -- above the y it returns); bottom edge lands exactly on the
+    -- between-halves divider.
+    do
+        local wash = sidebarOuter:CreateTexture(nil, "BACKGROUND", nil, 1)
+        wash:SetPoint("TOPLEFT", sidebarOuter, "TOPLEFT", 0, fixedY + 4)
+        wash:SetPoint("TOPRIGHT", sidebarOuter, "TOPRIGHT", 0, fixedY + 4)
+        wash:SetHeight(half + 4)
+        wash:SetColorTexture(1, 1, 1, 0.02)
+    end
+    local debuffTop = fixedY - half
+    do
+        local div = sidebarOuter:CreateTexture(nil, "ARTWORK")
+        div:SetHeight(1)
+        div:SetPoint("TOPLEFT", sidebarOuter, "TOPLEFT", 8, debuffTop)
+        div:SetPoint("TOPRIGHT", sidebarOuter, "TOPRIGHT", -8, debuffTop)
+        div:SetColorTexture(1, 1, 1, 0.08)
+    end
+    local debuffSec = MakeSection(debuffTop - 1, visibleH - fixedH - half - 1, L("DEBUFF BARS"))
+    local debuffChild = debuffSec.child
+
+    -- Inherited bar tiles for one section (concrete spec views only):
+    -- read-only rows -- edit them in their group; the pill toggles ONLY
+    -- this spec's enable (ns.PAB_SetInhDisabled). Builds into the given
+    -- section child at y; returns the new y cursor.
+    local function BuildInheritedBarTiles(sectionChild, tileY, isBuff)
+        if not inhGroups then return tileY end
+        for gi = 1, #inhGroups do
+            local gkey = inhGroups[gi]
+            local ginfo = SPEC_GROUP_INFO[gkey]
+            local gname = ginfo and L(ginfo.name) or gkey
+            local gl = (ns.PAB_BucketBars and ns.PAB_BucketBars(isBuff, gkey)) or {}
+            for i = 1, #gl do
+                local bar = gl[i]
+                local disHere = ns.PAB_InhDisabled and ns.PAB_InhDisabled(pabSpecSel, bar.id)
+                local kind = isBuff and "buff" or "debuff"
+                tileY = tileY - BuildTile(sectionChild, tileY, {
+                    width = sidebarW, fontPath = fontPath,
+                    title = L(bar.name or (isBuff and "Buff Bar" or "Debuff Bar")),
+                    subtitle = gname,
+                    inheritedTooltip = EllesmereUI.Lf("Inherited from %1$s. Editable only there.", gname),
+                    selected = (pabInhSel and pabInhSel.kind == kind
+                        and pabInhSel.group == gkey and pabInhSel.id == bar.id) and true or false,
+                    -- Pill = the PER-SPEC enable only; a group-level disable
+                    -- dims the tile instead (the pill must never look dead).
+                    dimmed = bar.enabled == false or nil,
+                    enabled = (not disHere) and true or false,
+                    showToggle = true,
+                    onSelect = function()
+                        pabInhSel = { kind = kind, group = gkey, id = bar.id }
+                        EllesmereUI:RefreshPage(true)
+                    end,
+                    onToggle = function()
+                        if not (ns.PAB_SetInhDisabled and ns.PAB_InhDisabled) then return end
+                        ns.PAB_SetInhDisabled(pabSpecSel, bar.id,
+                            not ns.PAB_InhDisabled(pabSpecSel, bar.id))
+                        Apply(isBuff, bar.id)
+                        EllesmereUI:RefreshPage(true)
+                    end,
+                })
+            end
+        end
+        return tileY
+    end
+
+    -- Buff bars section (top half): fixed "Buffs" default bar first (hidden
+    -- while Use Blizzard Buffs owns the display), then custom bars.
+    do
+        local sidebarChild = buffChild -- section-scoped: this half's scroll child
+        local tileY = 0
 
         -- Name follows the bar's content (see DefaultBuffBarName). Static, not
         -- a refresh client: every toggle that can change it forces a full page
         -- rebuild, which re-runs this.
-        local sPAB = ns.db and ns.db.profile and ns.db.profile.playerAuraBars
+        local sPAB = sPABTop
+        local defBuffCfg = sPAB and ns.PAB_DefaultBuffsCfg and ns.PAB_DefaultBuffsCfg(sPAB) or nil
+        if showDefaults then
         tileY = tileY - BuildTile(sidebarChild, tileY, {
             width = sidebarW, fontPath = fontPath,
-            title = DefaultBuffBarName(sPAB and ns.PAB_DefaultBuffsCfg
-                and ns.PAB_DefaultBuffsCfg(sPAB) or nil),
+            title = DefaultBuffBarName(defBuffCfg),
             subtitle = L("Default"),
-            selected = (pabSel and pabSel.kind == "buff" and pabSel.id == "default"),
-            showToggle = false,
-            onSelect = function() pabSel = { kind = "buff", id = "default" }; EllesmereUI:RefreshPage(true) end,
+            selected = (pabSel and pabSel.kind == "buff" and pabSel.id == "default"
+                and not pabInhSel) and true or false,
+            -- Enable toggle (cfg.enabled, nil = enabled): disables the bar without
+            -- deleting it, custom-bar parity.
+            enabled = not (defBuffCfg and defBuffCfg.enabled == false),
+            showToggle = defBuffCfg ~= nil,
+            onToggle = function(v)
+                if not defBuffCfg then return end
+                if v then defBuffCfg.enabled = nil else defBuffCfg.enabled = false end
+                if ns.PAB_ApplyLiveConfig then ns.PAB_ApplyLiveConfig(true) end
+                -- Re-register so an open unlock session drops/restores the mover.
+                if ns.PAB_RegisterUnlock then ns.PAB_RegisterUnlock() end
+                EllesmereUI:RefreshPage(true)
+            end,
+            onSelect = function() pabSel = { kind = "buff", id = "default" }; pabInhSel = nil; EllesmereUI:RefreshPage(true) end,
         })
+        end
+        tileY = BuildInheritedBarTiles(sidebarChild, tileY, true)
         for i = 1, #buffBars do
             local bar = buffBars[i]
             tileY = tileY - BuildTile(sidebarChild, tileY, {
                 width = sidebarW, fontPath = fontPath,
-                title = bar.name or L("Buff Bar"),
+                title = L(bar.name or "Buff Bar"),
                 subtitleFn = function() return BuildBuffBarSubtitle(bar) end,
-                selected = (pabSel and pabSel.kind == "buff" and pabSel.id == bar.id),
+                selected = (pabSel and pabSel.kind == "buff" and pabSel.id == bar.id
+                    and not pabInhSel) and true or false,
                 enabled = bar.enabled and true or false,
                 showToggle = true,
-                onSelect = function() pabSel = { kind = "buff", id = bar.id }; EllesmereUI:RefreshPage(true) end,
+                onSelect = function() pabSel = { kind = "buff", id = bar.id }; pabInhSel = nil; EllesmereUI:RefreshPage(true) end,
+                -- Right-click: copy this bar into another editing-spec
+                -- bucket (full clone, fresh id; the source stays).
+                onContext = function(tileFrame)
+                    if not EllesmereUI.ShowPickMenu then return end
+                    EllesmereUI.ShowPickMenu(tileFrame, {
+                        title = L("Add To"),
+                        fontPath = fontPath,
+                        items = PabBucketMenuItems(),
+                        onPick = function(key)
+                            local nb = ns.PAB_CopyCustomBar
+                                and ns.PAB_CopyCustomBar(true, bar, key)
+                            if nb then
+                                Apply(true, nb.id)
+                                EllesmereUI:RefreshPage(true)
+                            end
+                        end,
+                    })
+                end,
                 onToggle = function(v)
                     bar.enabled = v and true or false
                     Apply(true, bar.id)
@@ -2501,7 +3594,7 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
                 end,
                 onRename = function()
                     EllesmereUI:ShowInputPopup({
-                        title = L("Rename Bar"), placeholder = bar.name or L("Buff Bar"),
+                        title = L("Rename Bar"), placeholder = L(bar.name or "Buff Bar"),
                         confirmText = L("Rename"), cancelText = L("Cancel"),
                         onConfirm = function(text)
                             if text and text ~= "" then
@@ -2534,39 +3627,71 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
                 end,
             })
         end
-        tileY = tileY - AddNewButton(sidebarChild, tileY, sidebarW, L("Add Buff Bar"), function(self)
+        FinishSection(buffSec, tileY, L("Add Buff Bar"), function(self)
             ShowAddBarPopup(self, "buff", fontPath)
         end)
     end
 
-    -- Debuff bars section: fixed "Debuffs" default bar first, then custom.
+    -- Debuff bars section (bottom half): fixed "Debuffs" default bar first
+    -- (hidden while Use Blizzard Buffs owns the display), then custom.
     do
-        local hdr = sidebarChild:CreateFontString(nil, "OVERLAY")
-        hdr:SetFont(fontPath, 11, "")
-        hdr:SetPoint("TOP", sidebarChild, "TOPLEFT", floor(sidebarW / 2), tileY - 13)
-        hdr:SetText(L("DEBUFF BARS"))
-        hdr:SetTextColor(0.6, 0.6, 0.6)
-        tileY = tileY - 35
+        local sidebarChild = debuffChild -- section-scoped: this half's scroll child
+        local tileY = 0
 
+        local sPAB2 = sPABTop
+        local defDebuffCfg = sPAB2 and ns.PAB_DefaultDebuffsCfg and ns.PAB_DefaultDebuffsCfg(sPAB2) or nil
+        if showDefaults then
         tileY = tileY - BuildTile(sidebarChild, tileY, {
             width = sidebarW, fontPath = fontPath,
             title = L("Debuffs"),
             subtitle = L("Default"),
-            selected = (pabSel and pabSel.kind == "debuff" and pabSel.id == "default"),
-            showToggle = false,
-            onSelect = function() pabSel = { kind = "debuff", id = "default" }; EllesmereUI:RefreshPage(true) end,
+            selected = (pabSel and pabSel.kind == "debuff" and pabSel.id == "default"
+                and not pabInhSel) and true or false,
+            -- Enable toggle (cfg.enabled, nil = enabled): custom-bar parity.
+            enabled = not (defDebuffCfg and defDebuffCfg.enabled == false),
+            showToggle = defDebuffCfg ~= nil,
+            onToggle = function(v)
+                if not defDebuffCfg then return end
+                if v then defDebuffCfg.enabled = nil else defDebuffCfg.enabled = false end
+                if ns.PAB_ApplyLiveConfig then ns.PAB_ApplyLiveConfig(false) end
+                -- Re-register so an open unlock session drops/restores the mover.
+                if ns.PAB_RegisterUnlock then ns.PAB_RegisterUnlock() end
+                EllesmereUI:RefreshPage(true)
+            end,
+            onSelect = function() pabSel = { kind = "debuff", id = "default" }; pabInhSel = nil; EllesmereUI:RefreshPage(true) end,
         })
+        end
 
+        tileY = BuildInheritedBarTiles(sidebarChild, tileY, false)
         for i = 1, #debuffBars do
             local bar = debuffBars[i]
             tileY = tileY - BuildTile(sidebarChild, tileY, {
                 width = sidebarW, fontPath = fontPath,
-                title = bar.name or L("Debuff Bar"),
+                title = L(bar.name or "Debuff Bar"),
                 subtitleFn = function() return BuildDebuffBarSubtitle(bar) end,
-                selected = (pabSel and pabSel.kind == "debuff" and pabSel.id == bar.id),
+                selected = (pabSel and pabSel.kind == "debuff" and pabSel.id == bar.id
+                    and not pabInhSel) and true or false,
                 enabled = bar.enabled and true or false,
                 showToggle = true,
-                onSelect = function() pabSel = { kind = "debuff", id = bar.id }; EllesmereUI:RefreshPage(true) end,
+                onSelect = function() pabSel = { kind = "debuff", id = bar.id }; pabInhSel = nil; EllesmereUI:RefreshPage(true) end,
+                -- Right-click: copy this bar into another editing-spec
+                -- bucket (full clone, fresh id; the source stays).
+                onContext = function(tileFrame)
+                    if not EllesmereUI.ShowPickMenu then return end
+                    EllesmereUI.ShowPickMenu(tileFrame, {
+                        title = L("Add To"),
+                        fontPath = fontPath,
+                        items = PabBucketMenuItems(),
+                        onPick = function(key)
+                            local nb = ns.PAB_CopyCustomBar
+                                and ns.PAB_CopyCustomBar(false, bar, key)
+                            if nb then
+                                Apply(false, nb.id)
+                                EllesmereUI:RefreshPage(true)
+                            end
+                        end,
+                    })
+                end,
                 onToggle = function(v)
                     bar.enabled = v and true or false
                     Apply(false, bar.id)
@@ -2574,7 +3699,7 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
                 end,
                 onRename = function()
                     EllesmereUI:ShowInputPopup({
-                        title = L("Rename Bar"), placeholder = bar.name or L("Debuff Bar"),
+                        title = L("Rename Bar"), placeholder = L(bar.name or "Debuff Bar"),
                         confirmText = L("Rename"), cancelText = L("Cancel"),
                         onConfirm = function(text)
                             if text and text ~= "" then
@@ -2607,19 +3732,62 @@ function ns.PABMP_BuildPage(pageName, parent, yOffset)
                 end,
             })
         end
-        tileY = tileY - AddNewButton(sidebarChild, tileY, sidebarW, L("Add Debuff Bar"), function(self)
+        FinishSection(debuffSec, tileY, L("Add Debuff Bar"), function(self)
             ShowAddBarPopup(self, "debuff", fontPath)
         end)
     end
-
-    sidebarChild:SetHeight(max(10, math.abs(tileY)))
 
     local detail = CreateFrame("Frame", nil, root)
     detail:SetPoint("TOPLEFT", root, "TOPLEFT", 0, 0)
     detail:SetSize(leftW, visibleH)
     detail:SetFrameLevel(root:GetFrameLevel() + 1)
 
-    if pabSel then
+    if pabInhSel and pabInhBar then
+        -- Read-only pane for an INHERITED group bar: where it lives, a jump
+        -- link to the owning group, and a pointer at the tile toggle for the
+        -- per-spec enable. No settings render -- edits belong to the group.
+        local ginfo = SPEC_GROUP_INFO[pabInhSel.group]
+        local gname = ginfo and L(ginfo.name) or pabInhSel.group
+        local title = detail:CreateFontString(nil, "OVERLAY")
+        title:SetFont(fontPath, 18, "")
+        title:SetPoint("TOPLEFT", detail, "TOPLEFT", 25, -25)
+        title:SetTextColor(0.55, 0.72, 1)
+        title:SetText(pabInhBar.name
+            or (pabInhSel.kind == "buff" and L("Buff Bar") or L("Debuff Bar")))
+        local sub = detail:CreateFontString(nil, "OVERLAY")
+        sub:SetFont(fontPath, 13, "")
+        sub:SetPoint("LEFT", title, "RIGHT", 6, 0)
+        sub:SetTextColor(0.75, 0.75, 0.75, 0.65)
+        sub:SetText("(" .. EllesmereUI.Lf("Inherited from %1$s", gname) .. ")")
+        local info = detail:CreateFontString(nil, "OVERLAY")
+        info:SetFont(fontPath, 12, "")
+        info:SetPoint("TOPLEFT", detail, "TOPLEFT", 25, -58)
+        info:SetPoint("RIGHT", detail, "RIGHT", -35, 0)
+        info:SetJustifyH("LEFT")
+        info:SetWordWrap(true)
+        info:SetText(EllesmereUI.Lf("Inherited from %1$s. Edit it there, or use the tile toggle to enable or disable it for this spec.", gname))
+        info:SetTextColor(0.65, 0.65, 0.65)
+        local link = CreateFrame("Button", nil, detail)
+        link:SetPoint("TOPLEFT", detail, "TOPLEFT", 25, -108)
+        link:SetFrameLevel(detail:GetFrameLevel() + 2)
+        local linkFS = link:CreateFontString(nil, "OVERLAY")
+        linkFS:SetFont(fontPath, 12, "")
+        linkFS:SetPoint("TOPLEFT")
+        linkFS:SetText(EllesmereUI.Lf("Edit in %1$s", gname))
+        local lac = EllesmereUI.ELLESMERE_GREEN
+        if lac then linkFS:SetTextColor(lac.r, lac.g, lac.b, 0.85)
+        else linkFS:SetTextColor(0.05, 0.82, 0.62, 0.85) end
+        link:SetSize(linkFS:GetStringWidth() + 4, 18)
+        link:SetScript("OnEnter", function() linkFS:SetAlpha(1) end)
+        link:SetScript("OnLeave", function() linkFS:SetAlpha(0.85) end)
+        local jumpKind, jumpGroup, jumpId = pabInhSel.kind, pabInhSel.group, pabInhSel.id
+        link:SetScript("OnClick", function()
+            pabSpecSel = jumpGroup
+            pabSel = { kind = jumpKind, id = jumpId }
+            pabInhSel = nil
+            EllesmereUI:RefreshPage(true)
+        end)
+    elseif pabSel then
         if pabSel.id == "default" then
             BuildDefaultBarDetail(detail, fontPath, pabSel.kind == "buff")
         elseif pabSel.kind == "buff" then

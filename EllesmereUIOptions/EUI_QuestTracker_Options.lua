@@ -107,47 +107,46 @@ initFrame:SetScript("OnEvent", function(self)
             y = y - 68
         end
 
+        -- Stock styles (Blizzard Style / Classic WoW UI) keep Blizzard's own
+        -- tracker art, text and quest icons: the background, font and colour
+        -- rows only apply to the EllesmereUI look.
+        local BS = EllesmereUI.BlizzStyle
+        local STOCK = BS and BS.Get("questtracker")
+
         -- -- DISPLAY ---------------------------------------------------------
         _, h = W:SectionHeader(parent, "DISPLAY", y); y = y - h
+        if BS then y = BS.Note(parent, y, "questtracker") end
 
-        -- Row 1: Visibility | Visibility Options
-        local visRow
-        visRow, h = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
+        -- Row 1: Visibility | Hide When In Raid. The raid-hide dropdown moved up from
+        -- the Background Opacity row into the slot the old Visibility Options dropdown
+        -- left behind: it answers the same question the Visibility control does.
+        _, h = EllesmereUI.BuildVisibilityRow(W, parent, y,
             { getStore = DB, legacyKey = "visibility",
               caps = { partyIncludesRaid = false, luaDragonriding = true },
-              onChanged = function() RefreshAll() end },
-            { type="dropdown", text="Visibility Options",
-              values={ __placeholder = "..." }, order={ "__placeholder" },
-              getValue=function() return "__placeholder" end,
-              setValue=function() end })
-        if not EllesmereUI._prebuilding then
-            local rightRgn = visRow._rightRegion
-            if rightRgn._control then rightRgn._control:Hide() end
-            local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
-                rightRgn, 210, rightRgn:GetFrameLevel() + 2,
-                EllesmereUI.VIS_OPT_ITEMS,
-                function(k) return Cfg(k) or false end,
-                function(k, v) Set(k, v); RefreshAll() end)
-            PP.Point(cbDD, "RIGHT", rightRgn, "RIGHT", -20, 0)
-            rightRgn._control = cbDD
-            rightRgn._lastInline = nil
-            EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
-        end
-        y = y - h
-
-        -- Row 2: Background Opacity (slider + inline color swatch) | Hide when in Raid
-        local bgRow
-        bgRow, h = W:DualRow(parent, y,
-            { type="slider", text="Background Opacity",
-              min = 0, max = 1, step = 0.05,
-              getValue=function() return Cfg("bgAlpha") or 0.5 end,
-              setValue=function(v) Set("bgAlpha", v); if EQT.ApplyBackground then EQT.ApplyBackground() end end },
+              onChanged = function() RefreshAll() end,
+              onOptionChanged = function() RefreshAll() end },
             { type="dropdown", text="Hide When In Raid",
               tooltip="Always: hide the tracker the whole time you are in a raid.\nBoss Combat: keep it visible and only hide during boss encounters.",
               values = { always = "Always", boss = "Boss Combat" },
               order  = { "always", "boss" },
               getValue=function() return Cfg("hideInRaidMode") or "boss" end,
               setValue=function(v) Set("hideInRaidMode", v); if EQT.UpdateVisibility then EQT.UpdateVisibility() end end })
+        y = y - h
+
+        if not STOCK then
+        -- Row 2: Background Opacity (slider + inline color swatch) | Show Top Line.
+        -- Show Top Line moved up from the old trailing half-row to close the gap left
+        -- by Hide When In Raid; both settings describe the tracker's background chrome.
+        local bgRow
+        bgRow, h = W:DualRow(parent, y,
+            { type="slider", text="Background Opacity",
+              min = 0, max = 1, step = 0.05,
+              getValue=function() return Cfg("bgAlpha") or 0.5 end,
+              setValue=function(v) Set("bgAlpha", v); if EQT.ApplyBackground then EQT.ApplyBackground() end end },
+            { type="toggle", text="Show Top Line",
+              tooltip="Draws a 1px accent line above the background at the top of the tracker.",
+              getValue=function() return Cfg("showTopLine") ~= false end,
+              setValue=function(v) Set("showTopLine", v); if EQT.ApplyBackground then EQT.ApplyBackground() end end })
         if not EllesmereUI._prebuilding then
             local rgn = bgRow._leftRegion
             local ctrl = rgn._control
@@ -197,15 +196,16 @@ initFrame:SetScript("OnEvent", function(self)
                           message     = "Font changed. A UI reload is needed to apply the new font.",
                           confirmText = "Reload Now",
                           cancelText  = "Later",
-                          onConfirm   = function() ReloadUI() end,
+                          reload      = true,
                       })
                   end })
         end
         y = y - h
+        end -- not STOCK
 
-        -- Row 4: Show Quest Icons | Hide All Objectives
-        _, h = W:DualRow(parent, y,
-            { type="toggle", text="Show Quest Icons",
+        -- Row 4: Show Quest Icons | Hide All Objectives. Both stock styles show
+        -- Blizzard's native icons, so the toggle is gated there.
+        local questIconsCfg = { type="toggle", text="Show Quest Icons",
               tooltip="Show Blizzard's native quest type icons/buttons on the right instead of EllesmereUI's custom icons. Requires a UI reload.",
               getValue=function() return Cfg("showQuestIcons") or false end,
               setValue=function(v)
@@ -215,12 +215,22 @@ initFrame:SetScript("OnEvent", function(self)
                       message     = "Changing quest icons requires a UI reload to apply.",
                       confirmText = "Reload Now",
                       cancelText  = "Later",
-                      onConfirm   = function() ReloadUI() end,
+                      reload      = true,
                   })
-              end },
+              end }
+        if BS then BS.Gate("questtracker", questIconsCfg) end
+        _, h = W:DualRow(parent, y,
+            questIconsCfg,
             { type="toggle", text="Hide All Objectives",
-              tooltip="Hides the master header and its minimize button at the top of the tracker. When shown, it's skinned to match the section headers below it (Quests, Achievements, ...).",
-              getValue=function() return Cfg("hideAllObjectivesHeader") ~= false end,
+              tooltip = STOCK
+                  and "Hides the master header and its minimize button at the top of the tracker."
+                  or "Hides the master header and its minimize button at the top of the tracker. When shown, it's skinned to match the section headers below it (Quests, Achievements, ...).",
+              -- The module's own rule, so the per-style default (hidden under
+              -- the EllesmereUI look, shown under the stock styles) reads true.
+              getValue=function()
+                  if EQT.ShouldHideMasterHeader then return EQT.ShouldHideMasterHeader() end
+                  return Cfg("hideAllObjectivesHeader") ~= false
+              end,
               setValue=function(v)
                   Set("hideAllObjectivesHeader", v)
                   if EQT.ApplyMasterHeaderVisibility then EQT.ApplyMasterHeaderVisibility() end
@@ -228,15 +238,7 @@ initFrame:SetScript("OnEvent", function(self)
               end })
         y = y - h
 
-        -- Row 5: Show Top Line| spacer
-        _, h = W:DualRow(parent, y,
-            { type="toggle", text="Show Top Line",
-              tooltip="Draws a 1px accent line above the background at the top of the tracker.",
-              getValue=function() return Cfg("showTopLine") ~= false end,
-              setValue=function(v) Set("showTopLine", v); if EQT.ApplyBackground then EQT.ApplyBackground() end end },
-            { type="spacer" })
-        y = y - h
-
+        if not STOCK then
         -- -- COLORS ----------------------------------------------------------
         _, h = W:SectionHeader(parent, "COLORS", y); y = y - h
 
@@ -372,6 +374,7 @@ initFrame:SetScript("OnEvent", function(self)
         y = y - h
 
         y = y - 10
+        end -- not STOCK
 
         -- -- EXTRAS ----------------------------------------------------------
         _, h = W:SectionHeader(parent, "EXTRAS", y); y = y - h

@@ -21,6 +21,9 @@ local floor        = math.floor
 local max          = math.max
 local CreateFrame  = CreateFrame
 local InCombatLockdown = InCombatLockdown
+local IsInGroup        = IsInGroup
+local IsInRaid         = IsInRaid
+local IsInInstance     = IsInInstance
 local IsShiftKeyDown   = IsShiftKeyDown
 local IsControlKeyDown = IsControlKeyDown
 local IsAltKeyDown     = IsAltKeyDown
@@ -60,31 +63,58 @@ local ACTION_ICONS = {
     external = 135966,  -- Blessing of Sacrifice icon
 }
 
--- Dispel spells by class (friendly dispels only)
+-- Dispel spells by class (friendly dispels only). One entry per spec that has a
+-- distinct spell; ClassPresetSpells drops the ones this character has not got
+-- before they reach the macro.
 local DISPEL_SPELLS = {
-    { id = 240166, name = "Purify",        class = "PRIEST" },
-    { id = 218164, name = "Detox",         class = "MONK" },
+    { id = 527,    name = "Purify",        class = "PRIEST" },  -- Disc & Holy
+    { id = 213634, name = "Purify Disease", class = "PRIEST" }, -- Shadow
+    { id = 115450, name = "Detox",         class = "MONK" },  -- Mistweaver
+    { id = 218164, name = "Detox",         class = "MONK" },  -- Brewmaster & Windwalker
     { id = 4987,   name = "Cleanse",       class = "PALADIN" },  -- Holy
     { id = 213644, name = "Cleanse Toxins", class = "PALADIN" }, -- Prot & Ret (Cleanse is Holy-only)
     { id = 88423,  name = "Nature's Cure", class = "DRUID" },  -- Resto
     { id = 2782,   name = "Remove Corruption", class = "DRUID" }, -- Guardian, Feral & Balance
-    { id = 254420, name = "Purify Spirit", class = "SHAMAN" },  -- Resto
+    { id = 77130,  name = "Purify Spirit", class = "SHAMAN" },  -- Resto
     { id = 51886,  name = "Cleanse Spirit", class = "SHAMAN" }, -- Ele & Enh
     { id = 360823, name = "Naturalize",    class = "EVOKER" },  -- Pres
     { id = 365585, name = "Expunge",       class = "EVOKER" },  -- Aug & Dev
-    { id = 89808,  name = "Singe Magic",   class = "WARLOCK" }, -- Warlock
+    { id = 89808,  name = "Singe Magic",   class = "WARLOCK", pet = true }, -- Imp
     { id = 475,    name = "Remove Curse",  class = "MAGE" },  -- All specs (Curse only)
 }
 
 -- External defensive spells by class
 local EXTERNAL_SPELLS = {
-    { id = 33206,  name = "Pain Suppression",      class = "PRIEST" },
-    { id = 255312, name = "Guardian Spirit",        class = "PRIEST" },
-    { id = 102342, name = "Ironbark",              class = "DRUID" },
+    { id = 33206,  name = "Pain Suppression",      class = "PRIEST" },  -- Disc
+    { id = 47788,  name = "Guardian Spirit",        class = "PRIEST" },  -- Holy
+    { id = 102342, name = "Ironbark",              class = "DRUID" },  -- Resto
     { id = 6940,   name = "Blessing of Sacrifice",  class = "PALADIN" },
-    { id = 357170, name = "Time Dilation",          class = "EVOKER" },
-    { id = 343744, name = "Life Cocoon",            class = "MONK" },
+    { id = 357170, name = "Time Dilation",          class = "EVOKER" },  -- Pres
+    { id = 116849, name = "Life Cocoon",            class = "MONK" },  -- Mistweaver
 }
+
+-- This class's preset entries, narrowed to what the character can cast. A /cast
+-- line naming a spell they have not got matches its condition and then casts
+-- nothing, eating the fallback the next line was there to be, so an unavailable
+-- entry has to be dropped rather than ordered last. Empty falls back to the
+-- unfiltered list: the book can lag the first apply at login, so "nothing
+-- available" is as likely stale as true, and an all-unknown list shadows
+-- nothing anyway. Singe Magic is exempt -- the pet book holds only the
+-- summoned demon's spells.
+local function ClassPresetSpells(spellList, class)
+    local bank = Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+    local canCheck = C_SpellBook.IsSpellInSpellBook and bank
+    local usable, all = {}, {}
+    for _, sp in ipairs(spellList) do
+        if sp.class == class then
+            all[#all + 1] = sp
+            if sp.pet or not canCheck or C_SpellBook.IsSpellInSpellBook(sp.id, bank, true) then
+                usable[#usable + 1] = sp
+            end
+        end
+    end
+    return #usable > 0 and usable or all
+end
 
 -- Resurrection spells by class: single (ooc), group (ooc), battle (combat)
 local REZ_BY_CLASS = {
@@ -168,6 +198,7 @@ local originalTargetAttrs = setmetatable({}, { __mode = "k" })
 local regQueue         = {}
 local unregQueue       = {}
 local pendingApply     = false
+local lastRosterCtx    = nil  -- content gate: last context a roster update saw
 local ccInitialized    = false
 local ccEventFrame     = nil
 local lastBindingCount = 0
@@ -236,24 +267,285 @@ local function GetGlobalBindings()
     return cc and cc.globals or {}
 end
 
--- Merges globals + current spec (spec wins key conflicts); only enabled
--- bindings; gated on the master enable toggle.
-local function GetActiveBindings()
-    local cc = GetClickCastDB()
-    if not cc or not cc.enabled then return {} end
-    local result, usedKeys = {}, {}
-    for _, b in ipairs(GetSpecBindings()) do
-        if b.enabled ~= false and b.key then
-            result[#result + 1] = b
-            usedKeys[b.key] = true
-        end
+-- Content gate. binding.groupCtx is the set of contexts a binding is active in.
+-- In a context that is switched off the binding is never applied so the key falls
+-- through to whatever the player normally has bound.
+local CC_CTX_ORDER = { "solo", "party", "raid", "pvp" }
+
+local function CtxEnabled(binding, ctx)
+    local set = binding.groupCtx
+    if not set then return true end
+    return set[ctx] == true
+end
+
+-- The context the player is in right now.
+local function CurrentCtx()
+    local _, instType = IsInInstance()
+    if instType == "pvp" or instType == "arena" then return "pvp" end
+    if IsInRaid() then return "raid" end
+    if IsInGroup() then return "party" end
+    return "solo"
+end
+
+-- True when a binding's content gate matches the context the player is in now.
+local function MatchesGroupCtx(binding)
+    return CtxEnabled(binding, CurrentCtx())
+end
+
+-- Hovercast mode. binding.hovercast is:
+--   false / nil -> frame clicks only (attributes live on the unit frames)
+--   true        -> the global @mouseover override button only
+--   "both"      -> applied through BOTH paths
+local function IsHoverBinding(binding)
+    return binding.hovercast and true or false
+end
+local function IsFrameBinding(binding)
+    return (not binding.hovercast) or binding.hovercast == "both"
+end
+
+function ns.CC_GetBindingUnitType(binding)
+    local friendly, enemy = binding.hoverFriendly, binding.hoverEnemy
+    if friendly == false and enemy == false then return "none" end
+    -- The Friendly checkbox is default-on in the UI, so an omitted value is
+    -- friendly unless Enemy is explicitly enabled as well. Enemy is opt-in.
+    friendly = friendly ~= false
+    enemy = enemy == true
+    if friendly and not enemy then return "friendly" end
+    if enemy and not friendly then return "harmful" end
+    return "both"
+end
+
+-- Two spell bindings may share a key when their existing Friendly/Enemy
+-- checkboxes select opposite reactions. Combine those branches into one macro.
+local function IsReactionBinding(binding)
+    return binding and (binding.type == "spell" or binding.type == "item"
+        or (binding.type == "macro" and binding.hovercast))
+end
+
+local function IsBindingActive(binding)
+    return binding.enabled ~= false
+        and (not IsReactionBinding(binding) or ns.CC_GetBindingUnitType(binding) ~= "none")
+end
+
+-- A spell binding the character cannot cast right now (the other options of a
+-- choice node, a talent swapped out, a loadout without it) stays saved -- the
+-- next loadout may bring it back -- but it cannot own a key against a spell
+-- they do have, raises no conflict warning, and its tile dims. Pet-book spells
+-- read as unknown from the player book, so the preset pet spells are exempt,
+-- and a binding with no stored id cannot be judged, so it counts as known.
+local PET_SPELL_IDS = {}
+for _, sp in ipairs(DISPEL_SPELLS) do
+    if sp.pet then PET_SPELL_IDS[sp.id] = true end
+end
+
+local function IsSpellIDKnown(id)
+    if type(id) ~= "number" or id <= 0 or PET_SPELL_IDS[id] then return true end
+    local bank = Enum.SpellBookSpellBank and Enum.SpellBookSpellBank.Player
+    if not (C_SpellBook.IsSpellInSpellBook and bank) then return true end
+    if C_SpellBook.IsSpellInSpellBook(id, bank, true) then return true end
+    -- The saved id may be an override of a base spell the book lists instead.
+    local baseId = C_Spell.GetBaseSpell and C_Spell.GetBaseSpell(id)
+    if type(baseId) == "number" and baseId > 0 and baseId ~= id then
+        return C_SpellBook.IsSpellInSpellBook(baseId, bank, true) and true or false
     end
-    for _, b in ipairs(cc.globals) do
-        if b.enabled ~= false and b.key and not usedKeys[b.key] then
-            result[#result + 1] = b
+    return false
+end
+
+local function IsBindingKnown(binding)
+    if not binding then return false end
+    if binding.type == "spell" then
+        if IsSpellIDKnown(binding.spellID) then return true end
+        return binding.harmfulSpellID ~= nil and IsSpellIDKnown(binding.harmfulSpellID)
+    elseif binding.type == "reaction" then
+        return IsBindingKnown(binding.friendlyAction) or IsBindingKnown(binding.harmfulAction)
+    end
+    return true
+end
+
+function ns.CC_AreComplementaryReactionBindings(a, b)
+    if not IsReactionBinding(a) or not IsReactionBinding(b)
+        or a.key ~= b.key or a.harmfulSpell or b.harmfulSpell then return false end
+    if not ((a.type == "spell" and (b.type == "spell" or b.type == "item"))
+        or (a.type == "item" and b.type == "spell")) then return false end
+    if not ((IsFrameBinding(a) and IsFrameBinding(b))
+        or (IsHoverBinding(a) and IsHoverBinding(b)))
+        or (a.oocOnly or false) ~= (b.oocOnly or false) then return false end
+    local aReaction, bReaction = ns.CC_GetBindingUnitType(a), ns.CC_GetBindingUnitType(b)
+    return (aReaction == "friendly" and bReaction == "harmful")
+        or (aReaction == "harmful" and bReaction == "friendly")
+end
+
+function ns.CC_AreComplementarySpellBindings(a, b)
+    if not a or not b or a.type ~= "spell" or b.type ~= "spell" then return false end
+    return ns.CC_AreComplementaryReactionBindings(a, b)
+end
+
+function ns.CC_MergeComplementarySpellBindings(bindings)
+    local result = {}
+    for _, binding in ipairs(bindings) do
+        local merged = false
+        for i, previous in ipairs(result) do
+            if ns.CC_AreComplementarySpellBindings(previous, binding) then
+                local friendly = ns.CC_GetBindingUnitType(previous) == "friendly" and previous or binding
+                local harmful = friendly == previous and binding or previous
+                local combined = {}
+                for key, value in pairs(friendly) do combined[key] = value end
+                combined.harmfulSpell = harmful.spell
+                combined.harmfulSpellID = harmful.spellID
+                combined.harmfulIcon = harmful.icon
+                combined.hoverFriendly = true
+                combined.hoverEnemy = true
+                combined.smartRez = friendly.smartRez or harmful.smartRez
+                result[i] = combined
+                merged = true
+                break
+            end
+        end
+        if not merged then result[#result + 1] = binding end
+    end
+    return result
+end
+
+-- A spell and an equipped item can safely share a complementary reaction key by
+-- becoming one macro. Custom macro bodies remain separate because their actions
+-- cannot be safely nested behind a reaction conditional.
+function ns.CC_MergeComplementaryItemSpellBindings(bindings)
+    local result = {}
+    for _, binding in ipairs(bindings) do
+        local merged = false
+        for i, previous in ipairs(result) do
+            if ns.CC_AreComplementaryReactionBindings(previous, binding)
+                and previous.type ~= binding.type then
+                local friendly = ns.CC_GetBindingUnitType(previous) == "friendly" and previous or binding
+                local harmful = friendly == previous and binding or previous
+                local spell = friendly.type == "spell" and friendly or harmful
+                result[i] = {
+                    type = "reaction",
+                    key = friendly.key,
+                    hovercast = friendly.hovercast,
+                    oocOnly = friendly.oocOnly,
+                    friendlyAction = friendly,
+                    harmfulAction = harmful,
+                    smartRez = friendly.smartRez or harmful.smartRez,
+                    spell = spell.spell,
+                    spellID = spell.spellID,
+                }
+                merged = true
+                break
+            end
+        end
+        if not merged then result[#result + 1] = binding end
+    end
+    return result
+end
+
+-- A binding configured for both dispatch paths must participate in each path's
+-- merge/conflict resolution separately. This is only a runtime projection: the
+-- saved binding remains a single entry in the editor.
+local function ExpandBothPathBindings(bindings)
+    local result = {}
+    for _, binding in ipairs(bindings) do
+        if binding.hovercast == "both" then
+            local frameBinding, hoverBinding = {}, {}
+            for key, value in pairs(binding) do
+                frameBinding[key] = value
+                hoverBinding[key] = value
+            end
+            frameBinding.hovercast = false
+            hoverBinding.hovercast = true
+            result[#result + 1] = frameBinding
+            result[#result + 1] = hoverBinding
+        else
+            result[#result + 1] = binding
         end
     end
     return result
+end
+
+-- A warning may remain for two same-reaction bindings, but only one secure
+-- action can own a key. Mergeable opposite-reaction spell/item pairs have
+-- already become one macro; any remaining same-key action would overwrite the
+-- secure attribute, so keep the first resolved action so a later conflict
+-- cannot overwrite a valid complementary spell pair. The one exception: a
+-- spell the character has not got casts nothing, so a same-key action they do
+-- have takes the key off it.
+function ns.CC_FilterConflictingBindings(bindings)
+    local result = {}
+    for _, binding in ipairs(bindings) do
+        local conflicts = false
+        for i, previous in ipairs(result) do
+            if binding.key == previous.key
+                and ((IsFrameBinding(binding) and IsFrameBinding(previous))
+                    or (IsHoverBinding(binding) and IsHoverBinding(previous))) then
+                conflicts = true
+                if not IsBindingKnown(previous) and IsBindingKnown(binding) then
+                    result[i] = binding
+                end
+                break
+            end
+        end
+        if not conflicts then result[#result + 1] = binding end
+    end
+    return result
+end
+
+-- Merges globals + current spec (spec wins key conflicts, unless the spec
+-- spell is one the character has not got: the global then competes for the key
+-- and the conflict filter hands it over); only enabled bindings; gated on the
+-- master enable toggle.
+local function GetActiveBindings()
+    local cc = GetClickCastDB()
+    if not cc or not cc.enabled then return {} end
+    local result, usedKeys, specBindings = {}, {}, {}
+    for _, b in ipairs(GetSpecBindings()) do
+        if IsBindingActive(b) and b.key and MatchesGroupCtx(b) then
+            result[#result + 1] = b
+            specBindings[#specBindings + 1] = b
+            if IsBindingKnown(b) then usedKeys[b.key] = true end
+        end
+    end
+    for _, b in ipairs(cc.globals) do
+        local keepGlobal = not usedKeys[b.key]
+        if not keepGlobal then
+            for _, specBinding in ipairs(specBindings) do
+                if ns.CC_AreComplementaryReactionBindings(specBinding, b) then
+                    keepGlobal = true
+                    break
+                end
+            end
+        end
+        if IsBindingActive(b) and b.key and keepGlobal and MatchesGroupCtx(b) then
+            result[#result + 1] = b
+        end
+    end
+    result = ExpandBothPathBindings(result)
+    result = ns.CC_MergeComplementarySpellBindings(result)
+    result = ns.CC_MergeComplementaryItemSpellBindings(result)
+    return ns.CC_FilterConflictingBindings(result)
+end
+
+-- Talent and loadout swaps change which saved spells the character has got,
+-- and SPELLS_CHANGED is their edge (it also fires on every zone-in and spell
+-- learn). Only the known/unknown pattern of the enabled spell bindings decides
+-- a key, so an event that leaves the pattern as applied re-applies nothing,
+-- and the event is listened for only while an enabled spell binding exists.
+local knownSig = ""
+local sigParts = {}
+local function ComputeKnownSignature()
+    local cc = GetClickCastDB()
+    if not cc or not cc.enabled then return "" end
+    wipe(sigParts)
+    for _, b in ipairs(GetSpecBindings()) do
+        if b.type == "spell" and b.key and IsBindingActive(b) then
+            sigParts[#sigParts + 1] = IsBindingKnown(b) and "1" or "0"
+        end
+    end
+    for _, b in ipairs(cc.globals) do
+        if b.type == "spell" and b.key and IsBindingActive(b) then
+            sigParts[#sigParts + 1] = IsBindingKnown(b) and "1" or "0"
+        end
+    end
+    return table.concat(sigParts)
 end
 
 -------------------------------------------------------------------------------
@@ -373,10 +665,51 @@ local function ResolveCastSpellName(binding)
     return binding.spell
 end
 
+local function ResolveHarmfulSpellName(binding)
+    local id = binding.harmfulSpellID
+    if type(id) == "number" and id > 0 and C_Spell and C_Spell.GetBaseSpell then
+        local baseId = C_Spell.GetBaseSpell(id)
+        if type(baseId) == "number" and baseId > 0 and baseId ~= id then
+            local name = C_Spell.GetSpellName and C_Spell.GetSpellName(baseId)
+            if name then return name end
+        end
+    end
+    return binding.harmfulSpell
+end
+
+local function BuildReactionMacroText(binding, guard)
+    local lines = {}
+    local function AddAction(part, reaction)
+        if part.type == "spell" then
+            local name = ResolveCastSpellName(part)
+            if not name then return end
+            local conds = { "@mouseover", reaction }
+            if not IsRezSpellBinding(part) then
+                conds[#conds + 1] = "exists"
+                conds[#conds + 1] = "nodead"
+            end
+            if binding.oocOnly then conds[#conds + 1] = "nocombat" end
+            lines[#lines + 1] = "/cast [" .. table.concat(conds, ",") .. guard .. "] " .. name
+        elseif part.type == "item" then
+            local target = part.itemSlot or part.itemName
+            if not target then return end
+            local conds = { "@mouseover", reaction, "exists", "nodead" }
+            if binding.oocOnly then conds[#conds + 1] = "nocombat" end
+            lines[#lines + 1] = "/use [" .. table.concat(conds, ",") .. guard .. "] " .. target
+        end
+    end
+    AddAction(binding.friendlyAction, "help")
+    AddAction(binding.harmfulAction, "harm")
+    if #lines == 0 then return nil end
+    return table.concat(lines, "\n")
+end
+
 -- Builds dynamic-rez /cast lines (used by the dynamicrez binding type + Smart
 -- Rez). Returns a list of macro lines (possibly empty) or nil if the class has
 -- no rez kit. Never includes /stopmacro -- caller adds that for oocOnly.
-local function BuildRezLines(binding, guard)
+-- standalone marks the dedicated rez binding, where these lines are the whole
+-- macro rather than a [dead] prefix in front of somebody else's action.
+local function BuildRezLines(binding, guard, standalone)
     local _, pClass = UnitClass("player")
     local kit = REZ_BY_CLASS[pClass]
     if not kit then return nil end
@@ -392,13 +725,33 @@ local function BuildRezLines(binding, guard)
     local groupName  = Known(kit.group)
     local singleName = Known(kit.single)
     local lines = {}
-    if battleName and not binding.oocOnly then
-        lines[#lines + 1] = "/cast [@mouseover,help,dead,combat" .. guard .. "] " .. battleName
+    -- [combat] only when there is an out-of-combat rez after it to be the answer
+    -- instead. A death knight or a warlock, whose only rez IS the battle one,
+    -- would otherwise cast nothing out of combat -- where that spell works
+    -- perfectly well, so theirs takes oocOnly's [nocombat] rather than dropping.
+    -- That conditional has to live on the line: Smart Rez prepends these ahead of
+    -- the base macro, and so ahead of its /stopmacro [combat].
+    local hasOOCRez = groupName or singleName
+    if battleName and not (hasOOCRez and binding.oocOnly) then
+        local combatCond = ""
+        if hasOOCRez then
+            combatCond = ",combat"
+        elseif binding.oocOnly then
+            combatCond = ",nocombat"
+        end
+        lines[#lines + 1] = "/cast [@mouseover,help,dead" .. combatCond .. guard .. "] " .. battleName
     end
     if groupName then
         lines[#lines + 1] = "/cast [@mouseover,help,dead,nocombat" .. guard .. "] " .. groupName
     elseif singleName then
         lines[#lines + 1] = "/cast [@mouseover,help,dead,nocombat" .. guard .. "] " .. singleName
+    end
+    -- Soulstone also pre-buffs a LIVING ally, which the [dead] lines above can
+    -- never reach. Standalone only: Smart Rez prepends these lines to another
+    -- action and depends on all of them failing on a living unit.
+    if standalone and pClass == "WARLOCK" and battleName then
+        local oocCond = binding.oocOnly and ",nocombat" or ""
+        lines[#lines + 1] = "/cast [@mouseover,help,exists,nodead" .. oocCond .. guard .. "] " .. battleName
     end
     return lines
 end
@@ -409,17 +762,40 @@ local function BuildBaseMacroText(binding)
     local isHC = binding.hovercast
     local guard = isHC and MOUNT_GUARD or ""
 
-    if binding.type == "spell" then
+    if binding.type == "reaction" then
+        return BuildReactionMacroText(binding, guard)
+    elseif binding.type == "spell" then
         local name = ResolveCastSpellName(binding)
         if not name then return nil end
         local isRez = IsRezSpellBinding(binding)
+        local unitType = ns.CC_GetBindingUnitType(binding)
         local conds = { "@mouseover" }
-        if isHC then
-            if binding.hoverFriendly and not binding.hoverEnemy then
-                conds[#conds + 1] = "help"
-            elseif binding.hoverEnemy and not binding.hoverFriendly then
-                conds[#conds + 1] = "harm"
+        if binding.harmfulSpell then
+            local harmfulName = ResolveHarmfulSpellName(binding)
+            if harmfulName then
+                local lines = {}
+                local function AddReactionLine(reaction, spellName)
+                    local reactionEnabled = (reaction == "help" and unitType ~= "harmful")
+                        or (reaction == "harm" and unitType ~= "friendly")
+                    if not reactionEnabled then return end
+                    local reactionConds = { "@mouseover", reaction }
+                    if not isRez then
+                        reactionConds[#reactionConds + 1] = "exists"
+                        reactionConds[#reactionConds + 1] = "nodead"
+                    end
+                    if binding.oocOnly then reactionConds[#reactionConds + 1] = "nocombat" end
+                    lines[#lines + 1] = "/cast [" .. table.concat(reactionConds, ",") .. guard .. "] " .. spellName
+                end
+                AddReactionLine("help", name)
+                AddReactionLine("harm", harmfulName)
+                if #lines == 0 then return nil end
+                return table.concat(lines, "\n")
             end
+        end
+        if unitType == "friendly" then
+            conds[#conds + 1] = "help"
+        elseif unitType == "harmful" then
+            conds[#conds + 1] = "harm"
         end
         -- exists,nodead: without it, a gone/dead hovered unit lets the cast fall
         -- through to Blizzard default targeting -- with auto self-cast on, it
@@ -450,12 +826,13 @@ local function BuildBaseMacroText(binding)
         end
         if isHC then
             body = "/stopmacro [mounted][flying]\n" .. body
-            -- User's macro body can't have friend/harm conditionals folded in like the
-            -- /cast above, so gate the whole macro instead (same net effect; a missing
-            -- mouseover also stops it, matching the spell path's exists check).
-            if binding.hoverFriendly and not binding.hoverEnemy then
+            -- User macro bodies cannot fold friend/harm conditions into their
+            -- own commands, so Hovercast gates the whole macro instead.
+            local unitType = ns.CC_GetBindingUnitType(binding)
+            if unitType == "none" then return "/stopmacro" end
+            if unitType == "friendly" then
                 body = "/stopmacro [@mouseover,nohelp]\n" .. body
-            elseif binding.hoverEnemy and not binding.hoverFriendly then
+            elseif unitType == "harmful" then
                 body = "/stopmacro [@mouseover,noharm]\n" .. body
             end
         end
@@ -463,7 +840,11 @@ local function BuildBaseMacroText(binding)
     elseif binding.type == "item" then
         local target = binding.itemSlot or binding.itemName
         if not target then return nil end
-        local cmd = "/use [@mouseover,exists,nodead" .. guard .. "] " .. target
+        local unitType = ns.CC_GetBindingUnitType(binding)
+        local reaction = unitType == "friendly" and ",help"
+            or unitType == "harmful" and ",harm"
+            or ""
+        local cmd = "/use [@mouseover" .. reaction .. ",exists,nodead" .. guard .. "] " .. target
         if binding.oocOnly then
             cmd = "/stopmacro [combat]\n" .. cmd
         end
@@ -476,7 +857,7 @@ local function BuildBaseMacroText(binding)
         end
         return cmd
     elseif binding.type == "dynamicrez" then
-        local lines = BuildRezLines(binding, guard)
+        local lines = BuildRezLines(binding, guard, true)
         if not lines or #lines == 0 then return nil end
         if binding.oocOnly then
             table.insert(lines, 1, "/stopmacro [combat]")
@@ -489,14 +870,12 @@ local function BuildBaseMacroText(binding)
         if binding.oocOnly then
             lines[#lines + 1] = "/stopmacro [combat]"
         end
-        for _, sp in ipairs(spellList) do
-            if sp.class == pClass then
-                -- /cast resolves by localized name; hardcoded English sp.name
-                -- would silently fail on non-English clients. Fall back to
-                -- sp.name only if the API is unavailable/empty.
-                local castName = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
-                lines[#lines + 1] = "/cast [@mouseover,exists,nodead" .. guard .. "] " .. castName
-            end
+        for _, sp in ipairs(ClassPresetSpells(spellList, pClass)) do
+            -- /cast resolves by localized name; hardcoded English sp.name would
+            -- silently fail on non-English clients. Fall back to sp.name only if
+            -- the API is unavailable/empty.
+            local castName = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
+            lines[#lines + 1] = "/cast [@mouseover,exists,nodead" .. guard .. "] " .. castName
         end
         if #lines == 0 then return nil end
         return table.concat(lines, "\n")
@@ -535,20 +914,16 @@ end
 function ns.CC_GetBindingIcon(b)
     if b.type == "dispel" then
         local _, pc = UnitClass("player")
-        for _, sp in ipairs(DISPEL_SPELLS) do
-            if sp.class == pc then
-                local tex = C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(sp.id)
-                if tex then return tex end
-            end
+        for _, sp in ipairs(ClassPresetSpells(DISPEL_SPELLS, pc)) do
+            local tex = C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(sp.id)
+            if tex then return tex end
         end
         return ACTION_ICONS.dispel
     elseif b.type == "external" then
         local _, pc = UnitClass("player")
-        for _, sp in ipairs(EXTERNAL_SPELLS) do
-            if sp.class == pc then
-                local tex = C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(sp.id)
-                if tex then return tex end
-            end
+        for _, sp in ipairs(ClassPresetSpells(EXTERNAL_SPELLS, pc)) do
+            local tex = C_Spell.GetSpellTexture and C_Spell.GetSpellTexture(sp.id)
+            if tex then return tex end
         end
         return ACTION_ICONS.external
     elseif b.type == "trinket1" then
@@ -781,10 +1156,9 @@ local function SetClickAttr(frame, parsed, actionType, spellOrMacro, macrotext, 
     -- protected items); route through the secure proxy instead. TRANSPORT: the
     -- "click" action itself crashes on a Blizzard typo (SecureTemplates.lua:564,
     -- aspect check on the mouse-button string) -- use a "/click <proxy>" macro.
-    if actionType == "togglemenu" and EllesmereUI.GetSecureMenuProxy then
-        local proxy = EllesmereUI.GetSecureMenuProxy(frame)
+    if actionType == "togglemenu" and EllesmereUI.GetSecureMenuMacro then
         SetGatedType(frame, typeAttr, "macro", oocOnly)
-        frame:SetAttribute(prefix .. "macrotext" .. suffix, "/click " .. proxy:GetName())
+        frame:SetAttribute(prefix .. "macrotext" .. suffix, EllesmereUI.GetSecureMenuMacro(frame))
         return
     end
     -- 12.0.7+ also gates raw "target" on unit buttons, EXCEPT plain unmodified
@@ -824,10 +1198,9 @@ local function SetKeyAttr(frame, idx, actionType, spellOrMacro, macrotext, oocOn
     local typeAttr = "type-" .. suffix
     -- Route a "menu" keybind through the secure proxy (see SetClickAttr for
     -- why this uses the /click macro transport instead of the click action).
-    if actionType == "togglemenu" and EllesmereUI.GetSecureMenuProxy then
-        local proxy = EllesmereUI.GetSecureMenuProxy(frame)
+    if actionType == "togglemenu" and EllesmereUI.GetSecureMenuMacro then
         SetGatedType(frame, typeAttr, "macro", oocOnly)
-        frame:SetAttribute("macrotext-" .. suffix, "/click " .. proxy:GetName())
+        frame:SetAttribute("macrotext-" .. suffix, EllesmereUI.GetSecureMenuMacro(frame))
         return
     end
     -- A "target" keybind is never plain left-click, so it always hits the 12.0.7
@@ -905,7 +1278,7 @@ local function GenerateKeyBindSnippets(bindings)
     local enter, leave, selfClear = {}, {}, {}
     local kbBindings = {}
     for i, b in ipairs(bindings) do
-        if not b.hovercast then
+        if IsFrameBinding(b) then
             local parsed = ParseKeyString(b.key)
             if not parsed.isMouseButton or not parsed.buttonNum or parsed.buttonNum > 5 then
                 kbBindings[#kbBindings + 1] = { binding = b, index = i, parsed = parsed }
@@ -975,7 +1348,7 @@ end
 local function NeutralizeDefaultClicks(frame, bindings)
     local b1, b2 = false, false
     for _, b in ipairs(bindings) do
-        if not b.hovercast and b.key then
+        if IsFrameBinding(b) and b.key then
             local parsed = ParseKeyString(b.key)
             if parsed.isMouseButton and parsed.modifiers == "" then
                 if parsed.buttonNum == 1 then b1 = true
@@ -988,6 +1361,22 @@ local function NeutralizeDefaultClicks(frame, bindings)
     frame:SetAttribute("*clickbutton2", nil)
     if not b1 then frame:SetAttribute("type1", "none") end
     if not b2 then frame:SetAttribute("type2", "none") end
+end
+
+-- Active-binding list shared across one synchronous registration burst (the
+-- CompactUnitFrame hook firing per frame inside one Blizzard rebuild, the
+-- init/regen queue drains, the all-frames sweep). GetActiveBindings walks and
+-- merges the whole binding set, so recomputing it per frame dominated those
+-- bursts. A burst never spans a render frame (GetTime stamp), and
+-- CC_ApplyBindings -- where every settings write ends -- refreshes it in place.
+local burst = {}
+burst.Get = function()
+    local now = GetTime()
+    if burst.at ~= now then
+        burst.at = now
+        burst.list = GetActiveBindings()
+    end
+    return burst.list
 end
 
 local function DoRegisterFrame(frame)
@@ -1037,9 +1426,9 @@ local function DoRegisterFrame(frame)
         ]])
     end
 
-    local bindings = GetActiveBindings()
+    local bindings = burst.Get()
     for i, b in ipairs(bindings) do
-        if not b.hovercast and b.key then
+        if IsFrameBinding(b) and b.key then
             local parsed = ParseKeyString(b.key)
             local aType, spellName, macrotext = ResolveBinding(b)
             if aType then
@@ -1062,9 +1451,9 @@ local function DoUnregisterFrame(frame)
     if not registeredFrames[frame] then return end
     registeredFrames[frame] = nil
 
-    local bindings = GetActiveBindings()
+    local bindings = burst.Get()
     for i, b in ipairs(bindings) do
-        if not b.hovercast and b.key then
+        if IsFrameBinding(b) and b.key then
             local parsed = ParseKeyString(b.key)
             if parsed.isMouseButton and parsed.buttonNum and parsed.buttonNum <= 5 then
                 ClearClickAttr(frame, parsed)
@@ -1102,6 +1491,113 @@ local function DoUnregisterFrame(frame)
             pcall(header.UnwrapScript, header, frame, "OnLeave")
         end
     end
+end
+
+-------------------------------------------------------------------------------
+--  Tooltip-modifier eaters (Debuff Manager "Shown on Modifier"): secure unit
+--  sub-buttons laid over a unit button's debuff band. Wrapped by THIS header
+--  regardless of the enabled state (the peek needs the hover tracking even
+--  with click-casting off) with the standard enter/leave bodies plus:
+--   * an enter-time unit sync -- the engine's mouseover reads the frame's own
+--     "unit" attribute, useparent-unit only serves the Lua action path; and
+--   * the peek: if the tooltip modifier is already held on entry, the eater
+--     hides itself so the hover falls through to the aura button beneath.
+--  The "eui_tipmod" state driver on this header flips only the HOVERED eater
+--  on a modifier edge (one macro-conditional check per press, nothing else)
+--  and re-shows the peeked eater on release. wrappedFrames is set here first,
+--  so DoRegisterFrame (click attributes when enabled) never wraps them twice.
+-------------------------------------------------------------------------------
+local tipEaters = setmetatable({}, { __mode = "k" })
+local pendingTipSync = false
+local pendingTipKey = nil
+
+local TIP_ENTER_BODY = [[
+    local p = self:GetParent()
+    if p then self:SetAttribute("unit", p:GetAttribute("unit")) end
+    eui_hoverframe = self
+    control:RunFor(self, control:GetAttribute("eui_setup_onenter"))
+    if not eui_hoveractive then
+        control:RunAttribute("eui_hover_set")
+        eui_hoveractive = true
+    end
+    local k = control:GetAttribute("eui_tipmod_key")
+    if k and not eui_tippeeked
+       and ((k == "shift" and IsShiftKeyDown())
+         or (k == "control" and IsControlKeyDown())
+         or (k == "alt" and IsAltKeyDown())) then
+        eui_tippeeked = self
+        self:Hide()
+    end
+]]
+local TIP_LEAVE_BODY = [[
+    if eui_hoverframe == self then eui_hoverframe = nil end
+    control:RunFor(self, control:GetAttribute("eui_setup_onleave"))
+]]
+
+local function WrapTipEater(frame)
+    if wrappedFrames[frame] then return end
+    wrappedFrames[frame] = true
+    header:WrapScript(frame, "OnEnter", TIP_ENTER_BODY)
+    header:WrapScript(frame, "OnLeave", TIP_LEAVE_BODY)
+end
+
+-- Runs before every registration sweep (init, enable, regen) so an eater is
+-- always wrapped with ITS bodies before DoRegisterFrame could reach it.
+local function SyncTipEaters()
+    if not (ccInitialized and header) then return end
+    for frame in pairs(tipEaters) do WrapTipEater(frame) end
+end
+
+function ns.CC_RegisterTipEater(frame)
+    tipEaters[frame] = true
+    if InCombatLockdown() then
+        pendingTipSync = true
+    else
+        SyncTipEaters()
+    end
+    -- Click attributes follow the enabled state like any owned unit button
+    -- (self-queues to regen in combat; the sync above runs first there).
+    ns.CC_RegisterFrame(frame)
+end
+
+-- A parked eater must never be re-shown by the peek: drop the header's
+-- references to it. Out-of-combat only (Execute), like parking itself.
+function ns.CC_ReleaseTipEater(frame)
+    if not (tipEaters[frame] and ccInitialized and header) then return end
+    header:SetFrameRef("eui_tipclear", frame)
+    header:Execute([[
+        local f = self:GetFrameRef("eui_tipclear")
+        if eui_tippeeked == f then eui_tippeeked = nil end
+        if eui_hoverframe == f then eui_hoverframe = nil end
+    ]])
+end
+
+-- The tooltip modifier ("shift" / "control" / "alt"), nil to disarm. Header
+-- writes, so out-of-combat only; before init the key parks until CC_Init.
+function ns.CC_SetTipModKey(key)
+    if not (ccInitialized and header) then pendingTipKey = key or false; return end
+    UnregisterStateDriver(header, "eui_tipmod")
+    header:SetAttribute("eui_tipmod_key", key)
+    if not key then
+        header:Execute([[
+            if eui_tippeeked then eui_tippeeked:Show(); eui_tippeeked = nil end
+        ]])
+        return
+    end
+    header:SetAttribute("_onstate-eui_tipmod", [[
+        if newstate == "held" then
+            local f = eui_hoverframe
+            if f and not eui_tippeeked and f:GetAttribute("eui_tipeater") then
+                eui_tippeeked = f
+                f:Hide()
+            end
+        elseif eui_tippeeked then
+            eui_tippeeked:Show()
+            eui_tippeeked = nil
+        end
+    ]])
+    local cond = (key == "control") and "ctrl" or key
+    RegisterStateDriver(header, "eui_tipmod", "[mod:" .. cond .. "] held; shown")
 end
 
 function ns.CC_RegisterFrame(frame)
@@ -1216,13 +1712,26 @@ function ns.CC_ApplyBindings()
     NormalizeSavedBindingKeys()
 
     local bindings = GetActiveBindings()
+    -- Fresh list becomes the burst list: any registration later this frame
+    -- reads the post-write set.
+    burst.at, burst.list = GetTime(), bindings
+
+    knownSig = ComputeKnownSignature()
+    if knownSig ~= "" then
+        ccEventFrame:RegisterEvent("SPELLS_CHANGED")
+    else
+        ccEventFrame:UnregisterEvent("SPELLS_CHANGED")
+    end
 
     local frameBindings = {}
     local hoverBindings = {}
+    -- A "both" binding lands in BOTH lists: frame attributes for clicks on the
+    -- frames, plus the hover override for nameplates / world units.
     for i, b in ipairs(bindings) do
-        if b.hovercast then
+        if IsHoverBinding(b) then
             hoverBindings[#hoverBindings + 1] = { b = b, idx = i }
-        else
+        end
+        if IsFrameBinding(b) then
             frameBindings[#frameBindings + 1] = { b = b, idx = i }
         end
     end
@@ -1232,7 +1741,7 @@ function ns.CC_ApplyBindings()
     ---------------------------------------------------------------
     for frame in pairs(registeredFrames) do
         for _, pb in ipairs(prevBindings) do
-            if not pb.b.hovercast then
+            if IsFrameBinding(pb.b) then
                 local parsed = ParseKeyString(pb.b.key)
                 if parsed.isMouseButton and parsed.buttonNum and parsed.buttonNum <= 5 then
                     ClearClickAttr(frame, parsed)
@@ -1449,30 +1958,60 @@ ns.CC_GetCurrentSpecName = GetCurrentSpecName
 ns.CC_GetCurrentSpecIcon = GetCurrentSpecIcon
 ns.CC_GetClickCastDB     = GetClickCastDB
 
--- Finds all bindings (excluding the given one) sharing a key; returns a list
--- of names or an empty table.
-local function FindKeyConflicts(keyStr, excludeBinding)
-    if not keyStr then return {} end
-    local conflicts = {}
-    local cc = GetClickCastDB()
-    if not cc then return conflicts end
+-- Bindings only compete when their key is dispatched through at least one of
+-- the same paths. Frame-only and hover-only bindings may therefore share a key;
+-- a "both" binding overlaps either path.
+local function BindingsShareCastPath(a, b)
+    return (IsFrameBinding(a) and IsFrameBinding(b))
+        or (IsHoverBinding(a) and IsHoverBinding(b))
+end
+
+-- Calls fn for every OTHER active binding sharing the key and cast path, over
+-- the globals and the active spec only (other specs are never active at the
+-- same time). fn returning true stops the walk; returns whether it stopped.
+local function ForEachKeySharer(excludeBinding, fn)
+    local keyStr = excludeBinding.key
+    local cc = keyStr and GetClickCastDB()
+    if not cc then return false end
     for _, b in ipairs(cc.globals) do
-        if b ~= excludeBinding and b.key == keyStr then
-            conflicts[#conflicts + 1] = ns.CC_GetBindingName(b)
+        if b ~= excludeBinding and IsBindingActive(b) and b.key == keyStr
+            and BindingsShareCastPath(excludeBinding, b) and fn(b) then
+            return true
         end
     end
-    -- Only check the active spec's bindings (other specs are never active simultaneously)
     local specIdx = GetSpecialization and GetSpecialization()
     local specID = specIdx and select(1, GetSpecializationInfo(specIdx))
     local activeList = specID and cc.specs[specID]
     if activeList then
         for _, b in ipairs(activeList) do
-            if b ~= excludeBinding and b.key == keyStr then
-                conflicts[#conflicts + 1] = ns.CC_GetBindingName(b)
+            if b ~= excludeBinding and IsBindingActive(b) and b.key == keyStr
+                and BindingsShareCastPath(excludeBinding, b) and fn(b) then
+                return true
             end
         end
     end
+    return false
+end
+
+-- Finds all bindings (excluding the given one) sharing a key and a cast path;
+-- returns a list of names or an empty table. A spell the character has not got
+-- never owns the key, so it neither raises nor receives a conflict.
+local function FindKeyConflicts(keyStr, excludeBinding)
+    if not keyStr or not IsBindingKnown(excludeBinding) then return {} end
+    local conflicts = {}
+    ForEachKeySharer(excludeBinding, function(b)
+        if not ns.CC_AreComplementaryReactionBindings(excludeBinding, b) and IsBindingKnown(b) then
+            conflicts[#conflicts + 1] = ns.CC_GetBindingName(b)
+        end
+    end)
     return conflicts
+end
+
+-- An untalented spell only dims when another binding shares its key: that is
+-- the one that lost its key. Alone on a key it looks like any other binding.
+local function AnyTrue() return true end
+local function IsShadowedBinding(binding)
+    return not IsBindingKnown(binding) and ForEachKeySharer(binding, AnyTrue)
 end
 
 -------------------------------------------------------------------------------
@@ -1515,6 +2054,21 @@ function RegisterBlizzardFrames()
         hooksecurefunc("CompactUnitFrame_SetUpFrame", function(frame)
             if not frame then return end
             if frame.IsForbidden and frame:IsForbidden() then return end
+            -- Frames the raid module parked under its hidden parent (the whole
+            -- CompactRaidFrameContainer, the raid-style party members) can never
+            -- be clicked, yet Blizzard re-runs SetUpFrame on every one of them
+            -- for every roster change -- a full binding pass per hidden frame
+            -- per roster event, all wasted. Skip them; a frame that later leaves
+            -- the hidden parent registers on its next SetUpFrame.
+            local hiddenParent = ns._blizzHiddenParent
+            if hiddenParent then
+                local p, depth = frame:GetParent(), 0
+                while p and depth < 6 do
+                    if p == hiddenParent then return end
+                    p = p:GetParent()
+                    depth = depth + 1
+                end
+            end
             local ok, name = pcall(frame.GetName, frame)
             if ok and name and not name:match("^NamePlate") then
                 externalFrames[frame] = true
@@ -1540,6 +2094,7 @@ function ns.CC_SetEnabled(enabled)
         -- replaces the global table (RemoveFrameFromClickCast no-ops once it has).
         for frame in pairs(ownedFrames) do RemoveFrameFromClickCast(frame) end
         SetupClickCastFramesHook()
+        SyncTipEaters()
         for frame in pairs(ownedFrames) do
             if not registeredFrames[frame] then DoRegisterFrame(frame) end
         end
@@ -1559,6 +2114,9 @@ function ns.CC_SetEnabled(enabled)
         local list = {}
         for frame in pairs(registeredFrames) do list[#list + 1] = frame end
         for _, frame in ipairs(list) do DoUnregisterFrame(frame) end
+        -- The unregister above dropped the eaters' wraps with everyone else's;
+        -- the peek needs them back even with click-casting off.
+        SyncTipEaters()
     end
 end
 
@@ -1594,6 +2152,8 @@ end
 local function OnCCEvent(self, event)
     if event == "PLAYER_REGEN_ENABLED" then
         local cc = GetClickCastDB()
+        -- Eater wraps first: DoRegisterFrame below must find them already wrapped.
+        if pendingTipSync then pendingTipSync = false; SyncTipEaters() end
         -- Apply a deferred enable/disable sweep that was requested during combat.
         if pendingSetEnabled ~= nil then
             local v = pendingSetEnabled
@@ -1612,6 +2172,21 @@ local function OnCCEvent(self, event)
         if pendingApply then pendingApply = false; ns.CC_ApplyBindings() end
     elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
         if not InCombatLockdown() then ns.CC_ApplyBindings() else pendingApply = true end
+    elseif event == "SPELLS_CHANGED" then
+        -- A talent or loadout swap that moved a bound spell in or out of the
+        -- book; the apply re-resolves which binding owns each key.
+        if ComputeKnownSignature() ~= knownSig then
+            if not InCombatLockdown() then ns.CC_ApplyBindings() else pendingApply = true end
+        end
+    elseif event == "GROUP_ROSTER_UPDATE" then
+        -- Solo <-> party <-> raid transitions change which bindings are active.
+        -- GROUP_ROSTER_UPDATE fires every join, leave, promote and zone-in, so
+        -- only act when the context changed.
+        local ctx = CurrentCtx()
+        if ctx ~= lastRosterCtx then
+            lastRosterCtx = ctx
+            if not InCombatLockdown() then ns.CC_ApplyBindings() else pendingApply = true end
+        end
     elseif event == "PLAYER_ENTERING_WORLD" then
         -- Reapplies after zone/loading (OnLeave may not fire during transitions,
         -- so stuck frame-bindings need clearing); waits for spec via
@@ -1664,10 +2239,20 @@ function ns.CC_Init()
     ccEventFrame = (ns.TakeShell and ns.TakeShell()) or CreateFrame("Frame")
     ccEventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
     ccEventFrame:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    ccEventFrame:RegisterEvent("GROUP_ROSTER_UPDATE")
     ccEventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
     ccEventFrame:SetScript("OnEvent", OnCCEvent)
 
     ccInitialized = true
+
+    -- Tooltip-modifier eaters: wrapped whatever the enabled state (before the
+    -- registration sweep below), and a key parked before init applies now.
+    SyncTipEaters()
+    if pendingTipKey ~= nil then
+        local k = pendingTipKey
+        pendingTipKey = nil
+        ns.CC_SetTipModKey(k or nil)
+    end
 
     -- Only touches frames when enabled: a fresh/default install registers
     -- nothing, so clicks stay Blizzard-default. Enabling later runs the same
@@ -1772,21 +2357,17 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
         end
     end
     if hasDispel then
-        for _, sp in ipairs(DISPEL_SPELLS) do
-            if sp.class == pClass then
-                -- Matches the localized name stored by the spell picker, so
-                -- "already bound" dimming works on non-English clients.
-                local n = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
-                boundSpells[n] = true
-            end
+        for _, sp in ipairs(ClassPresetSpells(DISPEL_SPELLS, pClass)) do
+            -- Matches the localized name stored by the spell picker, so
+            -- "already bound" dimming works on non-English clients.
+            local n = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
+            boundSpells[n] = true
         end
     end
     if hasExternal then
-        for _, sp in ipairs(EXTERNAL_SPELLS) do
-            if sp.class == pClass then
-                local n = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
-                boundSpells[n] = true
-            end
+        for _, sp in ipairs(ClassPresetSpells(EXTERNAL_SPELLS, pClass)) do
+            local n = (C_Spell.GetSpellName and C_Spell.GetSpellName(sp.id)) or sp.name
+            boundSpells[n] = true
         end
     end
     if hasDynamicRez then
@@ -1940,6 +2521,50 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
         keySub:SetJustifyH("LEFT"); keySub:SetWordWrap(false)
         keySub:SetText(binding.key and ns.CC_FormatKey(binding.key) or EllesmereUI.L("Not Bound"))
 
+        -- A spell the character has not got right now dims when another binding
+        -- took its key; the binding stays for the loadout that has it.
+        local untalented = (side == "spec" or side == "global") and IsShadowedBinding(binding)
+        if untalented then
+            iconTex:SetAlpha(0.35)
+            title:SetAlpha(0.45)
+            keySub:SetAlpha(0.45)
+        end
+
+        -- Complementary Friendly/Harmful spell pairs may share a key. Mark only
+        -- real collisions, positioned in the sidebar action area so the marker
+        -- never obscures the spell icon.
+        if (side == "spec" or side == "global") and IsReactionBinding(binding)
+            and IsBindingActive(binding) and binding.key then
+            local conflicts = FindKeyConflicts(binding.key, binding)
+            if #conflicts > 0 then
+                local warning = CreateFrame("Button", nil, tile)
+                warning:SetSize(18, 18)
+                warning:SetPoint("TOPRIGHT", tile, "TOPRIGHT", -26, -7)
+                warning:SetFrameLevel(tile:GetFrameLevel() + 2)
+                local warningText = MakeFont(warning, 15, 1, 0.25, 0.15, 1)
+                warningText:SetAllPoints()
+                warningText:SetJustifyH("CENTER")
+                warningText:SetText("!")
+                local warningTooltip = {
+                    EllesmereUI.L("Conflicting Keybind"),
+                    EllesmereUI.Lf("%s is also assigned to:", ns.CC_FormatKey(binding.key)),
+                }
+                for _, name in ipairs(conflicts) do
+                    warningTooltip[#warningTooltip + 1] = "- " .. EllesmereUI.L(name)
+                end
+                warningTooltip = table.concat(warningTooltip, "\n")
+                warning:SetScript("OnEnter", function(self)
+                    EllesmereUI.ShowWidgetTooltip(self, warningTooltip, {
+                        color = { 1, 0.25, 0.15, 0.9 },
+                        justify = "LEFT",
+                        width = 250,
+                    })
+                end)
+                warning:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
+                warning:SetScript("OnClick", function() onSelect(side, idx) end)
+            end
+        end
+
         if onDelete then
             local delBtn = CreateFrame("Button", nil, tile)
             delBtn:SetSize(16, 16)
@@ -1963,8 +2588,16 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
         sep:SetColorTexture(1, 1, 1, 0.04)
 
         tile:SetScript("OnClick", function() onSelect(side, idx) end)
-        tile:SetScript("OnEnter", function() if not isSelected then tileBg:SetColorTexture(1, 1, 1, 0.04) end end)
-        tile:SetScript("OnLeave", function() if not isSelected then tileBg:SetColorTexture(1, 1, 1, 0) end end)
+        tile:SetScript("OnEnter", function(self)
+            if not isSelected then tileBg:SetColorTexture(1, 1, 1, 0.04) end
+            if untalented then
+                EllesmereUI.ShowWidgetTooltip(self, EllesmereUI.L("Not currently talented"), { width = 250 })
+            end
+        end)
+        tile:SetScript("OnLeave", function()
+            if not isSelected then tileBg:SetColorTexture(1, 1, 1, 0) end
+            if untalented then EllesmereUI.HideWidgetTooltip() end
+        end)
 
         return tile
     end
@@ -2342,7 +2975,7 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                 local eqItems = ns.CC_GetEquippedItems()
                 PopulateGridG(eqItems, function(itm)
                     ns.CC_AddGlobalBinding({ type = "item", itemSlot = itm.itemSlot, itemName = itm.name, icon = itm.icon,
-                        enabled = true, oocOnly = false, hovercast = false, hoverFriendly = true, hoverEnemy = false })
+                        enabled = true, oocOnly = false, hovercast = false, hoverFriendly = true, hoverEnemy = true })
                     ns._ccSelSide = "global"; ns._ccSelIndex = #(GetGlobalBindings()); RebuildPage()
                 end)
             end
@@ -2639,13 +3272,16 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                     local binding
                     if hoveredItem.id then
                         binding = { type = "spell", spell = hoveredItem.name, spellID = hoveredItem.id,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     elseif hoveredItem.macroName then
                         binding = { type = "macro", macroName = hoveredItem.macroName,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     elseif hoveredItem.itemSlot then
                         binding = { type = "item", itemSlot = hoveredItem.itemSlot, itemName = hoveredItem.name,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     end
                     if binding then
                         ns.CC_AddSpecBinding(binding)
@@ -2665,13 +3301,16 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                     local binding
                     if hoveredItem.id then
                         binding = { type = "spell", spell = hoveredItem.name, spellID = hoveredItem.id,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     elseif hoveredItem.macroName then
                         binding = { type = "macro", macroName = hoveredItem.macroName,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     elseif hoveredItem.itemSlot then
                         binding = { type = "item", itemSlot = hoveredItem.itemSlot, itemName = hoveredItem.name,
-                            icon = hoveredItem.icon, key = captured, enabled = true }
+                            icon = hoveredItem.icon, key = captured, enabled = true,
+                            hoverFriendly = true, hoverEnemy = true }
                     end
                     if binding then
                         ns.CC_AddSpecBinding(binding)
@@ -2916,7 +3555,7 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                     ns.CC_AddSpecBinding({
                         type = "spell", spell = item.name, spellID = item.id, icon = item.icon,
                         enabled = true, oocOnly = false, hovercast = false,
-                        hoverFriendly = true, hoverEnemy = false,
+                        hoverFriendly = true, hoverEnemy = true,
                     })
                     ns._ccSelSide = "spec"; ns._ccSelIndex = #(GetSpecBindings()); RebuildPage()
                 end)
@@ -2942,7 +3581,7 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                     ns.CC_AddSpecBinding({
                         type = "item", itemSlot = item.itemSlot, itemName = item.name, icon = item.icon,
                         enabled = true, oocOnly = false, hovercast = false,
-                        hoverFriendly = true, hoverEnemy = false,
+                        hoverFriendly = true, hoverEnemy = true,
                     })
                     ns._ccSelSide = "spec"; ns._ccSelIndex = #(GetSpecBindings()); RebuildPage()
                 end)
@@ -3239,17 +3878,7 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
             local kbBtn = BuildKeybindButton(row, 180,
                 function() return selectedBinding.key end,
                 function(newKey)
-                    if cc.hideKeyWarning then ApplyKey(newKey); return end
-                    local conflicts = FindKeyConflicts(newKey, selectedBinding)
-                    if #conflicts == 0 then ApplyKey(newKey); return end
-                    EllesmereUI:ShowConfirmPopup({
-                        title = EllesmereUI.L("Duplicate Keybind"),
-                        message = EllesmereUI.Lf("%s is already assigned to:\n%s", ns.CC_FormatKey(newKey), table.concat(conflicts, ", ")),
-                        confirmText = EllesmereUI.L("Okay"),
-                        cancelText = EllesmereUI.L("Don't Show Again"),
-                        onConfirm = function() ApplyKey(newKey) end,
-                        onCancel = function() cc.hideKeyWarning = true; ApplyKey(newKey) end,
-                    })
+                    ApplyKey(newKey)
                 end,
                 function()
                     selectedBinding.key = nil
@@ -3300,62 +3929,134 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
             centerY = centerY - ROW_H
         end
 
+        -- Content gate row: which content this binding is active in.
+        -- Outside the chosen contexts the binding is simply not applied, so
+        -- its key keeps doing whatever the player normally has bound.
+        do
+            local row = MakeRow(centerY)
+            RowLabel(row, "Active In")
+            -- Same checkbox dropdown the buff manager's filter pickers use, so
+            -- any combination of Solo / Party / Raid can be ticked. It renders
+            -- the summary itself ("All" when everything is on, "None" when
+            -- nothing is). groupCtx stays nil while all three are on -- that is
+            -- the default, so untouched bindings store nothing.
+            local ctxItems = {
+                { key = "solo",  label = "Solo",
+                  tooltip = "Active while you are not in a group." },
+                { key = "party", label = "Party",
+                  tooltip = "Active in a PvE party." },
+                { key = "raid",  label = "Raid",
+                  tooltip = "Active in a PvE raid." },
+                { key = "pvp",   label = "PvP",
+                  tooltip = "Active in battlegrounds and arenas." },
+            }
+            local cbDD = EllesmereUI.BuildVisOptsCBDropdown(
+                row, 160, row:GetFrameLevel() + 2,
+                ctxItems,
+                function(key) return CtxEnabled(selectedBinding, key) end,
+                function(key, v)
+                    -- nil means all-on, so materialize the full set before the
+                    -- first tick turns one context off; collapse back to nil
+                    -- once everything is on again.
+                    local set = selectedBinding.groupCtx
+                    if not set then
+                        set = {}
+                        for _, c in ipairs(CC_CTX_ORDER) do set[c] = true end
+                        selectedBinding.groupCtx = set
+                    end
+                    set[key] = v and true or false
+                    local n = 0
+                    for _, c in ipairs(CC_CTX_ORDER) do
+                        if set[c] == true then n = n + 1 end
+                    end
+                    if n == #CC_CTX_ORDER then selectedBinding.groupCtx = nil end
+                    ns.CC_ApplyBindings()
+                end,
+                nil, #CC_CTX_ORDER)
+            PP.Point(cbDD, "RIGHT", row, "RIGHT", -SIDE_PAD, 0)
+            centerY = centerY - ROW_H
+        end
+
         if hasAdvancedOpts then
-            -- Hovercast row (disabled for bare left/right click)
+            -- Hovercast row: a dropdown rather than a third toggle so the row
+            -- count (and the page height) is unchanged -- the center column has
+            -- no spare row.
+            -- Hovercast is unavailable for bare left/right click, so those two
+            -- entries are shown disabled with the reason as a tooltip.
             do
                 local row = MakeRow(centerY)
                 local isBareMouseBtn = selectedBinding.key == "BUTTON1" or selectedBinding.key == "BUTTON2"
-                RowLabel(row, "Only Cast on Actual Units (Not Frames)")
-                if isBareMouseBtn then
-                    if selectedBinding.hovercast then
-                        selectedBinding.hovercast = false
-                        ns.CC_ApplyBindings()
-                    end
-                    local pill, _ = RowToggle(row,
-                        function() return false end,
-                        function() end)
-                    pill:SetAlpha(0.35)
-                    pill:EnableMouse(false)
-                    if EllesmereUI.ShowWidgetTooltip then
-                        row:SetScript("OnEnter", function(self)
-                            EllesmereUI.ShowWidgetTooltip(self, EllesmereUI.L("Hovercast is not available for unmodified left/right click"))
-                        end)
-                        row:SetScript("OnLeave", function() EllesmereUI.HideWidgetTooltip() end)
-                    end
-                else
-                    RowToggle(row,
-                        function() return selectedBinding.hovercast end,
-                        function(v)
-                            selectedBinding.hovercast = v
-                            ns.CC_ApplyBindings()
-                            RebuildPage()
-                        end)
+                RowLabel(row, "Cast On")
+                if isBareMouseBtn and selectedBinding.hovercast then
+                    selectedBinding.hovercast = false
+                    ns.CC_ApplyBindings()
                 end
+                local hcValues = {
+                    frames = "Frames",
+                    units  = "Mouseover",
+                    both   = "Frames and Mouseover",
+                }
+                local hcOrder = { "frames", "units", "both" }
+                local ddCtrl = EllesmereUI.BuildDropdownControl(
+                    row, 160, row:GetFrameLevel() + 2,
+                    hcValues, hcOrder,
+                    function()
+                        if selectedBinding.hovercast == "both" then return "both" end
+                        return selectedBinding.hovercast and "units" or "frames"
+                    end,
+                    function(v)
+                        selectedBinding.hovercast = (v == "both" and "both")
+                            or (v == "units" and true) or false
+                        ns.CC_ApplyBindings()
+                        RebuildPage()
+                    end,
+                    function(key)
+                        if isBareMouseBtn and key ~= "frames" then
+                            return EllesmereUI.L("Hovercast is not available for unmodified left/right click")
+                        end
+                        return false
+                    end)
+                PP.Point(ddCtrl, "RIGHT", row, "RIGHT", -SIDE_PAD, 0)
                 centerY = centerY - ROW_H
             end
 
-            if selectedBinding.hovercast then
+            -- Spell and item reactions use the same Friendly/Enemy toggles as
+            -- Hovercast. Frame-only custom macros cannot safely share a key
+            -- with a complementary action, so they do not expose reactions.
+            if selectedBinding.type == "spell" or selectedBinding.type == "item" or selectedBinding.hovercast then
                 do
                     local row = MakeRow(centerY)
-                    RowLabel(row, "    Friendly Units")
-                    RowToggle(row,
-                        function() return selectedBinding.hoverFriendly ~= false end,
-                        function(v)
-                            selectedBinding.hoverFriendly = v
-                            ns.CC_ApplyBindings()
-                        end)
-                    centerY = centerY - ROW_H
-                end
-                do
-                    local row = MakeRow(centerY)
-                    RowLabel(row, "    Enemy Units")
-                    RowToggle(row,
+                    RowLabel(row, "    Unit Types")
+                    local ePill = RowToggle(row,
                         function() return selectedBinding.hoverEnemy == true end,
                         function(v)
                             selectedBinding.hoverEnemy = v
                             ns.CC_ApplyBindings()
+                            RebuildPage()
                         end)
+                    local eLbl = MakeFont(row, 13, 1, 1, 1, 0.8)
+                    eLbl:SetPoint("RIGHT", ePill, "LEFT", -8, 0)
+                    eLbl:SetText(EllesmereUI.L("Enemy"))
+
+                    local fPill = RowToggle(row,
+                        function() return selectedBinding.hoverFriendly ~= false end,
+                        function(v)
+                            selectedBinding.hoverFriendly = v
+                            ns.CC_ApplyBindings()
+                            RebuildPage()
+                        end)
+                    fPill:ClearAllPoints()
+                    PP.Point(fPill, "RIGHT", eLbl, "LEFT", -18, 0)
+                    local fLbl = MakeFont(row, 13, 1, 1, 1, 0.8)
+                    fLbl:SetPoint("RIGHT", fPill, "LEFT", -8, 0)
+                    fLbl:SetText(EllesmereUI.L("Friendly"))
                     centerY = centerY - ROW_H
+                end
+                if selectedBinding.type == "spell" or selectedBinding.type == "item" then
+                    local note = MakeFont(bodyHost, 11, 1, 1, 1, 0.45)
+                    note:SetPoint("TOPLEFT", bodyHost, "TOPLEFT", C_PAD + SIDE_PAD + 20, centerY - 5)
+                    note:SetText(EllesmereUI.L("Disabling both disables this binding."))
+                    centerY = centerY - 22
                 end
             end
         end
@@ -3459,7 +4160,7 @@ function ns.CC_BuildPage(pageName, parent, yOffset)
                 ns.CC_AddSpecBinding({
                     type = "spell", spell = sp.name, spellID = sp.id, icon = sp.icon,
                     enabled = true, oocOnly = false, hovercast = false,
-                    hoverFriendly = true, hoverEnemy = false,
+                    hoverFriendly = true, hoverEnemy = true,
                 })
                 ns._ccSelSide = "spec"
                 ns._ccSelIndex = #(GetSpecBindings())

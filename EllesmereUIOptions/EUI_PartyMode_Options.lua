@@ -143,7 +143,7 @@ do
                     return
                 end
                 if key == "LSHIFT" or key == "RSHIFT" or key == "LCTRL" or key == "RCTRL"
-                   or key == "LALT" or key == "RALT" then
+                   or key == "LALT" or key == "RALT" or key == "LMETA" or key == "RMETA" then
                     self:SetPropagateKeyboardInput(true)
                     return
                 end
@@ -154,11 +154,26 @@ do
                     RefreshLabel()
                     return
                 end
-                local mods = ""
-                if IsShiftKeyDown() then mods = mods .. "SHIFT-" end
-                if IsControlKeyDown() then mods = mods .. "CTRL-" end
-                if IsAltKeyDown() then mods = mods .. "ALT-" end
-                local fullKey = mods .. key
+                -- Blizzard's canonical chord order is ALT-CTRL-SHIFT-KEY, and
+                -- CreateKeyChordStringUsingMetaKeyState is what produces it.
+                -- Hand-rolling the modifiers built SHIFT-CTRL-ALT-KEY, a chord
+                -- string the engine never generates, so any bind using more
+                -- than one modifier was stored in a form nothing could match.
+                -- Single-modifier binds happen to agree, which is why this
+                -- survived.
+                local fullKey
+                if CreateKeyChordStringUsingMetaKeyState then
+                    fullKey = CreateKeyChordStringUsingMetaKeyState(key)
+                else
+                    local mods = ""
+                    if IsAltKeyDown() then mods = mods .. "ALT-" end
+                    if IsControlKeyDown() then mods = mods .. "CTRL-" end
+                    if IsShiftKeyDown() then mods = mods .. "SHIFT-" end
+                    if IsMetaKeyDown and IsMetaKeyDown() then
+                        mods = mods .. "META-"
+                    end
+                    fullKey = mods .. key
+                end
 
                 if not EllesmereUIDB then EllesmereUIDB = {} end
                 ClearOverrideBindings(EllesmereUIPartyModeBindBtn)
@@ -356,58 +371,79 @@ do
             return function() return EllesmereUIDB and EllesmereUIDB[key] or false end
         end
 
-        -- Row 1: Randomly | Timed Keystone | Mythic Boss Kill
         local CB_SPLITS = { 0.333, 0.333, 0.334, rowHeight = 36 }
-        _, h = W:TripleRow(parent, y,
-            { type = "checkbox", text = "Randomly",           getValue = TriggerGet("partyModeTriggerRandom"),     setValue = function(v)
+        local randomlyCheckbox = { type = "checkbox", text = "Randomly", getValue = TriggerGet("partyModeTriggerRandom"), setValue = function(v)
+            if not EllesmereUIDB then EllesmereUIDB = {} end
+            EllesmereUIDB.partyModeTriggerRandom = v
+            if v then
+                EllesmereUI_StartRandomTrigger()
+            else
+                EllesmereUI_StopRandomTrigger()
+            end
+            local rl = EllesmereUI._widgetRefreshList
+            if rl then for i = 1, #rl do rl[i]() end end
+        end }
+        -- Bloodlust is debuff-triggered with a hardcoded 40s celebration; it is
+        -- intentionally NOT wired into the Auto Celebration Duration slider, so
+        -- it has its own setValue rather than the shared TriggerSet.
+        local bloodlustCheckbox = { type = "checkbox", text = "Bloodlust",
+            getValue = TriggerGet("partyModeTriggerBloodlust"),
+            setValue = function(v)
                 if not EllesmereUIDB then EllesmereUIDB = {} end
-                EllesmereUIDB.partyModeTriggerRandom = v
-                if v then
-                    EllesmereUI_StartRandomTrigger()
-                else
-                    EllesmereUI_StopRandomTrigger()
-                end
+                EllesmereUIDB.partyModeTriggerBloodlust = v
+                if EllesmereUI_UpdatePartyModeLustListener then EllesmereUI_UpdatePartyModeLustListener() end
                 local rl = EllesmereUI._widgetRefreshList
                 if rl then for i = 1, #rl do rl[i]() end end
-            end },
-            { type = "checkbox", text = "Timed Keystone",     getValue = TriggerGet("partyModeTriggerKeystone"),   setValue = TriggerSet("partyModeTriggerKeystone") },
-            { type = "checkbox", text = "Mythic Boss Kill",   getValue = TriggerGet("partyModeTriggerMythicBoss"), setValue = TriggerSet("partyModeTriggerMythicBoss") },
-            CB_SPLITS
-        );  y = y - h
+            end }
+        local levelUpCheckbox = { type = "checkbox", text = "Level Up",
+            getValue = TriggerGet("partyModeTriggerLevelUp"),
+            setValue = function(v)
+                if not EllesmereUIDB then EllesmereUIDB = {} end
+                EllesmereUIDB.partyModeTriggerLevelUp = v
+                if EllesmereUI_UpdatePartyModeLevelUpListener then EllesmereUI_UpdatePartyModeLevelUpListener() end
+                local rl = EllesmereUI._widgetRefreshList
+                if rl then for i = 1, #rl do rl[i]() end end
+            end }
 
-        -- Row 2: Rated Arena Win | Rated BG Win | Heroic Boss Kill
-        _, h = W:TripleRow(parent, y,
-            { type = "checkbox", text = "Rated Arena Win",    getValue = TriggerGet("partyModeTriggerRatedArena"), setValue = TriggerSet("partyModeTriggerRatedArena") },
-            { type = "checkbox", text = "Rated BG Win",       getValue = TriggerGet("partyModeTriggerRatedBG"),    setValue = TriggerSet("partyModeTriggerRatedBG") },
-            { type = "checkbox", text = "Heroic Boss Kill",   getValue = TriggerGet("partyModeTriggerHeroicBoss"), setValue = TriggerSet("partyModeTriggerHeroicBoss") },
-            CB_SPLITS
-        );  y = y - h
+        if EllesmereUI.IS_FOREVER then
+            -- WoW Forever has no keystones, no rated PvP and no Mythic, Heroic or
+            -- Raid Finder difficulties, and its vanilla raids report difficulty 9 or
+            -- 148, which no boss kill trigger maps. Show only what can fire there.
+            _, h = W:TripleRow(parent, y,
+                randomlyCheckbox, bloodlustCheckbox, levelUpCheckbox,
+                CB_SPLITS
+            );  y = y - h
+        else
+            -- Row 1: Randomly | Timed Keystone | Mythic Boss Kill
+            _, h = W:TripleRow(parent, y,
+                randomlyCheckbox,
+                { type = "checkbox", text = "Timed Keystone",     getValue = TriggerGet("partyModeTriggerKeystone"),   setValue = TriggerSet("partyModeTriggerKeystone") },
+                { type = "checkbox", text = "Mythic Boss Kill",   getValue = TriggerGet("partyModeTriggerMythicBoss"), setValue = TriggerSet("partyModeTriggerMythicBoss") },
+                CB_SPLITS
+            );  y = y - h
 
-        -- Row 3: Normal Boss Kill | Raid Finder Boss Kill | Mythic 0 Completion
-        _, h = W:TripleRow(parent, y,
-            { type = "checkbox", text = "Normal Boss Kill",       getValue = TriggerGet("partyModeTriggerNormalBoss"),  setValue = TriggerSet("partyModeTriggerNormalBoss") },
-            { type = "checkbox", text = "Raid Finder Boss Kill",  getValue = TriggerGet("partyModeTriggerLFRBoss"),     setValue = TriggerSet("partyModeTriggerLFRBoss") },
-            { type = "checkbox", text = "Mythic 0 Completion",    getValue = TriggerGet("partyModeTriggerMythic0"),     setValue = TriggerSet("partyModeTriggerMythic0") },
-            CB_SPLITS
-        );  y = y - h
+            -- Row 2: Rated Arena Win | Rated BG Win | Heroic Boss Kill
+            _, h = W:TripleRow(parent, y,
+                { type = "checkbox", text = "Rated Arena Win",    getValue = TriggerGet("partyModeTriggerRatedArena"), setValue = TriggerSet("partyModeTriggerRatedArena") },
+                { type = "checkbox", text = "Rated BG Win",       getValue = TriggerGet("partyModeTriggerRatedBG"),    setValue = TriggerSet("partyModeTriggerRatedBG") },
+                { type = "checkbox", text = "Heroic Boss Kill",   getValue = TriggerGet("partyModeTriggerHeroicBoss"), setValue = TriggerSet("partyModeTriggerHeroicBoss") },
+                CB_SPLITS
+            );  y = y - h
 
-        -- Row 4: Bloodlust (debuff-triggered, hardcoded 40s; intentionally NOT
-        -- wired into the Auto Celebration Duration slider, so it has its own
-        -- setValue rather than the shared TriggerSet).
-        _, h = W:TripleRow(parent, y,
-            { type = "checkbox", text = "Bloodlust",
-              getValue = TriggerGet("partyModeTriggerBloodlust"),
-              setValue = function(v)
-                  if not EllesmereUIDB then EllesmereUIDB = {} end
-                  EllesmereUIDB.partyModeTriggerBloodlust = v
-                  if EllesmereUI_UpdatePartyModeLustListener then EllesmereUI_UpdatePartyModeLustListener() end
-                  local rl = EllesmereUI._widgetRefreshList
-                  if rl then for i = 1, #rl do rl[i]() end end
-              end },
-            nil,
-            nil,
-            CB_SPLITS
-        );  y = y - h
+            -- Row 3: Normal Boss Kill | Raid Finder Boss Kill | Mythic 0 Completion
+            _, h = W:TripleRow(parent, y,
+                { type = "checkbox", text = "Normal Boss Kill",       getValue = TriggerGet("partyModeTriggerNormalBoss"),  setValue = TriggerSet("partyModeTriggerNormalBoss") },
+                { type = "checkbox", text = "Raid Finder Boss Kill",  getValue = TriggerGet("partyModeTriggerLFRBoss"),     setValue = TriggerSet("partyModeTriggerLFRBoss") },
+                { type = "checkbox", text = "Mythic 0 Completion",    getValue = TriggerGet("partyModeTriggerMythic0"),     setValue = TriggerSet("partyModeTriggerMythic0") },
+                CB_SPLITS
+            );  y = y - h
+
+            -- Row 4: Bloodlust | Level Up
+            _, h = W:TripleRow(parent, y,
+                bloodlustCheckbox, levelUpCheckbox, nil,
+                CB_SPLITS
+            );  y = y - h
+        end
 
         -- Bottom border for the checkbox grid (matches SectionHeader separator style)
         -- Placed 1px above current y so the next row's background doesn't cover it
@@ -432,6 +468,7 @@ do
                     or EllesmereUIDB.partyModeTriggerMythic0
                     or EllesmereUIDB.partyModeTriggerRatedBG
                     or EllesmereUIDB.partyModeTriggerRatedArena
+                    or EllesmereUIDB.partyModeTriggerLevelUp
                     or EllesmereUIDB.partyModeTriggerRandom
                     or false
             end
@@ -666,6 +703,7 @@ do
                 EllesmereUIDB.partyModeTriggerLFRBoss = nil
                 EllesmereUIDB.partyModeTriggerMythic0 = nil
                 EllesmereUIDB.partyModeTriggerBloodlust = nil
+                EllesmereUIDB.partyModeTriggerLevelUp = nil
                 EllesmereUIDB.partyModeTriggerRatedBG = nil
                 EllesmereUIDB.partyModeTriggerRatedArena = nil
                 EllesmereUIDB.partyModeTriggerRandom = nil
@@ -675,6 +713,9 @@ do
             end
             -- Stop random trigger timer
             EllesmereUI_StopRandomTrigger()
+            -- Drop the Bloodlust and Level Up event listeners with their keys
+            if EllesmereUI_UpdatePartyModeLustListener then EllesmereUI_UpdatePartyModeLustListener() end
+            if EllesmereUI_UpdatePartyModeLevelUpListener then EllesmereUI_UpdatePartyModeLevelUpListener() end
             -- Clear any override bindings
             if EllesmereUIPartyModeBindBtn then
                 ClearOverrideBindings(EllesmereUIPartyModeBindBtn)

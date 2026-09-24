@@ -112,9 +112,12 @@ local function SetFont(fs, size)
     fs:SetFont(font, size, flags)
 end
 
-local function PhysicalPixels(val)
+-- Icon size is a coordinate value like the window width and icon spacing, so it
+-- keeps its proportion at any UI scale; only snapped onto the pixel grid.
+local function SnapSize(val)
     local PP = EUI and EUI.PP
-    return (val or 0) * ((PP and PP.mult) or 1)
+    if PP and PP.Snap then return PP.Snap(val or 0) end
+    return val or 0
 end
 
 local function GetBarTexturePath()
@@ -448,8 +451,11 @@ end
 --  Instance visibility check
 -------------------------------------------------------------------------------
 local function ShouldHide(hideInDungeon, hideInRaid, hideInDelve, hideInPvP, hideOutOfInstance)
-    -- Always visible while options panel is open
-    if ns._optionsOpen then return false end
+    -- Always visible while configuring or positioning the element.
+    if ns._optionsOpen or EUI._unlockActive then return false end
+    -- Show/hide all windows hotkey. Both displays rebuild themselves on every cast, so
+    -- the check belongs here rather than in a one-off hide from the main file.
+    if ns._toggleHidden and ns.EDM.DB().toggleIncludeSpellHistory then return true end
     local _, iType = IsInInstance()
     if hideInDungeon and iType == "party" then return true end
     if hideInRaid and iType == "raid" then return true end
@@ -462,6 +468,7 @@ end
 -------------------------------------------------------------------------------
 --  ICON STRIP  (standalone movable frame)
 -------------------------------------------------------------------------------
+local _iconContainer
 local _iconStrip
 local _iconPool = {}
 local _lastAnimTimestamp = 0  -- tracks when to animate icon 1
@@ -470,6 +477,85 @@ local _iconLayoutKey = ""     -- tracks settings that affect icon layout (skip r
 
 local ANIM_DUR = 0.5
 local ANIM_SLIDE_PX = 6
+
+-- The saved iconPos remains the TOPLEFT of the newest icon, matching every
+-- existing profile.  The container expands around that fixed icon so changing
+-- the history length or growth direction never makes the row wander.
+local function IconStripGeometry(count)
+    local sh = DB()
+    local iconSz = SnapSize(sh.iconSize or 24)
+    local gap = sh.iconSpacing or 1
+    local dir = sh.growDirection or "LEFT"
+    count = max(1, count or sh.iconCount or 5)
+    local span = count * iconSz + (count - 1) * gap
+    local horizontal = dir == "LEFT" or dir == "RIGHT"
+    local width = horizontal and span or iconSz
+    local height = horizontal and iconSz or span
+    local leftOffset = dir == "LEFT" and (span - iconSz) or 0
+    local upOffset = dir == "UP" and (span - iconSz) or 0
+    return iconSz, gap, dir, width, height, leftOffset, upOffset
+end
+
+local function PositionIconContainer(count)
+    if not _iconContainer or not _iconStrip then return end
+    local iconSz, _, dir, width, height, leftOffset, upOffset = IconStripGeometry(count)
+
+    _iconContainer:SetSize(width, height)
+    _iconStrip:SetSize(iconSz, iconSz)
+    _iconStrip:ClearAllPoints()
+    if dir == "RIGHT" then
+        _iconStrip:SetPoint("LEFT", _iconContainer, "LEFT", 0, 0)
+    elseif dir == "LEFT" then
+        _iconStrip:SetPoint("RIGHT", _iconContainer, "RIGHT", 0, 0)
+    elseif dir == "DOWN" then
+        _iconStrip:SetPoint("TOP", _iconContainer, "TOP", 0, 0)
+    else
+        _iconStrip:SetPoint("BOTTOM", _iconContainer, "BOTTOM", 0, 0)
+    end
+
+    -- The shared anchor system owns placement while this element is linked.
+    if EUI.IsUnlockAnchored and EUI.IsUnlockAnchored("EDM_IconHistory") then return end
+
+    local pos = DB().iconPos
+    local firstLeft, firstTop
+    if pos and pos.x and pos.y then
+        firstLeft, firstTop = pos.x, pos.y
+    else
+        firstLeft = UIParent:GetWidth() * 0.5 - iconSz * 0.5
+        firstTop = UIParent:GetHeight() * 0.5 + iconSz * 0.5
+    end
+    _iconContainer:ClearAllPoints()
+    _iconContainer:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT",
+        firstLeft - leftOffset, firstTop + upOffset)
+end
+
+local function SaveIconPositionFromFrame(count)
+    if not _iconContainer then return end
+    local left, top = _iconContainer:GetLeft(), _iconContainer:GetTop()
+    if not left or not top then return end
+    local _, _, _, _, _, leftOffset, upOffset = IconStripGeometry(count)
+    DB().iconPos = { x = left + leftOffset, y = top - upOffset }
+end
+
+local function StartIconDrag(btn)
+    local anchored = EUI.IsUnlockAnchored and EUI.IsUnlockAnchored("EDM_IconHistory")
+    if btn == "LeftButton" and IsShiftKeyDown() and _iconContainer and not anchored then
+        _iconContainer._dragging = true
+        _iconContainer:StartMoving()
+    end
+end
+
+local function StopIconDrag()
+    if not _iconContainer then return end
+    _iconContainer._dragging = nil
+    _iconContainer:StopMovingOrSizing()
+    SaveIconPositionFromFrame(_iconContainer._layoutCount)
+    -- Shift may have been released during drag; disable mouse now.
+    if not IsShiftKeyDown() then
+        _iconStrip:EnableMouse(false)
+        for _, ic in ipairs(_iconPool) do ic.frame:EnableMouse(false) end
+    end
+end
 
 -------------------------------------------------------------------------------
 --  Fade-out clock (iconFadeTime > 0): each icon expires individually once
@@ -634,24 +720,9 @@ local function MakeIcon(parent)
     ic.frame:EnableMouse(false)
     -- Shift+drag on any icon moves the entire strip
     ic.frame:SetScript("OnMouseDown", function(_, btn)
-        if btn == "LeftButton" and IsShiftKeyDown() and _iconStrip then
-            _iconStrip._dragging = true
-            _iconStrip:StartMoving()
-        end
+        StartIconDrag(btn)
     end)
-    ic.frame:SetScript("OnMouseUp", function()
-        if _iconStrip then
-            _iconStrip._dragging = nil
-            _iconStrip:StopMovingOrSizing()
-            local left, top = _iconStrip:GetLeft(), _iconStrip:GetTop()
-            if left and top then DB().iconPos = { x = left, y = top } end
-            -- Shift may have been released during drag; disable mouse now
-            if not IsShiftKeyDown() then
-                _iconStrip:EnableMouse(false)
-                for _, ic in ipairs(_iconPool) do ic.frame:EnableMouse(false) end
-            end
-        end
-    end)
+    ic.frame:SetScript("OnMouseUp", StopIconDrag)
     local bg = ic.frame:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
     bg:SetColorTexture(0, 0, 0, 0.4)
@@ -697,34 +768,25 @@ end
 BuildIconStrip = function()
     local sh = DB()
     if not sh.iconEnabled or ShouldHide(sh.iconHideInDungeon, sh.iconHideInRaid, sh.iconHideInDelve, sh.iconHideInPvP, sh.iconHideOutOfInstance) then
-        if _iconStrip then _iconStrip:Hide() end
+        if _iconContainer then _iconContainer:Hide() end
         StopFadeClock()
         return
     end
 
-    if not _iconStrip then
-        _iconStrip = CreateFrame("Frame", "EllesmereUIDMIconStrip", UIParent)
+    if not _iconContainer then
+        _iconContainer = CreateFrame("Frame", "EllesmereUIDMIconHistoryFrame", UIParent)
+        _iconContainer:SetFrameStrata("MEDIUM")
+        _iconContainer:SetFrameLevel(10)
+        _iconContainer:SetClampedToScreen(true)
+        _iconContainer:SetMovable(true)
+        _iconContainer:EnableMouse(false)
+
+        _iconStrip = CreateFrame("Frame", "EllesmereUIDMIconStrip", _iconContainer)
         _iconStrip:SetFrameStrata("MEDIUM")
         _iconStrip:SetFrameLevel(10)
-        _iconStrip:SetClampedToScreen(true)
-        _iconStrip:SetMovable(true)
         _iconStrip:EnableMouse(false)
-        _iconStrip:SetScript("OnMouseDown", function(self, btn)
-            if btn == "LeftButton" and IsShiftKeyDown() then
-                self._dragging = true
-                self:StartMoving()
-            end
-        end)
-        _iconStrip:SetScript("OnMouseUp", function(self)
-            self._dragging = nil
-            self:StopMovingOrSizing()
-            local left, top = self:GetLeft(), self:GetTop()
-            if left and top then DB().iconPos = { x = left, y = top } end
-            if not IsShiftKeyDown() then
-                self:EnableMouse(false)
-                for _, ic in ipairs(_iconPool) do ic.frame:EnableMouse(false) end
-            end
-        end)
+        _iconStrip:SetScript("OnMouseDown", function(_, btn) StartIconDrag(btn) end)
+        _iconStrip:SetScript("OnMouseUp", StopIconDrag)
         -- Click-through unless shift is held (strip + all icon children)
         local modFrame = CreateFrame("Frame")
         modFrame:RegisterEvent("MODIFIER_STATE_CHANGED")
@@ -732,7 +794,7 @@ BuildIconStrip = function()
             if key == "LSHIFT" or key == "RSHIFT" then
                 local on = (down == 1)
                 -- Don't disable mouse mid-drag; let OnMouseUp end it naturally
-                if not on and _iconStrip._dragging then return end
+                if not on and _iconContainer._dragging then return end
                 _iconStrip:EnableMouse(on)
                 for _, ic in ipairs(_iconPool) do
                     ic.frame:EnableMouse(on)
@@ -743,8 +805,8 @@ BuildIconStrip = function()
         -- during animation. No strip-level background needed.
     end
 
-    local iconSz = PhysicalPixels(sh.iconSize or 24)
-    local gap = PhysicalPixels(sh.iconSpacing or 1)
+    local iconSz = SnapSize(sh.iconSize or 24)
+    local gap = sh.iconSpacing or 1
     local dir = sh.growDirection or "LEFT"
     local iconZoom = sh.iconZoom or 0.08
 
@@ -779,28 +841,23 @@ BuildIconStrip = function()
         StopFadeClock()
     end
 
-    -- Preview placeholders never backfill slots vacated by faded icons.
-    local showPreview = ns._optionsOpen and histCount < maxIcons
-        and not (fadeTime > 0 and #_history > 0)
+    -- Unlock Mode always reserves the configured maximum footprint. Live
+    -- history and fade state may change the icon contents, but never the mover
+    -- size while the user is positioning it. The options preview keeps its
+    -- existing behavior and does not backfill slots vacated by faded icons.
+    local showPreview = EUI._unlockActive or (ns._optionsOpen and histCount < maxIcons
+        and not (fadeTime > 0 and #_history > 0))
     local count = showPreview and maxIcons or histCount
 
     -- Nothing to show: hide the strip entirely
-    if count == 0 then _iconStrip:Hide(); return end
+    if count == 0 then _iconContainer:Hide(); return end
 
     -- Position and size only on layout change (checked after count is known)
     local iconAlphaCheck = sh.iconOpacity or 1
     local needsLayout = (iconSz .. "|" .. gap .. "|" .. dir .. "|" .. count .. "|" .. iconAlphaCheck) ~= _iconLayoutKey
     if needsLayout then
-        _iconStrip:SetSize(iconSz, iconSz)
-        local pos = sh.iconPos
-        if pos and pos.x and pos.y then
-            _iconStrip:ClearAllPoints()
-            _iconStrip:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", pos.x, pos.y)
-        elseif not _iconStrip._positioned then
-            _iconStrip:ClearAllPoints()
-            _iconStrip:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
-            _iconStrip._positioned = true
-        end
+        _iconContainer._layoutCount = count
+        PositionIconContainer(count)
     end
 
     while #_iconPool < ICON_POOL_SIZE do
@@ -910,6 +967,66 @@ BuildIconStrip = function()
     end
 
     _iconStrip:Show()
+    _iconContainer:Show()
+end
+
+-- First-class Unlock Mode element.  The frame spans every configured icon in
+-- preview mode, giving the strip the same labeled placement box as Combat Timer.
+ns.MakeIconHistoryUnlockElement = function(MK)
+    local function UnlockGeometry()
+        return IconStripGeometry(DB().iconCount or 5)
+    end
+    return MK({
+        key   = "EDM_IconHistory",
+        label = "Icon History",
+        group = "Damage Meters",
+        order = 657,
+        noResize = true,
+        noAnchorTarget = true,
+        -- Self-positioning: the container resizes with the LIVE icon count
+        -- (casts, fade-outs), and the unlock system's resize re-apply would pin
+        -- the stored CENTER of the MAX footprint on every resize -- turning the
+        -- fixed newest-icon anchor into centered growth. noInitHook delegates
+        -- both the login apply and every resize re-apply to applyPos below
+        -- (PositionIconContainer's newest-icon-TOPLEFT compensation).
+        noInitHook = true,
+        getFrame = function() return _iconContainer end,
+        getSize = function()
+            local _, _, _, width, height = UnlockGeometry()
+            return width, height
+        end,
+        isHidden = function() return not DB().iconEnabled end,
+        savePos = function(_, point, relPoint, x, y)
+            -- Unlock Mode stores registered elements as CENTER/CENTER offsets.
+            -- Convert that full-container center back to the legacy first-icon
+            -- TOPLEFT convention so old profiles and Shift-drag keep agreeing.
+            local iconSz, _, dir, width, height = UnlockGeometry()
+            local centerX = UIParent:GetWidth() * 0.5 + (x or 0)
+            local centerY = UIParent:GetHeight() * 0.5 + (y or 0)
+            local firstLeft = centerX - width * 0.5
+            local firstTop = centerY + height * 0.5
+            if dir == "LEFT" then firstLeft = firstLeft + width - iconSz end
+            if dir == "UP" then firstTop = firstTop - height + iconSz end
+            DB().iconPos = { x = firstLeft, y = firstTop }
+        end,
+        loadPos = function()
+            local pos = DB().iconPos
+            local iconSz, _, dir, width, height = UnlockGeometry()
+            local firstLeft = pos and pos.x or (UIParent:GetWidth() * 0.5 - iconSz * 0.5)
+            local firstTop = pos and pos.y or (UIParent:GetHeight() * 0.5 + iconSz * 0.5)
+            local left = firstLeft - (dir == "LEFT" and (width - iconSz) or 0)
+            local top = firstTop + (dir == "UP" and (height - iconSz) or 0)
+            return {
+                point = "CENTER", relPoint = "CENTER",
+                x = left + width * 0.5 - UIParent:GetWidth() * 0.5,
+                y = top - height * 0.5 - UIParent:GetHeight() * 0.5,
+            }
+        end,
+        clearPos = function() DB().iconPos = nil end,
+        applyPos = function()
+            PositionIconContainer((EUI._unlockActive and DB().iconCount) or _iconContainer and _iconContainer._layoutCount)
+        end,
+    })
 end
 
 -------------------------------------------------------------------------------
@@ -940,6 +1057,12 @@ local function MakeHistoryBar(parent)
     bar.fill:SetMinMaxValues(0, 1)
     bar.fill:SetValue(1)
     bar.fill:SetStatusBarTexture(BAR_TEX)
+    -- Blizzard Style: the same track and edge as the meter's own rows
+    -- (Classic WoW UI rows stay plain).
+    if ns.DMStyle() == "blizzard" then
+        bar._bg = bar.row:CreateTexture(nil, "BACKGROUND")
+        ns.DMApplyBlizzBarBg(bar)
+    end
 
     local tf = CreateFrame("Frame", nil, bar.fill)
     tf:SetAllPoints(bar.fill)
@@ -992,10 +1115,11 @@ local function BuildBarWindow()
         frame._bg = frame:CreateTexture(nil, "BACKGROUND")
         frame._bg:SetAllPoints()
 
-        -- Header
+        -- Header (inside the classic box's line; flush on every other look)
+        local ci = ns.DMClassicInset()
         local hdr = CreateFrame("Frame", nil, frame)
         hdr:SetHeight(22)
-        hdr:SetPoint("TOPLEFT"); hdr:SetPoint("TOPRIGHT")
+        hdr:SetPoint("TOPLEFT", frame, "TOPLEFT", ci, -ci); hdr:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -ci, -ci)
         hdr:SetFrameLevel(frame:GetFrameLevel() + 5)
         hdr:EnableMouse(true)
         frame._hdr = hdr
@@ -1013,25 +1137,32 @@ local function BuildBarWindow()
         -- Header icons (right-aligned, matching DM window style)
         local ICON_A = 0.4
         local ICON_HA = 0.9
-        local btnSize = 22
-        local btnPad = -2
+        -- Size and gap follow the style (the main window's rule at its
+        -- fixed 22 base): ns.DMHdrIconSize / ns.DMHdrIconPad.
+        local btnSize = ns.DMHdrIconSize(nil)
+        local btnPad = ns.DMHdrIconPad()
 
-        local function MakeHdrBtn(texFile, xOff, tooltip, onClick)
+        -- artKey: the header key whose stock-style art replaces the glyph
+        -- under a stock style (ns.DM_HDR_ART); the glyph stays where none exists.
+        local function MakeHdrBtn(texFile, xOff, tooltip, onClick, artKey)
             local btn = CreateFrame("Button", nil, hdr)
             btn:SetSize(btnSize, btnSize)
             btn:SetPoint("RIGHT", hdr, "RIGHT", xOff, 0)
             btn:SetFrameLevel(hdr:GetFrameLevel() + 2)
             local icon = btn:CreateTexture(nil, "ARTWORK")
             icon:SetAllPoints()
-            icon:SetTexture(texFile)
-            icon:SetDesaturated(true)
-            icon:SetVertexColor(1, 1, 1, ICON_A)
+            btn._hdrIcon = icon
+            if not ns.DMPaintHdrArt(icon, artKey) then
+                icon:SetTexture(texFile)
+                icon:SetDesaturated(true)
+                icon:SetVertexColor(1, 1, 1, ICON_A)
+            end
             btn:SetScript("OnEnter", function()
-                icon:SetVertexColor(1, 1, 1, ICON_HA)
+                if not ns.DMHdrHover(icon, true) then icon:SetVertexColor(1, 1, 1, ICON_HA) end
                 if EUI.ShowWidgetTooltip then EUI.ShowWidgetTooltip(btn, tooltip) end
             end)
             btn:SetScript("OnLeave", function()
-                icon:SetVertexColor(1, 1, 1, ICON_A)
+                if not ns.DMHdrHover(icon, false) then icon:SetVertexColor(1, 1, 1, ICON_A) end
                 if EUI.HideWidgetTooltip then EUI.HideWidgetTooltip() end
             end)
             btn:SetScript("OnClick", function()
@@ -1054,7 +1185,7 @@ local function BuildBarWindow()
                     if EUI.SelectPage then EUI:SelectPage("Spell History") end
                 end)
             end
-        end)
+        end, "settings")
 
         -- Btn 2: Lock/Unlock
         local lockBtnHdr = MakeHdrBtn(
@@ -1063,12 +1194,16 @@ local function BuildBarWindow()
             function()
                 frame._locked = not frame._locked
                 DB().barLocked = frame._locked
-                frame._lockBtn._icon:SetTexture(frame._locked and (MEDIA .. "dm_locked_top.png") or (MEDIA .. "dm_unlock_top.png"))
-            end
+                local ic = frame._lockBtn._icon
+                if not ns.DMPaintHdrArt(ic, frame._locked and "locked" or "unlocked") then
+                    ic:SetTexture(frame._locked and (MEDIA .. "dm_locked_top.png") or (MEDIA .. "dm_unlock_top.png"))
+                end
+            end,
+            frame._locked and "locked" or "unlocked"
         )
         frame._lockBtn = lockBtnHdr
         lockBtnHdr:SetScript("OnEnter", function()
-            lockBtnHdr._icon:SetVertexColor(1, 1, 1, ICON_HA)
+            if not ns.DMHdrHover(lockBtnHdr._icon, true) then lockBtnHdr._icon:SetVertexColor(1, 1, 1, ICON_HA) end
             if EUI.ShowWidgetTooltip then
                 EUI.ShowWidgetTooltip(lockBtnHdr, frame._locked and "Locked" or "Unlocked")
             end
@@ -1132,12 +1267,13 @@ local function BuildBarWindow()
 
     end
 
-    -- Apply styling (bg from spell history settings, header from DM settings)
-    _barWin._bg:SetColorTexture(sh.bgR or 0, sh.bgG or 0, sh.bgB or 0, sh.bgAlpha or 0.25)
+    -- Apply styling (bg from spell history settings, header from DM settings;
+    -- the classic header shade follows this window's own colour)
+    ns.DMPaintWindowBg(_barWin._bg, sh.bgR or 0, sh.bgG or 0, sh.bgB or 0, sh.bgAlpha or 0.25, true)
 
     local hc = dmCfg.hdrBgColor
     local hR, hG, hB = hc and hc.r or 0x1B/255, hc and hc.g or 0x1B/255, hc and hc.b or 0x1B/255
-    _barWin._hdrBg:SetColorTexture(hR, hG, hB, dmCfg.hdrBgAlpha or 1)
+    ns.DMPaintHeaderBg(_barWin._hdrBg, hR, hG, hB, dmCfg.hdrBgAlpha or 1, sh.bgR or 0, sh.bgG or 0, sh.bgB or 0)
 
     local tR, tG, tB
     if dmCfg.hdrTextUseAccent ~= false then tR, tG, tB = GetAccentRGB()
@@ -1146,21 +1282,22 @@ local function BuildBarWindow()
 
     -- Hide/show top bar
     local hideTop = sh.hideTopBar
+    local ci = ns.DMClassicInset()
     if hideTop then _barWin._hdr:Hide() else _barWin._hdr:Show() end
     _barWin._content:ClearAllPoints()
     if hideTop then
-        _barWin._content:SetPoint("TOPLEFT", _barWin, "TOPLEFT", 0, 0)
+        _barWin._content:SetPoint("TOPLEFT", _barWin, "TOPLEFT", ci, -ci)
     else
         _barWin._content:SetPoint("TOPLEFT", _barWin._hdr, "BOTTOMLEFT", 0, 0)
     end
-    _barWin._content:SetPoint("BOTTOMRIGHT", _barWin, "BOTTOMRIGHT", 0, 0)
+    _barWin._content:SetPoint("BOTTOMRIGHT", _barWin, "BOTTOMRIGHT", -ci, ci)
 
-    -- Size: width from DB, height auto-calculated from maxBars
+    -- Size: width from DB, height auto-calculated from maxBars (plus the
+    -- classic box's inset above and below)
     local hdrH = hideTop and 0 or 22
     local maxBars = sh.maxBars or 5
-    local barH = PhysicalPixels(sh.shBarHeight or 18)
-    local barSp = PhysicalPixels(dmCfg.barSpacing or 2)
-    local autoH = hdrH + maxBars * (barH + barSp)
+    local _, _, stride = ns._RowMetrics(sh.shBarHeight or 18, dmCfg.barSpacing or 2, _barWin:GetEffectiveScale())
+    local autoH = hdrH + maxBars * stride + ci * 2
     _barWin:SetSize(sh.barWidth or 300, autoH)
     _barWin._locked = sh.barLocked or false
     local pos = sh.barPos
@@ -1186,9 +1323,7 @@ RefreshBarWindow = function()
 
     local dmCfg = ns.EDM.DB()
     local sh = DB()
-    local barH = PhysicalPixels(sh.shBarHeight or 18)
-    local barSp = PhysicalPixels(dmCfg.barSpacing or 2)
-    local stride = barH + barSp
+    local barH, barSp, stride = ns._RowMetrics(sh.shBarHeight or 18, dmCfg.barSpacing or 2, _barWin:GetEffectiveScale())
     local texPath = GetBarTexturePath()
     local fontSize = sh.textSize or 11
     local content = _barWin._content
@@ -1247,6 +1382,9 @@ RefreshBarWindow = function()
                 bar.row:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, y)
                 bar.row:SetHeight(barH)
                 bar.fill:SetStatusBarTexture(texPath)
+                -- Blizzard Style: the stock bevel over the user's texture
+                -- (none under Classic WoW UI).
+                if ns.DMStyle() == "blizzard" then ns.DMApplyBlizzFill(bar.fill) end
                 bar.icon:SetSize(barH, barH)
                 bar._cachedEntry = nil -- force content rebuild
             end
@@ -1363,10 +1501,28 @@ function ns.ApplySpellHistory()
     if active then RegisterEvents() else UnregisterEvents(); StopCastAnim() end
 
     if sh.iconEnabled then BuildIconStrip()
-    elseif _iconStrip then _iconStrip:Hide() end
+    elseif _iconContainer then _iconContainer:Hide() end
 
     if sh.barEnabled then BuildBarWindow()
     elseif _barWin then _barWin:Hide() end
+
+    -- Keep disabled cost at zero: only subscribe to unlock transitions while
+    -- Icon History itself is enabled.
+    if sh.iconEnabled and not ns._iconUnlockListenerRegistered and EUI.RegisterUnlockModeListener then
+        ns._iconUnlockListenerRegistered = true
+        EUI:RegisterUnlockModeListener("EDM_IconHistory", function()
+            if DB().iconEnabled then BuildIconStrip() end
+        end)
+    elseif not sh.iconEnabled and ns._iconUnlockListenerRegistered and EUI.UnregisterUnlockModeListener then
+        EUI:UnregisterUnlockModeListener("EDM_IconHistory")
+        ns._iconUnlockListenerRegistered = nil
+    end
+end
+
+function ns.RefreshSpellHistoryProfile()
+    _shDB = nil
+    _iconLayoutKey = ""
+    ns.ApplySpellHistory()
 end
 
 function ns.ClearSpellHistory()

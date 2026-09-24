@@ -189,6 +189,41 @@ local function ZoneReactionColor()
     return 0.9, 0.85, 0.05
 end
 
+-- SEASON UPDATE: replace the ids when the crest set rotates; the tints are the
+-- item-quality colors the crest art itself uses and only move if Blizzard
+-- restyles them. Keep in sync with EllesmereUIQoL/EUI_UpgradeCalc.lua's
+-- Data.tracks, which tracks the same currencies for the upgrade planner (that
+-- addon can be disabled, so DataBars carries its own copy rather than reaching
+-- across for it). Names and icons come live from C_CurrencyInfo, so only the
+-- ids and tints are hardcoded. The keys are TIER slots, not ids: a season swap
+-- edits the ids here and every player's crest checklist still applies.
+local CRESTS = {
+    { key = "t1", id = 3442, hex = "1EFF00", r = 0.118, g = 1,     b = 0     },
+    { key = "t2", id = 3443, hex = "0070DD", r = 0,     g = 0.439, b = 0.867 },
+    { key = "t3", id = 3444, hex = "A335EE", r = 0.639, g = 0.208, b = 0.933 },
+    { key = "t4", id = 3445, hex = "FF8000", r = 1,     g = 0.502, b = 0     },
+    { key = "t5", id = 3446, hex = "FFD100", r = 1,     g = 0.820, b = 0     },
+}
+ns.CRESTS = CRESTS
+-- Currency id set: the crest block's CURRENCY_DISPLAY_UPDATE handler drops
+-- events that name some other currency (payload currencyType; nil = bulk).
+do
+    local ids = {}
+    for i = 1, #CRESTS do ids[CRESTS[i].id] = true end
+    ns.CREST_IDS = ids
+end
+
+-- SEASON UPDATE: rank-1 item level of each upgrade track, highest first;
+-- mirrors Data.tracks[*].ranks[1] in EllesmereUIQoL/EUI_UpgradeCalc.lua. Feeds
+-- the item level block's "Band" text swatch, which tints the number with the
+-- crest color of the track its gear sits in.
+local ILVL_BANDS = {
+    { 272, 5 }, { 259, 4 }, { 246, 3 }, { 233, 2 }, { 220, 1 },
+}
+-- Equipped item level, written by the ilvl block's Refresh; read by the band
+-- tint below (and its swatch preview) exactly like _lastDurabilityPct.
+local _lastAvgIlvl
+
 -- Themed per-block icon defaults (Icon Color row's "Default" swatch): spec ->
 -- live class color; professions -> live accent (matches their skill-bar fill,
 -- so no separate Default swatch there); durability -> DYNAMIC red->green tint
@@ -204,7 +239,14 @@ local ICON_DEFAULTS = {
     location    = { 0.918, 0.263, 0.208 },  -- EA4335
     -- Map-marker yellow, distinct from gold's peachy E2AC7A at a glance.
     coords      = { 0.961, 0.784, 0.259 },  -- F5C842
+    ilvl        = { 1, 1, 1 },
 }
+-- NOTE: no `crests` entry, and the block is deliberately absent from the
+-- options page's ICON_COLOR_BLOCKS. Its icons are inline |T|t escapes inside
+-- one FontString (variable segment count, per-crest tinting), and inline
+-- textures cannot be vertex-tinted -- the crest art is meant to read by its own
+-- tier color anyway.
+
 -- Lowest equipped-durability percent, written by the durability block's sampler; read by the dynamic tint below (and its swatch preview).
 local _lastDurabilityPct
 function ns.BlockIconDefault(bType)
@@ -237,6 +279,20 @@ end
 local TEXT_DYNAMIC = {
     location = ZoneReactionColor,
     coords   = ZoneReactionColor,
+    -- Item level "Band": the crest color of the upgrade track the equipped
+    -- gear sits in. Below the lowest track it stays white.
+    ilvl     = function()
+        local lvl = _lastAvgIlvl
+        if not lvl then return 1, 1, 1 end
+        for i = 1, #ILVL_BANDS do
+            local band = ILVL_BANDS[i]
+            if lvl >= band[1] then
+                local c = CRESTS[band[2]]
+                return c.r, c.g, c.b
+            end
+        end
+        return 1, 1, 1
+    end,
 }
 function ns.BlockTextDynamic(bType)
     local fn = TEXT_DYNAMIC[bType]
@@ -880,15 +936,68 @@ local function MakeStatBlock(blockCfg, slot, content, barCtx, opts)
         frame:SetScript("OnClick", opts.click(inst, function() return mouseOver end))
     end
 
+    -- Evented stat blocks (opts.events) never touch the heartbeat: the game
+    -- names the exact edges their value changes on, so the block samples only
+    -- there and costs nothing between them. Time-driven blocks (fps/ms) keep
+    -- the shared 1s ticker.
+    local function ForceTick()
+        tickCount = (opts.interval or 1) - 1
+        Tick()
+    end
+
+    -- Lets a tooltip resync the bar text with what it just sampled.
+    function inst:ForceSample()
+        ForceTick()
+    end
+
+    -- A sample taken right when an event fires can catch the source before
+    -- it's populated. Resample once more after a short delay to catch that.
+    -- One outstanding retry at a time: event bursts (durability drops hit
+    -- many items per damage wave) would otherwise queue a timer closure each.
+    local retryPending = false
+    local function ForceTickChecked()
+        ForceTick()
+        if opts.retryDelay and not retryPending then
+            retryPending = true
+            C_Timer.After(opts.retryDelay, function()
+                retryPending = false
+                if not inst._dead then ForceTick() end
+            end)
+        end
+    end
+
+    -- Same-frame event bursts (a damage wave fires the durability AND alert
+    -- events per slot) collapse to ONE sample after the frame settles.
+    local flushPending = false
+    local function FlushEventSample()
+        flushPending = false
+        if not inst._dead then ForceTickChecked() end
+    end
+    local function OnEventSample()
+        if flushPending then return end
+        flushPending = true
+        C_Timer.After(0, FlushEventSample)
+    end
+
     function inst:Enable()
         content:Show()
         lastVal = -1
         -- Sample on the very first tick regardless of interval.
         tickCount = (opts.interval or 1) - 1
-        ns.RegisterHeartbeat(opts.hbPrefix .. ":" .. self.key, Tick)
+        if opts.events then
+            if not self.eventFrame then
+                self.events = opts.events
+                self.eventFrame = MakeEventFrame(self, OnEventSample)
+            end
+            RegisterInstEvents(self)
+            ForceTickChecked()
+        else
+            ns.RegisterHeartbeat(opts.hbPrefix .. ":" .. self.key, Tick)
+        end
     end
 
     function inst:Disable()
+        UnregisterInstEvents(self)
         ns.UnregisterHeartbeat(opts.hbPrefix .. ":" .. self.key)
         content:Hide()
     end
@@ -902,6 +1011,7 @@ local function MakeStatBlock(blockCfg, slot, content, barCtx, opts)
 
     function inst:Destroy()
         self._dead = true
+        UnregisterInstEvents(self)
         content:Hide()
     end
 
@@ -918,7 +1028,12 @@ ns.BlockFactories.fps = function(blockCfg, slot, content, barCtx)
 
         local now = GetTime()
         -- UpdateAddOnMemoryUsage() iterates every loaded addon and is a noticeable spike; amortise the rescan to once per 30s.
-        if not skipMemoryScan and (now - sysLastMemScanTime) >= 30 then
+        -- Skipped entirely in combat: on a busy pull that spike can push the
+        -- hovered tooltip's whole script past the "script ran too long" watchdog
+        -- (field report: Murder Row, adds casting Felfire Orb). The data is
+        -- already tolerated at up to 30s stale, so holding it longer is not a
+        -- new behaviour; the next out-of-combat hover rescans normally.
+        if not skipMemoryScan and not InCombatLockdown() and (now - sysLastMemScanTime) >= 30 then
             sysLastMemScanTime = now
             UpdateAddOnMemoryUsage()
             local count = 0
@@ -1161,7 +1276,9 @@ ns.BlockFactories.durability = function(blockCfg, slot, content, barCtx)
         return pct
     end
 
-    local function DurabilityTooltip()
+    local function DurabilityTooltip(inst)
+        -- Resync the bar text whenever the tooltip opens.
+        if inst then inst:ForceSample() end
         local ar, ag, ab = 1, 1, 1
         ns.Tip_Begin(content)
         ns.Tip_AddDouble("Durability", SampleDurability() .. "%",
@@ -1173,11 +1290,169 @@ ns.BlockFactories.durability = function(blockCfg, slot, content, barCtx)
         hbPrefix = "durability",
         texture  = MEDIA .. "forge.png",
         iconExtra = 7,
-        interval = 2,
+        -- Durability only moves on damage/repair edges the game announces, so
+        -- the block samples on those events alone -- no heartbeat, and with no
+        -- other time-driven block enabled the 1s ticker never runs at all.
+        -- Self-repair items recalculate alerts without the durability event.
+        events   = { "UPDATE_INVENTORY_DURABILITY", "UPDATE_INVENTORY_ALERTS", "PLAYER_ENTERING_WORLD" },
+        -- Retry each sample once, a moment later.
+        retryDelay = 2,
         sample   = SampleDurability,
         suffix   = function() return "%" end,
         tooltip  = DurabilityTooltip,
     })
+end
+
+ns.BlockFactories.combat = function(blockCfg, slot, content, barCtx)
+    local inst = { cfg = blockCfg, slot = slot, content = content, ctx = barCtx }
+    inst.key = InstKey(barCtx, blockCfg)
+    inst.events = { "PLAYER_REGEN_DISABLED", "PLAYER_REGEN_ENABLED", "PLAYER_ENTERING_WORLD" }
+
+    local function IsInCombat()
+        return UnitAffectingCombat("player") and 1 or 0
+    end
+
+    local function CombatLabel(value)
+        return value == 1 and L["IN_COMBAT"] or L["OUT_OF_COMBAT"]
+    end
+
+    local function CombatTooltip()
+        ns.Tip_Begin(content)
+        ns.Tip_AddDouble(L["COMBAT_STATUS"], CombatLabel(IsInCombat()), 1, 1, 1, 1, 1, 1)
+        ns.Tip_Show()
+    end
+
+    local mouseOver = false
+    local lastValue = -1
+    local fontSize = max(9, floor(CONTENT_BASE * 0.4333 + 0.5))
+
+    local function D() return blockCfg.settings or {} end
+    local function BC() return barCtx.cfg end
+
+    local frame = CreateFrame("Button", nil, content)
+    frame:SetSize(60, 20)
+    frame:EnableMouse(true)
+    frame:RegisterForClicks("AnyUp")
+
+    local text = frame:CreateFontString(nil, "OVERLAY")
+    AttachTextOffset(inst, text)
+    text:SetPoint("LEFT")
+
+    local measureFS = frame:CreateFontString(nil, "OVERLAY")
+    measureFS:Hide()
+
+    local function ApplyColors()
+        local r, g, b
+        if mouseOver then
+            r, g, b = ns.GetAccent()
+        else
+            r, g, b = BlockColorOf(blockCfg)
+        end
+        text:SetTextColor(r, g, b, 1)
+    end
+
+    function inst:Refresh()
+        local barCfg = BC()
+        local barH = barCtx.GetThickness()
+        local isSide = barCtx.IsVertical()
+        local value = lastValue
+        if value < 0 then value = IsInCombat(); lastValue = value end
+        local collapsed = D().onlyInCombat == true and value ~= 1
+
+        if not collapsed and not content:IsShown() then content:Show() end
+
+        ns.SetFont(text, fontSize, barCfg)
+        text:SetText(EllesmereUI.L(CombatLabel(value)))
+        ApplyColors()
+
+        if InCombatLockdown() then
+            MaybeRelayout(inst)
+            return
+        end
+
+        if isSide then
+            local slotW = VSlotW(inst)
+            local innerW = max(36, slotW - 8)
+            frame:SetSize(innerW, fontSize + 4)
+            frame:ClearAllPoints()
+            frame:SetPoint("CENTER", content, "CENTER", 0, 0)
+            text:ClearAllPoints()
+            text:SetPoint("CENTER", frame, "CENTER", 0, 0)
+            ns.SetWrappedText(text, innerW, "CENTER")
+            content:SetSize(slotW, max(fontSize + 12, barH))
+        else
+            local align = blockCfg.align or "CENTER"
+            ns.ResetInlineText(text, align)
+            text:ClearAllPoints()
+            text:SetPoint("LEFT", frame, "LEFT", 0, 0)
+            ns.SetFont(measureFS, fontSize, barCfg)
+            -- Fixed width from the wider label so the block never resizes on
+            -- combat edges; either label can be the wide one per locale.
+            measureFS:SetText(EllesmereUI.L(CombatLabel(0)))
+            local wOut = measureFS:GetStringWidth() or 30
+            measureFS:SetText(EllesmereUI.L(CombatLabel(1)))
+            local width = max(30, ns.SnapToPixelGrid(max(wOut, measureFS:GetStringWidth() or 30)) + 2)
+            text:SetWidth(width)
+            frame:SetSize(width, barH)
+            frame:ClearAllPoints()
+            frame:SetPoint("CENTER", content, "CENTER", 0, 0)
+            content:SetSize(width, barH)
+        end
+        if collapsed then
+            content:Hide()
+            ns.Tip_Hide(content)
+        end
+        MaybeRelayout(inst)
+    end
+
+    local function RefreshFromEvent()
+        local value = IsInCombat()
+        if value == lastValue then return end
+        lastValue = value
+        inst:Refresh()
+        if mouseOver then CombatTooltip() end
+    end
+
+    frame:SetScript("OnEnter", function()
+        mouseOver = true
+        ApplyColors()
+        CombatTooltip()
+    end)
+    frame:SetScript("OnLeave", function()
+        mouseOver = false
+        ns.Tip_Hide(content)
+        ApplyColors()
+    end)
+
+    function inst:Enable()
+        content:Show()
+        lastValue = -1
+        if not self.eventFrame then
+            self.eventFrame = MakeEventFrame(self, RefreshFromEvent)
+        end
+        RegisterInstEvents(self)
+        RefreshFromEvent()
+    end
+
+    function inst:Disable()
+        UnregisterInstEvents(self)
+        content:Hide()
+    end
+
+    function inst:GetAutoLength()
+        if D().onlyInCombat == true and lastValue ~= 1 then return 0 end
+        if not content:IsShown() then return 0 end
+        if barCtx.IsVertical() then return max(content:GetHeight() or 40, 40) end
+        return max(content:GetWidth() or 70, 40)
+    end
+
+    function inst:Destroy()
+        self._dead = true
+        UnregisterInstEvents(self)
+        content:Hide()
+    end
+
+    return inst
 end
 
 -------------------------------------------------------------------------------
@@ -1361,7 +1636,7 @@ local function MakeLocationBlock(blockCfg, slot, content, barCtx, opts)
     -- click; PLAYER_REGEN_ENABLED drives Refresh's retry so a block built mid-fight becomes clickable once combat ends.
     local clickBtn
     local function EnsureClickButton()
-        if clickBtn or InCombatLockdown() then return clickBtn end
+        if clickBtn or InCombatLockdown() or not EllesmereUI.SecureSnippetsOK() then return clickBtn end
         local micro = _G.QuestLogMicroButton
         if not micro then return nil end
         clickBtn = CreateFrame("Button", "EWB_LOC_" .. inst.key, frame,
@@ -1735,13 +2010,15 @@ ns.BlockFactories.gold = function(blockCfg, slot, content, barCtx)
 
         local money = GetMoney()
         local ci = dg.coinIcons == true
+        local ab = dg.abbreviate == true
+        local fe = dg.forceEnglishUnits == true
         if isSide then
             local slotW = VSlotW(inst)
             local innerW = max(30, slotW - 8)
             -- One token per coin, one coin per line. Coin Colored tints the suffix letters
             -- (nothing to tint once Coin Icons is on, so the two compose); hovering drops it so the accent wash reads.
             local lines = ns.MoneyTokens(money, dg.showSmall == true, ci,
-                blockCfg.useCoinColor == true and not mouseOver)
+                blockCfg.useCoinColor == true and not mouseOver, ab, fe)
             local startSize = min(fontSize, max(10, floor(CONTENT_BASE * 0.52 + 0.5)))
             local goldFontSize = startSize
             ns.SetFont(goldText, goldFontSize, barCfg)
@@ -1752,11 +2029,11 @@ ns.BlockFactories.gold = function(blockCfg, slot, content, barCtx)
             else r, g, b = BlockColorOf(blockCfg) end
             goldText:SetTextColor(r, g, b, 1)
         elseif mouseOver then
-            goldText:SetText(ns.FormatMoneyPlain(money, dg.showSmall == true, ci))
+            goldText:SetText(ns.FormatMoneyPlain(money, dg.showSmall == true, ci, ab, fe))
             local r, g, b = ns.GetAccent()
             goldText:SetTextColor(r, g, b, 1)
         else
-            goldText:SetText(ns.FormatMoney(money, blockCfg.useCoinColor == true, dg.showSmall == true, ci))
+            goldText:SetText(ns.FormatMoney(money, blockCfg.useCoinColor == true, dg.showSmall == true, ci, ab, fe))
             if blockCfg.useCoinColor then
                 goldText:SetTextColor(1, 1, 1, 1)
             else
@@ -1823,8 +2100,8 @@ ns.BlockFactories.gold = function(blockCfg, slot, content, barCtx)
         else
             local slotW = HBudget(inst, 100)
             -- Fit against BOTH money formats so font/icon size and frame width stay identical hovered or not; otherwise it resizes on mouseover.
-            local plainText = ns.FormatMoneyPlain(money, dg.showSmall == true, ci)
-            local fancyText = ns.FormatMoney(money, blockCfg.useCoinColor == true, dg.showSmall == true, ci)
+            local plainText = ns.FormatMoneyPlain(money, dg.showSmall == true, ci, ab, fe)
+            local fancyText = ns.FormatMoney(money, blockCfg.useCoinColor == true, dg.showSmall == true, ci, ab, fe)
             local moneyText
             if mouseOver then moneyText = plainText else moneyText = fancyText end
             local bagTextValue = ""
@@ -2134,7 +2411,6 @@ ns.BlockFactories.xprep = function(blockCfg, slot, content, barCtx)
             inst:Refresh()
         end
     end)
-
     local nameText = content:CreateFontString(nil, "OVERLAY")
     AttachTextOffset(inst, nameText)
     local bar = CreateFrame("StatusBar", nil, content)
@@ -2149,11 +2425,24 @@ ns.BlockFactories.xprep = function(blockCfg, slot, content, barCtx)
     local function ComputeState()
         UpdateMode()
         if mode == "xp" then
-            -- At the level cap (or with XP gains off) there is no XP: collapse like rep mode
-            -- with no watched faction, even when the user forced Experience mode (otherwise "0% to level cap+1" junk).
+            -- At the level cap (or with XP gains off) there is no XP. AUTO mode
+            -- collapses (return nil) -- but an EXPLICIT d.mode must always render:
+            -- nil hides `content`, and barButton is a CHILD of content, so a
+            -- collapsed block has no hitbox and the right-click that toggles the
+            -- persisted mode back can never fire again -- the block stayed
+            -- cleared across reloads (field report 2026-08-13). The placeholder
+            -- keeps the block alive and names the way back.
             local atMax = XPAtMaxLevel()
             local xpOff = IsXPUserDisabled and IsXPUserDisabled()
-            if atMax or xpOff then return nil end
+            if atMax or xpOff then
+                if D().mode ~= "xp" then return nil end
+                return {
+                    label = xpOff and "XP Off (Right-Click: Rep)"
+                                   or "Max Level (Right-Click: Rep)",
+                    minV = 0, maxV = 1, curV = 0,
+                    r = 0.5, g = 0.5, b = 0.5, rested = 0,
+                }
+            end
             local curXP = UnitXP("player") or 0
             local maxXP = UnitXPMax("player") or 1
             if maxXP <= 0 then maxXP = 1 end
@@ -2169,9 +2458,41 @@ ns.BlockFactories.xprep = function(blockCfg, slot, content, barCtx)
             }
         end
         local name, reaction, minV, maxV, curV, factionID = GetWatchedFactionInfoCompat()
-        if not name then return nil end
+        if not name then
+            -- Same trap as the XP branch above: collapse only in AUTO mode. The
+            -- reported repro is exactly this arm -- right-click on the XP bar
+            -- forces d.mode="rep" with no watched faction, and the collapsed
+            -- block ate every later click.
+            if D().mode ~= "rep" then return nil end
+            return {
+                label = "No Rep Tracked",
+                minV = 0, maxV = 1, curV = 0,
+                r = 0.5, g = 0.5, b = 0.5, rested = 0,
+            }
+        end
+        -- Friendship factions (Captain Tokka, Cursed Angler ranks, etc.): the
+        -- watched-faction payload returns EQUAL reaction thresholds for these,
+        -- which collapsed the range to zero and rendered a permanent 0% with a
+        -- nonsense "8,400 / 8,401" tooltip (field report 2026-08-22). The
+        -- friendship API carries the real rank window -- same handling as the
+        -- Action Bars RepBar. Checked before renown, matching that code path.
+        local isFriendship = false
+        if factionID and C_GossipInfo and C_GossipInfo.GetFriendshipReputation then
+            local fi = C_GossipInfo.GetFriendshipReputation(factionID)
+            if fi and fi.friendshipFactionID and fi.friendshipFactionID > 0 then
+                isFriendship = true
+                minV = fi.reactionThreshold or 0
+                curV = fi.standing or minV
+                if fi.nextThreshold and fi.nextThreshold > minV then
+                    maxV = fi.nextThreshold
+                else
+                    -- Maxed friendship rank: render a full bar.
+                    minV, maxV, curV = 0, 1, 1
+                end
+            end
+        end
         -- Major Factions (renown progress)
-        if factionID and C_MajorFactions and C_MajorFactions.GetMajorFactionData then
+        if not isFriendship and factionID and C_MajorFactions and C_MajorFactions.GetMajorFactionData then
             local mfd = C_MajorFactions.GetMajorFactionData(factionID)
             if mfd and type(mfd.renownLevelThreshold) == "number" and mfd.renownLevelThreshold > 0 then
                 minV = 0; maxV = mfd.renownLevelThreshold; curV = mfd.renownReputationEarned or 0
@@ -2200,6 +2521,40 @@ ns.BlockFactories.xprep = function(blockCfg, slot, content, barCtx)
             r = cr, g = cg, b = cb, rested = 0,
         }
     end
+
+    -- Tooltip parity with every other block (clock/FPS/gold): info + the
+    -- action rows that document the mode toggle -- the toggle was invisible
+    -- without it. Built from the SAME ComputeState the bar renders from, so
+    -- the tip can never disagree with the bar (renown/paragon/placeholder
+    -- labels all inherit). Built on hover only -- zero idle cost. Wired HERE,
+    -- below ComputeState's declaration: at the barButton creation site above
+    -- the name would compile as a nil global inside the closure.
+    barButton:SetScript("OnEnter", function()
+        local state = ComputeState()
+        if not state then return end
+        local ar, ag, ab = ns.GetAccent()
+        ns.Tip_Begin(barButton)
+        ns.Tip_AddLine(state.label, 1, 1, 1)
+        if state.maxV and state.maxV > 1 then
+            local bl = BreakUpLargeNumbers
+            ns.Tip_AddDouble(L["PROGRESS"],
+                (bl and bl(state.curV) or state.curV) .. " / " .. (bl and bl(state.maxV) or state.maxV),
+                0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        if state.rested and state.rested > 0 then
+            local bl = BreakUpLargeNumbers
+            ns.Tip_AddDouble(L["RESTED"], (bl and bl(state.rested) or state.rested),
+                0.6, 0.6, 0.6, 0.3, 0.3, 1)
+        end
+        ns.Tip_AddLine(" ")
+        ns.Tip_AddDouble(L["RIGHT_CLICK"],
+            mode == "xp" and L["SWITCH_TO_REP"] or L["SWITCH_TO_XP"],
+            1, 1, 1, ar, ag, ab)
+        ns.Tip_Show()
+    end)
+    barButton:SetScript("OnLeave", function()
+        ns.Tip_Hide(barButton)
+    end)
 
     function inst:Refresh()
         local barCfg = BC()
@@ -2480,6 +2835,10 @@ ns.BlockFactories.travel = function(blockCfg, slot, content, barCtx)
     local inst = { cfg = blockCfg, slot = slot, content = content, ctx = barCtx }
     inst.key = InstKey(barCtx, blockCfg)
     -- BAG_UPDATE_DELAYED / SPELLS_CHANGED: ownership edges that must clear the negative hearthstone cache (rare at idle, cheap refresh).
+    -- Cooldown-START edges ride a player-filtered UNIT_SPELLCAST_SUCCEEDED
+    -- registered in Enable (RegisterInstEvents cannot unit-filter): every
+    -- hearth start IS a player cast, and BAG_UPDATE_COOLDOWN measured
+    -- idle-chatty (~0.7 Hz ambient with nothing cooling).
     inst.events = { "HEARTHSTONE_BOUND", "PLAYER_ENTERING_WORLD",
         "BAG_UPDATE_DELAYED", "SPELLS_CHANGED" }
 
@@ -2487,6 +2846,11 @@ ns.BlockFactories.travel = function(blockCfg, slot, content, barCtx)
     local _trvFitBuf1 = { "" }
     local _trvFitBuf2 = { "" }
     local mouseOver = false
+    -- Heartbeat demand-gate: the 1s tick runs ONLY while something is cooling
+    -- or the tooltip is open (live M:SS columns). Ready + un-hovered = no tick
+    -- at all; BAG_UPDATE_COOLDOWN announces every start edge and re-arms.
+    local ticking = false
+    local TravelSyncTicker -- forward declaration, filled in after TravelTick
 
     -- Pre-allocated tooltip line buffers (no per-show garbage). `spellId` is the static teleport spell ID (click overlay attribute), not the shown `name`.
     local _mythicLinesBuf = {}
@@ -2764,6 +3128,8 @@ ns.BlockFactories.travel = function(blockCfg, slot, content, barCtx)
         -- Block renders only icon + bind location; remaining cooldown lives in
         -- the tooltip. On cooldown (or an unknown/secret one) it dims to gray.
         local cd, cdKnown = TravelGetPrimaryCooldown()
+        inst._lastCooling = (not cdKnown) or cd > 0
+        TravelSyncTicker(mouseOver or inst._lastCooling)
 
         if mouseOver then
             local ar, ag, ab = ns.GetAccent()
@@ -2840,10 +3206,35 @@ ns.BlockFactories.travel = function(blockCfg, slot, content, barCtx)
         if cooling ~= inst._lastCooling then
             inst._lastCooling = cooling
             inst:Refresh()
+        elseif not cooling and not mouseOver then
+            -- Settled ready with no edge to paint: nothing left to watch.
+            TravelSyncTicker(false)
         end
     end
 
-    inst.eventFrame = MakeEventFrame(inst, function(self)
+    -- Fills the forward declaration above. Register/unregister is flag-guarded
+    -- so redundant syncs cost one boolean test.
+    TravelSyncTicker = function(want)
+        if want then
+            if not ticking then
+                ticking = true
+                ns.RegisterHeartbeat("travel:" .. inst.key, TravelTick)
+            end
+        elseif ticking then
+            ticking = false
+            ns.UnregisterHeartbeat("travel:" .. inst.key)
+        end
+    end
+
+    inst.eventFrame = MakeEventFrame(inst, function(self, event)
+        if event == "UNIT_SPELLCAST_SUCCEEDED" then
+            -- Cooldown-START lane (player casts only; every hearth start is
+            -- one): never invalidates the hearthstone pick, and while the
+            -- ticker already runs there is nothing to learn. One probe on a
+            -- start edge re-arms the tick; zero fires standing idle.
+            if not ticking then TravelTick() end
+            return
+        end
         ns.TravelInvalidateHearthCache()
         self:Refresh()
     end)
@@ -2851,11 +3242,16 @@ ns.BlockFactories.travel = function(blockCfg, slot, content, barCtx)
     function inst:Enable()
         content:Show()
         RegisterInstEvents(self)
-        ns.RegisterHeartbeat("travel:" .. self.key, TravelTick)
+        -- Player-filtered registration; Disable's UnregisterAllEvents drops it,
+        -- so it re-registers here (re-registration is idempotent).
+        pcall(self.eventFrame.RegisterUnitEvent, self.eventFrame, "UNIT_SPELLCAST_SUCCEEDED", "player")
+        -- Armed at enable as a belt; the first settled ready read stands it
+        -- down (TravelTick's else branch or any Refresh).
+        TravelSyncTicker(true)
     end
 
     function inst:Disable()
-        ns.UnregisterHeartbeat("travel:" .. self.key)
+        TravelSyncTicker(false)
         UnregisterInstEvents(self)
         content:Hide()
     end
@@ -2916,6 +3312,8 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
                     -- its name read is stale; SPELLS_CHANGED fires once the swap applied
                     -- (same signal CDM keys its talent-swap rebuilds off) and re-reads the settled name.
                     "TRAIT_CONFIG_UPDATED", "SPELLS_CHANGED",
+                    -- Combat cancelling a loadout swap started from this block.
+                    "CONFIG_COMMIT_FAILED",
                     "PLAYER_ENTERING_WORLD",
                     -- Refresh runs in combat too (our frames only); regen is a cheap catch-up for anything a combat path missed.
                     "PLAYER_REGEN_ENABLED" }
@@ -2947,22 +3345,42 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
     local currentSpecIdx, currentLootSpecID = nil, 0
     local mouseOver = false
 
+    -- Loadout swap, Blizzard's sequence: the last-selected pointer is written
+    -- only once the swap is real -- immediately when no commit is needed,
+    -- else on the TRAIT_CONFIG_UPDATED that lands the commit. Nothing is
+    -- written up front, so a commit cancelled by combat leaves the pointer
+    -- on the loadout still applied.
+    local pendingSwapSpecId, pendingSwapConfigID
+    local function BeginLoadoutSwap(specId, configID)
+        local result = C_ClassTalents.LoadConfig(configID, true)
+        local R = Enum.LoadConfigResult
+        if result == R.NoChangesNecessary then
+            C_ClassTalents.UpdateLastSelectedSavedConfigID(specId, configID)
+        elseif result ~= R.Error then
+            pendingSwapSpecId, pendingSwapConfigID = specId, configID
+        end
+        inst:Refresh()
+    end
+
     -- Per-instance popup pools (lazy). Two spec blocks never fight over the same popup frames.
     local specPool, lootPool, loadoutPool
 
     local function D() return blockCfg.settings or {} end
     local function BC() return barCtx.cfg end
 
+    -- Spec reads go through C_SpecializationInfo: the legacy globals are not
+    -- registered on WoW Forever (same native functions on retail). The loot
+    -- spec pair and GetNumSpecializations are plain globals on both clients.
     local function BuildSpecCache()
         specCache = {}; numSpecs = GetNumSpecializations() or 0
         for i = 1, numSpecs do
-            local id, name, _, icon, role = GetSpecializationInfo(i)
+            local id, name, _, icon, role = C_SpecializationInfo.GetSpecializationInfo(i)
             if id then specCache[i] = { id = id, name = name, icon = icon, role = role } end
         end
     end
 
     local function UpdateCurrentSpec()
-        currentSpecIdx    = GetSpecialization()
+        currentSpecIdx    = C_SpecializationInfo.GetSpecialization()
         currentLootSpecID = GetLootSpecialization() or 0
     end
 
@@ -3232,9 +3650,7 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
         end
         if #entries == 0 then return end
         local pop = BuildPopup(subnavPool, specButton, nil, entries, function(e)
-            C_ClassTalents.LoadConfig(e.configID, true)
-            C_ClassTalents.UpdateLastSelectedSavedConfigID(specId, e.configID)
-            inst:Refresh()
+            BeginLoadoutSwap(specId, e.configID)
         end, true)
         -- Flyout anchoring: flush against the spec popup's edge, with its
         -- FIRST entry level with the row the cursor is on, so a straight
@@ -3319,7 +3735,7 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
         local inCombat = InCombatLockdown()
         BuildPopup(lootPool, specButton, L["CHANGE_LOOT_SPEC"], entries, function(e)
             local id = 0
-            if e.specIndex > 0 then id = select(1, GetSpecializationInfo(e.specIndex)) or 0 end
+            if e.specIndex > 0 then id = select(1, C_SpecializationInfo.GetSpecializationInfo(e.specIndex)) or 0 end
             SetLootSpecialization(id)
         end, inCombat, nil, true)
         if inCombat and hoverWatch then
@@ -3354,9 +3770,7 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
         -- Row clicks stay gated (LoadConfig is blocked); the list is viewable.
         local inCombat = InCombatLockdown()
         BuildPopup(loadoutPool, specButton, L["CHANGE_LOADOUT"], entries, function(e)
-            C_ClassTalents.LoadConfig(e.configID, true)
-            C_ClassTalents.UpdateLastSelectedSavedConfigID(specId, e.configID)
-            inst:Refresh()
+            BeginLoadoutSwap(specId, e.configID)
         end, inCombat)
         if inCombat and hoverWatch then
             hoverWatch._watchPool = loadoutPool
@@ -3564,7 +3978,27 @@ ns.BlockFactories.spec = function(blockCfg, slot, content, barCtx)
         end
     end)
 
-    inst.eventFrame = MakeEventFrame(inst, function(self)
+    inst.eventFrame = MakeEventFrame(inst, function(self, event, eventConfigID)
+        if pendingSwapConfigID then
+            if event == "TRAIT_CONFIG_UPDATED" then
+                -- The commit-landing event carries the ACTIVE combat config's id,
+                -- never the loadout's. Updates for any other config (loadout
+                -- saves/syncs, hero-talent data -- instance background churn) are
+                -- not the commit; the pointer is written from the remembered
+                -- loadout id once the active config reports the landing.
+                local active = C_ClassTalents.GetActiveConfigID
+                    and C_ClassTalents.GetActiveConfigID()
+                if active and eventConfigID == active then
+                    local specId, configID = pendingSwapSpecId, pendingSwapConfigID
+                    pendingSwapSpecId, pendingSwapConfigID = nil, nil
+                    C_ClassTalents.UpdateLastSelectedSavedConfigID(specId, configID)
+                end
+            elseif event == "CONFIG_COMMIT_FAILED" then
+                -- Payload deliberately not consulted: a failed commit while we are
+                -- pending is ours, whichever id it names.
+                pendingSwapSpecId, pendingSwapConfigID = nil, nil
+            end
+        end
         self:Refresh()
     end)
 
@@ -4093,7 +4527,7 @@ local mmHiders = {}
 local function MMGetHider(frame)
     local hider = mmHiders[frame]
     if hider then return hider end
-    if InCombatLockdown() then return nil end
+    if InCombatLockdown() or not EllesmereUI.SecureSnippetsOK() then return nil end
     hider = CreateFrame("Frame", nil, nil, "SecureHandlerStateTemplate")
     hider:SetFrameRef("target", frame)
     hider:SetAttribute("_onstate-vis", [[
@@ -4119,7 +4553,7 @@ function ns.RefreshMicroMenuHider(force)
         local bars = profile.bars
         for i = 1, #bars do
             local bar = bars[i]
-            if bar.visibility ~= "never" then
+            if not ns.VisIsNever(bar) then
                 for j = 1, #bar.blocks do
                     local b = bar.blocks[j]
                     if b.type == "micromenu" and b.settings and b.settings.disableBlizzardMicroMenu then
@@ -4159,9 +4593,9 @@ end
 local CS_DIM = "|cffaaaaaa"
 
 local function MMPrimaryStat()
-    local specIndex = GetSpecialization and GetSpecialization()
+    local specIndex = C_SpecializationInfo.GetSpecialization()
     if not specIndex or specIndex <= 0 then return nil end
-    local _, _, _, _, _, statID = GetSpecializationInfo(specIndex)
+    local _, _, _, _, _, statID = C_SpecializationInfo.GetSpecializationInfo(specIndex)
     if statID == LE_UNIT_STAT_STRENGTH  then return SPELL_STAT1_NAME or "Strength",  1 end
     if statID == LE_UNIT_STAT_AGILITY   then return SPELL_STAT2_NAME or "Agility",   2 end
     if statID == LE_UNIT_STAT_INTELLECT then return SPELL_STAT4_NAME or "Intellect", 4 end
@@ -4247,7 +4681,9 @@ local function MMOpenWhisper(charName, bnetName)
     end
     if charName and charName ~= "" then
         local sendTell = (ChatFrameUtil and ChatFrameUtil.SendTell) or ChatFrame_SendTell
-        if sendTell then sendTell(charName, DEFAULT_CHAT_FRAME) end
+        -- Fix "Name-Realm-Realm" to "Name-Realm"
+        local target = EllesmereUI.BuildFullName(charName) or charName
+        if sendTell then sendTell(target, DEFAULT_CHAT_FRAME) end
     end
 end
 
@@ -4277,10 +4713,24 @@ local function MMBuildSocialTip()
             if acc.isDND or ga.isGameBusy then icon = FRIENDS_TEXTURE_DND end
             -- Left text carries NO |c codes so hover recolor (Tip_Show) shows; its blue rides the left-color args. Right column keeps its codes.
             local left  = format("|T%s:16|t %s", icon, acc.accountName or "?")
-            local right = format("|cffecd672%s|r %s", charName or "?", ga.areaName or "")
+            -- A cross-faction BNet friend's characterName can be secret; format("%s", ...)
+            -- rejects it outright, so display text uses a nil'd-out copy. The real
+            -- charName below is kept whole for BuildFullName (invite/whisper). The
+            -- area name rides the same format call and the faction feeds a compare,
+            -- so a secret in either is dropped the same way: no area shown, and a
+            -- friend whose faction cannot be read is treated as not ours to invite.
+            local displayCharName, displayArea = charName, ga.areaName
+            local secretFaction = false
+            if issecretvalue then
+                if issecretvalue(displayCharName) then displayCharName = nil end
+                if issecretvalue(displayArea) then displayArea = nil end
+                secretFaction = issecretvalue(faction)
+            end
+            local right = format("|cffecd672%s|r %s", displayCharName or "?", displayArea or "")
             local bnetName   = acc.accountName
-            local sameFaction = (not faction) or (faction == playerFaction)
-            local inviteName  = (charName and realmName) and (charName .. "-" .. realmName) or charName
+            local sameFaction = (not secretFaction) and ((not faction) or (faction == playerFaction))
+            -- Fix "Name-Realm-Realm" to "Name-Realm"
+            local inviteName  = EllesmereUI.BuildFullName(charName, realmName)
             ns.Tip_AddClickable(left, right, function(mouseButton)
                 if mouseButton == "LeftButton" then
                     if IsShiftKeyDown() and sameFaction and inviteName then
@@ -4365,7 +4815,7 @@ local function MMBuildGuildTip()
             ns.Tip_AddClickable(left, zone or "", function(mouseButton)
                 if not fname then return end
                 if mouseButton == "LeftButton" then
-                    if IsShiftKeyDown() then C_PartyInfo.InviteUnit(fname)
+                    if IsShiftKeyDown() then C_PartyInfo.InviteUnit(EllesmereUI.BuildFullName(fname) or fname)
                     else MMOpenWhisper(fname, nil) end
                 end
             end, clr, clg, clb, 1, 1, 1)
@@ -4559,7 +5009,7 @@ ns.BlockFactories.micromenu = function(blockCfg, slot, content, barCtx)
         end
         local frame
         local gname = "EWB_MM_" .. inst.key .. "_" .. key
-        if microRef then
+        if microRef and EllesmereUI.SecureSnippetsOK() then
             -- Taint-safe: pass clicks through to the Blizzard MicroButton.
             frame = CreateFrame("Button", gname, content,
                 "SecureActionButtonTemplate,SecureHandlerStateTemplate")
@@ -4834,6 +5284,11 @@ ns.BlockFactories.currency = function(blockCfg, slot, content, barCtx)
         return nil
     end
 
+    local function Num(v)
+        if BreakUpLargeNumbers then return BreakUpLargeNumbers(v or 0) end
+        return tostring(v or 0)
+    end
+
     function inst:Refresh()
         local s = D()
         local barCfg = BC()
@@ -4962,12 +5417,17 @@ ns.BlockFactories.currency = function(blockCfg, slot, content, barCtx)
             ns.Tip_AddWrappedLine(info.description, 280, 0.8, 0.8, 0.8)
         end
         ns.Tip_AddLine(" ")
-        local qty
-        if BreakUpLargeNumbers then qty = BreakUpLargeNumbers(info.quantity or 0) else qty = tostring(info.quantity or 0) end
-        if info.maxQuantity and info.maxQuantity > 0 then
-            local maxQty
-            if BreakUpLargeNumbers then maxQty = BreakUpLargeNumbers(info.maxQuantity) else maxQty = tostring(info.maxQuantity) end
-            ns.Tip_AddDouble(L["TOTAL"], qty .. " / " .. maxQty, 0.6, 0.6, 0.6, 1, 1, 1)
+        local qty = Num(info.quantity)
+        local cap = info.maxQuantity
+        if cap and cap > 0 then
+            -- useTotalEarnedForMaxQty currencies (crests) cap what you EARNED this
+            -- season, not what you hold, so the wallet total is the wrong numerator.
+            if info.useTotalEarnedForMaxQty then
+                ns.Tip_AddDouble(L["TOTAL"], qty .. " |cffaaaaaa(" .. Num(info.totalEarned) .. "/" .. Num(cap) .. ")|r",
+                    0.6, 0.6, 0.6, 1, 1, 1)
+            else
+                ns.Tip_AddDouble(L["TOTAL"], qty .. " / " .. Num(cap), 0.6, 0.6, 0.6, 1, 1, 1)
+            end
         else
             ns.Tip_AddDouble(L["TOTAL"], qty, 0.6, 0.6, 0.6, 1, 1, 1)
         end
@@ -5002,6 +5462,473 @@ ns.BlockFactories.currency = function(blockCfg, slot, content, barCtx)
             elseif ToggleCharacter then
                 ToggleCharacter("TokenFrame")
             end
+        end
+    end)
+
+    inst.eventFrame = MakeEventFrame(inst, function(self)
+        self:Refresh()
+    end)
+
+    function inst:Enable()
+        content:Show()
+        RegisterInstEvents(self)
+    end
+
+    function inst:Disable()
+        UnregisterInstEvents(self)
+        content:Hide()
+    end
+
+    function inst:GetAutoLength()
+        if barCtx.IsVertical() then
+            return max(content:GetHeight() or 40, 30)
+        end
+        return max(content:GetWidth() or 60, 24)
+    end
+
+    function inst:Destroy()
+        self._dead = true
+        content:Hide()
+    end
+
+    return inst
+end
+
+-------------------------------------------------------------------------------
+--  CRESTS (season upgrade currencies, one compact readout)
+--
+--  Renders into ONE FontString using inline |T|t icon and |cff color escapes
+--  rather than a texture/fontstring pair per crest: the segment count is
+--  variable (the checklist and Hide Empty both drop entries) and crest coloring
+--  is per-segment anyway, so a single measured string beats up to fourteen
+--  regions. Same reason its icons sit out of the Icon Color row -- see the note
+--  by ICON_DEFAULTS.
+-------------------------------------------------------------------------------
+
+-- Separator glyph. A literal pipe has to be doubled or the text engine reads it
+-- as the start of an escape sequence.
+-- Dim tone for the tooltip's secondary (season progress) figure. Same value the
+-- character stats tooltip uses for its parenthesized ratings, kept local so the
+-- two sections stay independent.
+local CREST_DIM = "|cffaaaaaa"
+
+local CREST_SEPARATORS = {
+    slash = " / ",
+    line  = " || ",
+    dash  = " - ",
+    space = "   ",
+}
+
+-- Crest Colors is this block's nothing-stored default, so it resolves the same
+-- way the Icon Color row's "Default" swatch does instead of Gold's forced
+-- one-shot write: an untouched block is crest colored, and the first Custom
+-- click seeds b.color, which takes over. Shared with the options page so the
+-- 4th swatch lights on exactly this test.
+function ns.CrestColorMode(b)
+    if b.useCrestColor then return true end
+    return not b.useClassColor and not b.useAccentColor
+        and not b.useDynamicColor and b.color == nil
+end
+
+ns.BlockFactories.crests = function(blockCfg, slot, content, barCtx)
+    local inst = { cfg = blockCfg, slot = slot, content = content, ctx = barCtx }
+    inst.key = InstKey(barCtx, blockCfg)
+    inst.events = { "CURRENCY_DISPLAY_UPDATE" }
+
+    local mouseOver = false
+    -- Reused across refreshes: the string is rebuilt on every currency event,
+    -- so a fresh table per pass would allocate in a hot path.
+    local _segBuf = {}
+
+    local function D() return blockCfg.settings or {} end
+    local function BC() return barCtx.cfg end
+
+    local button = CreateFrame("Button", nil, content)
+    button:SetAllPoints()
+    button:EnableMouse(true)
+    button:RegisterForClicks("AnyUp")
+
+    local crestText = button:CreateFontString(nil, "OVERLAY")
+    AttachTextOffset(inst, crestText)
+
+    local function GetInfo(id)
+        if not (C_CurrencyInfo and C_CurrencyInfo.GetCurrencyInfo) then return nil end
+        return C_CurrencyInfo.GetCurrencyInfo(id)
+    end
+
+    local function Num(v)
+        if BreakUpLargeNumbers then return BreakUpLargeNumbers(v or 0) end
+        return tostring(v or 0)
+    end
+
+    -- Bar figure. Off: the spendable amount. On: season progress, which for
+    -- crests means totalEarned/maxQuantity -- a DIFFERENT number, which is why
+    -- the option is labelled Show Season Progress rather than Show Cap.
+    local function AmountText(info, seasonProgress)
+        local qty = info.quantity or 0
+        if not seasonProgress then return Num(qty) end
+        local cap = info.maxQuantity
+        if not cap or cap <= 0 then return Num(qty) end
+        local shown = qty
+        if info.useTotalEarnedForMaxQty then shown = info.totalEarned or qty end
+        return Num(shown) .. "/" .. Num(cap)
+    end
+
+    -- Tooltip figure: the spendable amount first (what the bar shows), then the
+    -- season cap progress dimmed in parentheses. Those two diverge as soon as
+    -- you spend a crest, so showing only one of them is what made the tooltip
+    -- read as contradicting the bar.
+    local function TooltipAmount(info)
+        local owned = Num(info.quantity or 0)
+        local cap = info.maxQuantity
+        if not cap or cap <= 0 then return owned end
+        local earned = info.quantity or 0
+        if info.useTotalEarnedForMaxQty then earned = info.totalEarned or earned end
+        return owned .. " " .. CREST_DIM .. "(" .. Num(earned) .. "/" .. Num(cap) .. ")|r"
+    end
+
+    function inst:Refresh()
+        local s = D()
+        local barCfg = BC()
+        local barH = barCtx.GetThickness()
+        local fontSize = max(9, floor(CONTENT_BASE * 0.4333 + 0.5))
+        local isSide = barCtx.IsVertical()
+
+        local showIcons  = s.showIcons ~= false
+        local seasonProg = s.showSeasonProgress == true
+        local hideEmpty  = s.hideEmpty == true
+        -- Crest tints are baked into the string, so hovering has to fall back
+        -- to plain segments for the accent wash to read (same as Gold).
+        local crestMode = ns.CrestColorMode(blockCfg) and not mouseOver
+        local iconSz = fontSize + 2
+
+        local from, to, step = 1, #CRESTS, 1
+        if s.reverse == true then from, to, step = #CRESTS, 1, -1 end
+
+        wipe(_segBuf)
+        for i = from, to, step do
+            local c = CRESTS[i]
+            if s[c.key] ~= false then
+                local info = GetInfo(c.id)
+                local seg
+                if info then
+                    if not (hideEmpty and (info.quantity or 0) <= 0) then
+                        seg = AmountText(info, seasonProg)
+                        if showIcons and info.iconFileID then
+                            seg = format("|T%s:%d:%d:0:0:64:64:5:59:5:59|t", info.iconFileID,
+                                iconSz, iconSz) .. seg
+                        end
+                        if crestMode then seg = "|cff" .. c.hex .. seg .. "|r" end
+                    end
+                else
+                    seg = "-"
+                end
+                if seg then _segBuf[#_segBuf + 1] = seg end
+            end
+        end
+
+        local text
+        if #_segBuf == 0 then
+            -- Everything filtered out (Hide Empty on an empty wallet, or the
+            -- whole checklist cleared): a placeholder keeps the block on the
+            -- bar instead of silently collapsing to nothing.
+            text = "-"
+        elseif isSide then
+            -- One crest per line on a side bar, like the Gold block's tokens.
+            text = tconcat(_segBuf, "\n")
+        else
+            local sep = CREST_SEPARATORS[s.separator or "slash"] or CREST_SEPARATORS.slash
+            if crestMode then sep = "|cff808080" .. sep .. "|r" end
+            text = tconcat(_segBuf, sep)
+        end
+
+        ns.SetFont(crestText, fontSize, barCfg)
+        if isSide then
+            local slotW = VSlotW(inst)
+            local innerW = max(24, slotW - 8)
+            crestText:SetText(text)
+            ns.SetWrappedText(crestText, innerW, "CENTER")
+            crestText:ClearAllPoints()
+            crestText:SetPoint("TOP", button, "TOP", 0, -4)
+            local totalH = max(8 + ns.SnapToPixelGrid(crestText:GetStringHeight()), barH)
+            content:SetSize(slotW, totalH)
+            button:SetSize(slotW, totalH)
+        else
+            local slotW = HBudget(inst, 200)
+            ns.ResetInlineText(crestText, "LEFT")
+            crestText:SetText(text)
+            crestText:ClearAllPoints()
+            crestText:SetPoint("LEFT", button, "LEFT", 0, 0)
+            local tw = ns.SnapToPixelGrid(crestText:GetStringWidth())
+            local totalW = min(slotW, tw + 4)
+            content:SetSize(max(totalW, 10), barH)
+            button:SetSize(max(totalW, 10), barH)
+        end
+
+        if mouseOver then
+            crestText:SetTextColor(ns.GetAccent())
+        elseif crestMode then
+            -- Every segment carries its own escape; a white base keeps the
+            -- separators and any placeholder neutral.
+            crestText:SetTextColor(1, 1, 1, 1)
+        else
+            crestText:SetTextColor(BlockColorOf(blockCfg))
+        end
+        MaybeRelayout(inst)
+    end
+
+    local function ShowCrestTooltip()
+        local ar, ag, ab = ns.GetAccent()
+        ns.Tip_Begin(button)
+        -- The header row doubles as the column legend: the parenthesized
+        -- figure below is the same one Blizzard's currency tooltip prints
+        -- under "Current season maximum", so naming it here costs no extra row.
+        ns.Tip_AddDouble(L["CRESTS"], L["SEASON_MAXIMUM"], 1, 1, 1, 0.667, 0.667, 0.667)
+        ns.Tip_AddLine(" ")
+        -- All five, whatever the bar shows: the block is the compact view and
+        -- the tooltip is the full one.
+        for i = 1, #CRESTS do
+            local c = CRESTS[i]
+            local info = GetInfo(c.id)
+            if info then
+                ns.Tip_AddDouble(info.name or "?", TooltipAmount(info),
+                    c.r, c.g, c.b, 1, 1, 1)
+            end
+        end
+        ns.Tip_AddLine(" ")
+        ns.Tip_AddDouble(L["LEFT_CLICK"], L["OPEN_CURRENCIES"], 1, 1, 1, ar, ag, ab)
+        ns.Tip_Show()
+    end
+
+    button:SetScript("OnEnter", function()
+        mouseOver = true
+        inst:Refresh()
+        ShowCrestTooltip()
+    end)
+    button:SetScript("OnLeave", function()
+        mouseOver = false
+        ns.Tip_Hide(button)
+        inst:Refresh()
+    end)
+    button:SetScript("OnClick", function(_, mb)
+        if mb ~= "LeftButton" then return end
+        if C_CurrencyInfo and C_CurrencyInfo.OpenCurrencyPanel then
+            C_CurrencyInfo.OpenCurrencyPanel()
+        elseif ToggleCharacter then
+            ToggleCharacter("TokenFrame")
+        end
+    end)
+
+    -- Payload-gated: a single-currency update that is not a crest is skipped;
+    -- a nil currencyType (bulk update) refreshes.
+    inst.eventFrame = MakeEventFrame(inst, function(self, _, currencyType)
+        if currencyType and not ns.CREST_IDS[currencyType] then return end
+        self:Refresh()
+    end)
+
+    function inst:Enable()
+        content:Show()
+        RegisterInstEvents(self)
+    end
+
+    function inst:Disable()
+        UnregisterInstEvents(self)
+        content:Hide()
+    end
+
+    function inst:GetAutoLength()
+        if barCtx.IsVertical() then
+            return max(content:GetHeight() or 40, 30)
+        end
+        return max(content:GetWidth() or 120, 24)
+    end
+
+    function inst:Destroy()
+        self._dead = true
+        content:Hide()
+    end
+
+    return inst
+end
+
+-------------------------------------------------------------------------------
+--  ITEM LEVEL (equipped / total, with an optional prefix)
+-------------------------------------------------------------------------------
+ns.BlockFactories.ilvl = function(blockCfg, slot, content, barCtx)
+    local inst = { cfg = blockCfg, slot = slot, content = content, ctx = barCtx }
+    inst.key = InstKey(barCtx, blockCfg)
+    inst.events = { "PLAYER_AVG_ITEM_LEVEL_UPDATE", "PLAYER_EQUIPMENT_CHANGED",
+                    "PLAYER_ENTERING_WORLD" }
+
+    local ILVL_TEX = MEDIA .. "micromenu\\menu-character.png"
+    local mouseOver = false
+
+    local function D() return blockCfg.settings or {} end
+    local function BC() return barCtx.cfg end
+
+    local button = CreateFrame("Button", nil, content)
+    button:SetAllPoints()
+    button:EnableMouse(true)
+    button:RegisterForClicks("AnyUp")
+
+    local icon = button:CreateTexture(nil, "OVERLAY")
+    icon:SetTexture(ILVL_TEX)
+    local ilvlText = button:CreateFontString(nil, "OVERLAY")
+    AttachTextOffset(inst, ilvlText)
+
+    -- Item level returns can be secret values, which detonate the moment they
+    -- reach format() or a tooltip width measure (see the micro menu's char
+    -- stats block). Strip them here, once, and every consumer below is safe.
+    local function AvgIlvl()
+        local total, equipped, pvp = GetAverageItemLevel()
+        if issecretvalue then
+            if issecretvalue(total) then total = nil end
+            if issecretvalue(equipped) then equipped = nil end
+            if issecretvalue(pvp) then pvp = nil end
+        end
+        return total, equipped, pvp
+    end
+
+    local function Fmt(v, p)
+        if not v then return "-" end
+        return format("%." .. p .. "f", v)
+    end
+
+    local function LongLabel()
+        return STAT_AVERAGE_ITEM_LEVEL or EllesmereUI.L(L["ITEM_LEVEL"])
+    end
+
+    function inst:Refresh()
+        local s = D()
+        local barCfg = BC()
+        local barH = barCtx.GetThickness()
+        local fontSize = max(9, floor(CONTENT_BASE * 0.4333 + 0.5))
+        local isSide = barCtx.IsVertical()
+        local gap = ICON_GAP
+
+        local total, equipped = AvgIlvl()
+        -- Published for the "Band" text swatch (and its options preview).
+        _lastAvgIlvl = equipped or total
+
+        local p = s.precision
+        if p == nil then p = 0 end
+        local mode = s.value or "equipped"
+        local body
+        if mode == "total" then
+            body = Fmt(total, p)
+        elseif mode == "both" then
+            body = Fmt(equipped, p) .. " / " .. Fmt(total, p)
+        else
+            body = Fmt(equipped, p)
+        end
+
+        -- Bar text goes straight through SetText, which does not route through
+        -- the locale like the Tip_* helpers, so the short prefix is translated
+        -- by hand; the long one rides Blizzard's own localized global.
+        local prefix = s.prefix or "short"
+        local text = body
+        if prefix == "short" then
+            text = EllesmereUI.L(L["ILVL"]) .. " " .. body
+        elseif prefix == "long" then
+            text = LongLabel() .. " " .. body
+        end
+
+        local iconSz = 0
+        if prefix == "icon" then
+            iconSz = fontSize + 2
+            icon:Show()
+        else
+            icon:Hide()
+        end
+
+        ns.SetFont(ilvlText, fontSize, barCfg)
+        if isSide then
+            local slotW = VSlotW(inst)
+            local innerW = max(24, slotW - 8)
+            ilvlText:SetText(text)
+            local totalH = 8
+            if iconSz > 0 then
+                icon:SetSize(iconSz, iconSz)
+                icon:ClearAllPoints()
+                icon:SetPoint("TOP", button, "TOP", 0, -4)
+                totalH = totalH + iconSz + 2
+            end
+            ns.SetWrappedText(ilvlText, innerW, "CENTER")
+            ilvlText:ClearAllPoints()
+            if iconSz > 0 then
+                ilvlText:SetPoint("TOP", icon, "BOTTOM", 0, -2)
+            else
+                ilvlText:SetPoint("TOP", button, "TOP", 0, -4)
+            end
+            totalH = totalH + ns.SnapToPixelGrid(ilvlText:GetStringHeight()) + 4
+            totalH = max(totalH, barH)
+            content:SetSize(slotW, totalH)
+            button:SetSize(slotW, totalH)
+        else
+            local slotW = HBudget(inst, 120)
+            ns.ResetInlineText(ilvlText, "LEFT")
+            ilvlText:SetText(text)
+            if iconSz > 0 then
+                icon:SetSize(iconSz, iconSz)
+                icon:ClearAllPoints()
+                icon:SetPoint("LEFT", button, "LEFT", 0, 0)
+            end
+            ilvlText:ClearAllPoints()
+            local xOff = 0
+            if iconSz > 0 then xOff = iconSz + gap end
+            ilvlText:SetPoint("LEFT", button, "LEFT", xOff, 0)
+            local tw = ns.SnapToPixelGrid(ilvlText:GetStringWidth())
+            local totalW = min(slotW, xOff + tw + 4)
+            content:SetSize(max(totalW, 10), barH)
+            button:SetSize(max(totalW, 10), barH)
+        end
+
+        do
+            local ir, ig, ib = IconColorOf(blockCfg)
+            icon:SetVertexColor(ir, ig, ib, 1)
+        end
+        if mouseOver then
+            ilvlText:SetTextColor(ns.GetAccent())
+        else
+            ilvlText:SetTextColor(BlockColorOf(blockCfg))
+        end
+        MaybeRelayout(inst)
+    end
+
+    local function ShowIlvlTooltip()
+        local ar, ag, ab = ns.GetAccent()
+        local total, equipped, pvp = AvgIlvl()
+        ns.Tip_Begin(button)
+        ns.Tip_AddLine(LongLabel(), 1, 1, 1)
+        ns.Tip_AddLine(" ")
+        if equipped then
+            ns.Tip_AddDouble(L["EQUIPPED"], format("%.2f", equipped), 0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        if total then
+            ns.Tip_AddDouble(L["TOTAL"], format("%.2f", total), 0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        -- PvP item level only exists in PvP-scaled gear; hide the row otherwise.
+        if pvp and pvp > 0 then
+            ns.Tip_AddDouble(L["PVP_ITEM_LEVEL"], format("%.2f", pvp), 0.6, 0.6, 0.6, 1, 1, 1)
+        end
+        ns.Tip_AddLine(" ")
+        ns.Tip_AddDouble(L["LEFT_CLICK"], L["OPEN_CHARACTER"], 1, 1, 1, ar, ag, ab)
+        ns.Tip_Show()
+    end
+
+    button:SetScript("OnEnter", function()
+        mouseOver = true
+        inst:Refresh()
+        ShowIlvlTooltip()
+    end)
+    button:SetScript("OnLeave", function()
+        mouseOver = false
+        ns.Tip_Hide(button)
+        inst:Refresh()
+    end)
+    button:SetScript("OnClick", function(_, mb)
+        if mb == "LeftButton" and ToggleCharacter then
+            ToggleCharacter("PaperDollFrame")
         end
     end)
 
@@ -5312,7 +6239,6 @@ local function GVToggleVault()
     end
     local wrf = _G.WeeklyRewardsFrame
     if not wrf then return end
-    if EllesmereUI.RegisterEscapeClose then EllesmereUI.RegisterEscapeClose(wrf) end
     wrf:SetShown(not wrf:IsShown())
 end
 
@@ -5480,6 +6406,8 @@ ns.BlockFactories.greatvault = function(blockCfg, slot, content, barCtx)
 
     return inst
 end
+-- No Great Vault on WoW Forever: no factory, so no instance, no keystone feed (the main file drops the block from BLOCK_TYPES too).
+if EllesmereUI.IS_FOREVER then ns.BlockFactories.greatvault = nil end
 
 -------------------------------------------------------------------------------
 --  SPACER (transparent block; the slot's optional bg tint still applies)
@@ -5739,6 +6667,421 @@ ns.BlockFactories.audio = function(blockCfg, slot, content, barCtx)
     end
 
     inst:Refresh()
+    return inst
+end
+
+-------------------------------------------------------------------------------
+--  BROKER PLUGIN (LibDataBroker) -- one block type for every data source
+-------------------------------------------------------------------------------
+-- The only block whose content is written by code we do not own, and three
+-- rules follow from that:
+--   1. Never write to the data object. A display READS; the plugin owns its own
+--      text, and a stray write would fight whoever set it.
+--   2. Every call into the plugin (OnEnter/OnLeave/OnClick/OnTooltipShow/
+--      OnMouseWheel) goes through pcall. A plugin that errors inside our hover
+--      or refresh path would otherwise take the bar's layout down with it.
+--   3. Width is never assumed stable. The other text blocks reserve width from
+--      a stable template so neighbours never shift; broker text has no shape we
+--      can predict, so this one measures live and offers a Max Width clamp.
+--
+-- Tooltips route three ways, in the plugin's own order of preference:
+--   OnEnter        the plugin draws its own tooltip (LibQTip, usually) into the
+--                  frame we hand it, and OnLeave takes it away. The owned
+--                  tooltip stays out of it -- two tooltips for one block, and
+--                  the plugin's is the one carrying the data.
+--   OnTooltipShow  the broker contract's GameTooltip path, and the one place in
+--                  this addon that still uses GameTooltip: the plugin writes
+--                  into it directly, which we cannot re-render.
+--   neither        name + text in the owned tooltip, so hover is never dead.
+
+-- Attributes worth a repaint. The library fires a per-NAME event carrying the
+-- changed key, so one registration covers the whole plugin and this set decides
+-- what is worth redrawing: a bar full of broker blocks never wakes for each
+-- other's updates, and a plugin parking its own state on the data object does
+-- not drag us through a re-measure for a key we never render.
+local LDB_WATCH = {
+    text = true, value = true, suffix = true, label = true,
+    icon = true, iconR = true, iconG = true, iconB = true, iconCoords = true,
+}
+
+-- Broker text arrives full of the plugin's own color codes, which silently beat
+-- this block's Text Color and its accent hover. Stripping them (default on)
+-- hands the color back to the block; leaving them keeps the plugin's palette.
+local function LDBStripColors(str)
+    if not str then return str end
+    str = str:gsub("|c%x%x%x%x%x%x%x%x", "")
+    str = str:gsub("|cn[%a%d_]+:", "")   -- named-color form (|cnGREEN_FONT_COLOR:)
+    str = str:gsub("|r", "")
+    return str
+end
+
+-- text is the display string; value+suffix is the fallback pair for plugins
+-- that publish the number and its unit separately.
+local function LDBDisplayText(obj)
+    if not obj then return nil end
+    local t = obj.text
+    if type(t) == "string" and t ~= "" then return t end
+    local v = obj.value
+    if v ~= nil then
+        local str = tostring(v)
+        local suf = obj.suffix
+        if type(suf) == "string" and suf ~= "" then str = str .. " " .. suf end
+        return str
+    end
+    return nil
+end
+
+ns.BlockFactories.ldb = function(blockCfg, slot, content, barCtx)
+    local inst = { cfg = blockCfg, slot = slot, content = content, ctx = barCtx }
+    inst.key = InstKey(barCtx, blockCfg)
+
+    local mouseOver = false
+    local bound        -- source name we currently hold attribute callbacks for
+    local tipMode      -- "own" | "gametip" | nil; picked at hover, read at leave
+
+    -- The collapse flip below is a Show/Hide, which lockdown can refuse. A block
+    -- built or re-sourced mid-combat therefore settles here rather than waiting
+    -- for a plugin update that may never come.
+    inst.events = { "PLAYER_REGEN_ENABLED" }
+
+    local function D() return blockCfg.settings or {} end
+    local function BC() return barCtx.cfg end
+
+    local button = CreateFrame("Button", nil, content)
+    button:EnableMouse(true)
+    button:RegisterForClicks("AnyUp")
+
+    local icon = button:CreateTexture(nil, "OVERLAY")
+    local text = button:CreateFontString(nil, "OVERLAY")
+    AttachTextOffset(inst, text)
+
+    -- The chosen source, or nil while its addon has not registered it yet.
+    local function Obj()
+        local name = D().source
+        if not name then return nil end
+        local LDB = ns.GetLDB()
+        if not LDB then return nil end
+        return LDB:GetDataObjectByName(name)
+    end
+
+    local function Unbind()
+        local LDB = ns.GetLDB()
+        if LDB and bound then
+            pcall(LDB.UnregisterCallback, inst, "LibDataBroker_AttributeChanged_" .. bound)
+        end
+        bound = nil
+    end
+
+    -- Idempotent: re-binds only when the chosen source actually changed.
+    local function Bind()
+        local name = D().source
+        if bound == name then return end
+        Unbind()
+        if not name then return end
+        local LDB = ns.GetLDB()
+        if not LDB then return end
+        -- Args are (event, sourceName, key, value, obj); only the key matters.
+        local function OnAttr(_, _, key)
+            if LDB_WATCH[key] and not inst._dead then inst:Refresh() end
+        end
+        pcall(LDB.RegisterCallback, inst, "LibDataBroker_AttributeChanged_" .. name, OnAttr)
+        bound = name
+    end
+
+    -- Untouched Icon Color leaves the plugin's artwork alone, honouring the
+    -- iconR/G/B tint if it declares one; any explicit choice in the options wins,
+    -- exactly as on every other icon-bearing block.
+    local function IconTint(obj)
+        local b = blockCfg
+        if b.iconColor or b.useIconClassColor or b.useIconAccentColor or b.useIconDefaultColor then
+            return IconColorOf(b)
+        end
+        if obj and type(obj.iconR) == "number" then
+            return obj.iconR, obj.iconG or 1, obj.iconB or 1
+        end
+        return 1, 1, 1
+    end
+
+    function inst:Refresh()
+        local s = D()
+        local barCfg = BC()
+        local barH = barCtx.GetThickness()
+        local fontSize = max(9, floor(CONTENT_BASE * 0.4333 + 0.5))
+        local isSide = barCtx.IsVertical()
+        local gap = ICON_GAP
+        Bind()
+
+        local obj = Obj()
+
+        -- A source picked on a session where its addon WAS loaded, opened on one
+        -- where it is not: collapse rather than show a dead slot. GetAutoLength
+        -- reports 0 and the solver drops the block and its gaps entirely.
+        local collapsed = (s.source ~= nil) and (obj == nil)
+        -- Show/Hide can be protected (another block on this bar may hold a
+        -- secure child): flip only on a real state change, never in lockdown.
+        if content:IsShown() == collapsed and not InCombatLockdown() then
+            if collapsed then content:Hide() else content:Show() end
+        end
+        if collapsed then
+            MaybeRelayout(inst)
+            return
+        end
+
+        local str
+        local placeholder = false
+        if not s.source then
+            -- Bar text goes straight through SetText, which does not route
+            -- through the locale like the Tip_* helpers do, so translate by hand.
+            str = EllesmereUI.L(L["SELECT_PLUGIN"])
+            placeholder = true
+        else
+            local body = LDBDisplayText(obj)
+            if s.showText == false then body = nil end
+            local lbl = obj.label
+            if s.showLabel and type(lbl) == "string" and lbl ~= "" then
+                if body then str = lbl .. ": " .. body else str = lbl end
+            else
+                str = body
+            end
+            if s.stripColors ~= false then str = LDBStripColors(str) end
+            if not str then str = "" end
+        end
+
+        local iconSz = 0
+        local tex = obj and obj.icon
+        if s.showIcon ~= false and tex then
+            iconSz = fontSize + 2
+            icon:SetTexture(tex)
+            local c = obj.iconCoords
+            if type(c) == "table" and #c == 4 then
+                icon:SetTexCoord(c[1], c[2], c[3], c[4])
+            else
+                icon:SetTexCoord(0, 1, 0, 1)
+            end
+            icon:SetSize(iconSz, iconSz)
+            local ir, ig, ib = IconTint(obj)
+            icon:SetVertexColor(ir, ig, ib, 1)
+            icon:Show()
+        else
+            icon:Hide()
+        end
+
+        -- Only steal the wheel for a plugin that asked for it.
+        button:EnableMouseWheel((obj and obj.OnMouseWheel) ~= nil)
+
+        if placeholder then
+            text:SetTextColor(0.55, 0.55, 0.55, 1)
+        elseif mouseOver then
+            local ar, ag, ab = ns.GetAccent()
+            text:SetTextColor(ar, ag, ab, 1)
+        else
+            local tr, tg, tb = BlockColorOf(blockCfg)
+            text:SetTextColor(tr, tg, tb, 1)
+        end
+
+        ns.SetFont(text, fontSize, barCfg)
+
+        if isSide then
+            local slotW = VSlotW(inst)
+            local innerW = max(24, slotW - 8)
+            local totalH = 8
+            if iconSz > 0 then
+                icon:ClearAllPoints()
+                icon:SetPoint("TOP", button, "TOP", 0, -4)
+                totalH = totalH + iconSz + 2
+            end
+            ns.SetWrappedText(text, innerW, "CENTER")
+            text:SetText(str)
+            text:ClearAllPoints()
+            if iconSz > 0 then
+                text:SetPoint("TOP", icon, "BOTTOM", 0, -2)
+            else
+                text:SetPoint("TOP", button, "TOP", 0, -4)
+            end
+            totalH = totalH + ns.SnapToPixelGrid(text:GetStringHeight() or fontSize) + 4
+            totalH = max(totalH, barH)
+            content:SetSize(slotW, totalH)
+            button:SetSize(slotW, totalH)
+        else
+            ns.ResetInlineText(text, "LEFT")
+            text:SetText(str)
+            local iconPad = 0
+            if iconSz > 0 then
+                iconPad = iconSz + gap
+                icon:ClearAllPoints()
+                icon:SetPoint("LEFT", button, "LEFT", 0, 0)
+            end
+            text:ClearAllPoints()
+            text:SetPoint("LEFT", button, "LEFT", iconPad, 0)
+            local w = s.maxWidth
+            if w then
+                -- Max Width: the block holds this width whatever the plugin
+                -- publishes, and longer strings clip. The setting that stops a
+                -- chatty broker from shoving its neighbours on every update.
+                text:SetWidth(max(20, w - iconPad - 2))
+                text:SetWordWrap(false)
+            else
+                w = iconPad + ns.SnapToPixelGrid(text:GetStringWidth() or 40) + 2
+            end
+            if w < 24 then w = 24 end
+            content:SetSize(w, barH)
+            button:SetSize(w, barH)
+        end
+
+        button:ClearAllPoints()
+        button:SetPoint("CENTER", content, "CENTER", 0, 0)
+        MaybeRelayout(inst)
+    end
+
+    local function HideTip()
+        if tipMode == "own" then
+            local obj = Obj()
+            if obj and obj.OnLeave then pcall(obj.OnLeave, button) end
+        elseif tipMode == "gametip" then
+            if GameTooltip:IsOwned(button) then GameTooltip:Hide() end
+        else
+            ns.Tip_Hide(button)
+        end
+        tipMode = nil
+    end
+
+    local function ShowTip()
+        local s = D()
+        local ar, ag, ab = ns.GetAccent()
+        -- Cleared up front so every early return below leaves the LAST hover's
+        -- route behind: HideTip reads this to decide whose tooltip to take away.
+        tipMode = nil
+        -- Unconfigured: the placeholder is the whole block, so the tooltip has
+        -- to say where a plugin is actually picked.
+        if not s.source then
+            ns.Tip_Begin(button)
+            ns.Tip_AddLine(L["SELECT_PLUGIN"], 1, 1, 1)
+            ns.Tip_AddLine(" ")
+            ns.Tip_AddDouble(L["LEFT_CLICK"], L["OPEN_SETTINGS"], 1, 1, 1, ar, ag, ab)
+            ns.Tip_Show()
+            return
+        end
+        local obj = Obj()
+        if not obj then return end
+        if obj.OnEnter then
+            tipMode = "own"
+            pcall(obj.OnEnter, button)
+            return
+        end
+        if obj.OnTooltipShow then
+            tipMode = "gametip"
+            GameTooltip:SetOwner(button, "ANCHOR_NONE")
+            GameTooltip:ClearAllPoints()
+            -- Same flip the owned tooltip does: a top bar drops its tooltip
+            -- below itself, a bottom bar lifts it above.
+            if barCtx.IsBarAtTop() then
+                GameTooltip:SetPoint("TOPLEFT", button, "BOTTOMLEFT", 0, -6)
+            else
+                GameTooltip:SetPoint("BOTTOMLEFT", button, "TOPLEFT", 0, 6)
+            end
+            GameTooltip:ClearLines()
+            if pcall(obj.OnTooltipShow, GameTooltip) then
+                GameTooltip:Show()
+            else
+                GameTooltip:Hide()
+                tipMode = nil
+            end
+            return
+        end
+        ns.Tip_Begin(button)
+        ns.Tip_AddLine(ns.LDBLabel(s.source, obj), 1, 1, 1)
+        local body = LDBDisplayText(obj)
+        if body then
+            ns.Tip_AddLine(" ")
+            ns.Tip_AddLine(LDBStripColors(body), 0.8, 0.8, 0.8)
+        end
+        ns.Tip_Show()
+    end
+
+    button:SetScript("OnEnter", function()
+        mouseOver = true
+        inst:Refresh()
+        ShowTip()
+    end)
+    button:SetScript("OnLeave", function()
+        mouseOver = false
+        HideTip()
+        inst:Refresh()
+    end)
+    button:SetScript("OnClick", function(_, mb)
+        -- No plugin picked yet: nothing to forward the click to, so send the
+        -- player to the picker instead of dead-ending there.
+        if not D().source then
+            -- Options surface is LoadOnDemand; load it so OpenBlockSettings exists.
+            if not ns.OpenBlockSettings then EllesmereUI:EnsureLoaded() end
+            if ns.OpenBlockSettings then
+                ns.OpenBlockSettings(barCtx.id, blockCfg.id, "ldb")
+            end
+            return
+        end
+        local obj = Obj()
+        if obj and obj.OnClick then pcall(obj.OnClick, button, mb) end
+    end)
+    button:SetScript("OnMouseWheel", function(_, delta)
+        local obj = Obj()
+        if obj and obj.OnMouseWheel then pcall(obj.OnMouseWheel, button, delta) end
+    end)
+
+    -- A source whose plugin registers later -- its addon loads after us, or on
+    -- demand -- binds the moment it appears; without this the block would sit
+    -- collapsed until something else happened to force a Refresh.
+    local function OnCreated(_, name)
+        if name == D().source and not inst._dead then
+            Bind()
+            inst:Refresh()
+        end
+    end
+
+    function inst:Enable()
+        content:Show()
+        if not self.eventFrame then
+            self.eventFrame = MakeEventFrame(self, function(me)
+                if not me._dead then me:Refresh() end
+            end)
+        end
+        RegisterInstEvents(self)
+        local LDB = ns.GetLDB()
+        if LDB then
+            pcall(LDB.RegisterCallback, inst, "LibDataBroker_DataObjectCreated", OnCreated)
+        end
+        Bind()
+    end
+
+    function inst:Disable()
+        UnregisterInstEvents(self)
+        local LDB = ns.GetLDB()
+        if LDB then
+            pcall(LDB.UnregisterCallback, inst, "LibDataBroker_DataObjectCreated")
+        end
+        Unbind()
+        content:Hide()
+    end
+
+    function inst:GetAutoLength()
+        if not content:IsShown() then return 0 end
+        if barCtx.IsVertical() then
+            return max(content:GetHeight() or 40, 30)
+        end
+        return max(content:GetWidth() or 60, 24)
+    end
+
+    function inst:Destroy()
+        self._dead = true
+        UnregisterInstEvents(self)
+        local LDB = ns.GetLDB()
+        if LDB then
+            pcall(LDB.UnregisterCallback, inst, "LibDataBroker_DataObjectCreated")
+        end
+        Unbind()
+        HideTip()
+        content:Hide()
+    end
+
     return inst
 end
 

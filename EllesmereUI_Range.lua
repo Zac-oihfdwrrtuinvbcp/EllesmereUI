@@ -1,8 +1,9 @@
 if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
 -------------------------------------------------------------------------------
 --  EllesmereUI_Range.lua
---  Shared range-check engine for the suite's three range consumers:
+--  Shared range-check engine for the suite's range consumers:
 --    - Nameplates "Distance to Target Text"  (spell-ladder lower bound)
+--    - Nameplates "Out of Range Alpha"       (class/spec cutoff probes)
 --    - QoL "Target Distance Text"            (item bracket or spell lower bound)
 --    - QoL crosshair out-of-range recolor    (cutoff probes + item fallback)
 --
@@ -80,6 +81,71 @@ local function ResetCaches()
     RG.probeCutoff = nil
 end
 
+local DRUID_MELEE_FORMS = { [1] = true, [2] = true } -- Bear, Cat
+
+-- Spec-derived attack cutoff, form check NOT included (that is the one live
+-- input; everything here only moves on spec/talent changes and is cached by
+-- Range_GetAttackCutoff below).
+local function SpecAttackCutoff(holyPaladinMelee)
+    local _, classFile = UnitClass("player")
+    local specIndex = GetSpecialization()
+    local specID = specIndex and GetSpecializationInfo(specIndex)
+    if not specID then return 5 end
+
+    if classFile == "DRUID" then
+        if specID == 102 or specID == 105 then
+            return IsPlayerSpell(197488) and 45 or 40 -- Astral Influence
+        end
+        return 5
+    elseif classFile == "DEMONHUNTER" then
+        return (specID == 577 or specID == 581) and 5 or 25
+    elseif classFile == "EVOKER" then
+        return specID == 1468 and 30 or 25
+    elseif classFile == "HUNTER" then
+        return (specID == 253 or specID == 254) and 40 or 5
+    elseif classFile == "PALADIN" then
+        return specID == 65 and not holyPaladinMelee and 40 or 5
+    elseif classFile == "SHAMAN" then
+        return specID == 263 and 5 or 40
+    elseif classFile == "MONK" then
+        return specID == 270 and 40 or 5
+    elseif classFile == "PRIEST" or classFile == "MAGE" or classFile == "WARLOCK" then
+        return 40
+    end
+    return 5
+end
+
+-- Attack range shared by range-aware UI. An explicit cutoff wins; otherwise
+-- class/spec decides -- CACHED, invalidated by the engine's activation events
+-- (spec/talent/spellbook churn): consumers call this at sweep/tick cadence and
+-- per-call GetSpecializationInfo re-derivation was measurable. Druid melee
+-- forms are the single live check. Holy Paladins can opt into melee range.
+function EllesmereUI.Range_GetAttackCutoff(customCutoff, holyPaladinMelee)
+    customCutoff = tonumber(customCutoff)
+    if customCutoff then
+        customCutoff = math.floor((customCutoff + 2.5) / 5) * 5
+        return math.max(5, math.min(50, customCutoff))
+    end
+
+    local _, classFile = UnitClass("player")
+    if classFile == "DRUID" and DRUID_MELEE_FORMS[GetShapeshiftForm()] then return 5 end
+
+    if holyPaladinMelee then
+        local v = RG.cutoffHolyMelee
+        if v == nil then
+            v = SpecAttackCutoff(true)
+            RG.cutoffHolyMelee = v
+        end
+        return v
+    end
+    local v = RG.cutoffBase
+    if v == nil then
+        v = SpecAttackCutoff(false)
+        RG.cutoffBase = v
+    end
+    return v
+end
+
 local function BuildLadder()
     RG.ladderBuilt = true
     RG.dirty = false
@@ -105,6 +171,16 @@ local function BuildLadder()
                     and (not C_Spell.IsSpellHarmful or C_Spell.IsSpellHarmful(sid)) then
                     local sinfo = C_Spell.GetSpellInfo(sid)
                     local maxR = sinfo and sinfo.maxRange
+                    -- A charge/leap-style spell with a nonzero minRange answers
+                    -- IsSpellInRange false both beyond maxRange AND inside its
+                    -- own dead zone (e.g. a gap-closer unusable under ~8yd) --
+                    -- the ladder walk below treats any false as "beyond this
+                    -- rung," so such a spell would falsely fade a target
+                    -- standing well inside melee range. Exclude it; other
+                    -- spells sharing its maxRange rung are unaffected.
+                    if sinfo and sinfo.minRange and sinfo.minRange > 0 then
+                        maxR = nil
+                    end
                     if maxR and maxR > 0 and maxR <= 100 then
                         local rung = byRange[maxR]
                         if not rung then
@@ -179,6 +255,9 @@ local function ItemChecksAllowed(unit)
     if issecretvalue and issecretvalue(can) then return false end
     return can == true
 end
+-- Shared with any other item-range reader (Quickdraw's usability tint) so the
+-- protection rule lives in one place.
+EllesmereUI.ItemRangeChecksAllowed = ItemChecksAllowed
 
 -------------------------------------------------------------------------------
 --  Queries
@@ -219,15 +298,10 @@ end
 -- nothing has answered in-range yet -- a beyond/within verdict at stopRange
 -- never needs the rungs past it. A cached full walk can serve a stopped
 -- query (its verdict at any cutoff is identical), never the other way.
-function EllesmereUI.Range_ItemBracket(unit, stopRange)
-    if not unit or not UnitExists(unit) then return nil end
-    if not (C_Item and C_Item.IsItemInRange) then return nil end
-    if not ItemChecksAllowed(unit) then return nil end
-    local now = GetTime()
-    if brCache.has and brCache.unit == unit and (now - brCache.t) < CACHE_TTL
-        and (brCache.stop == stopRange or brCache.stop == nil) then
-        return brCache.mn, brCache.mx
-    end
+-- Bare item walk, no cache reads or writes: the single-unit consumers cache
+-- through Range_ItemBracket below; the multi-unit plate sweep calls this
+-- directly so its fan-out can never evict the "target" cache slot.
+local function ItemWalk(unit, stopRange)
     local minY, maxY = 0, nil
     local answered = false
     for i = 1, #RANGE_ITEMS do
@@ -240,14 +314,27 @@ function EllesmereUI.Range_ItemBracket(unit, stopRange)
         elseif res == false then
             answered = true
             minY = entry.range
+            -- Only stop once THIS entry actually answered: an unowned item
+            -- sitting exactly at stopRange answers nil, not false, and must
+            -- not silently truncate the walk before a farther rung the
+            -- player DOES own gets a chance to give a real verdict.
+            if stopRange and entry.range >= stopRange then break end
         end
-        if stopRange and entry.range >= stopRange then break end
     end
-    if not answered then
-        brCache.unit, brCache.stop, brCache.t, brCache.has = unit, stopRange, now, true
-        brCache.mn, brCache.mx = nil, nil
-        return nil
+    if not answered then return nil end
+    return minY, maxY
+end
+
+function EllesmereUI.Range_ItemBracket(unit, stopRange)
+    if not unit or not UnitExists(unit) then return nil end
+    if not (C_Item and C_Item.IsItemInRange) then return nil end
+    if not ItemChecksAllowed(unit) then return nil end
+    local now = GetTime()
+    if brCache.has and brCache.unit == unit and (now - brCache.t) < CACHE_TTL
+        and (brCache.stop == stopRange or brCache.stop == nil) then
+        return brCache.mn, brCache.mx
     end
+    local minY, maxY = ItemWalk(unit, stopRange)
     brCache.unit, brCache.stop, brCache.t, brCache.has = unit, stopRange, now, true
     brCache.mn, brCache.mx = minY, maxY
     return minY, maxY
@@ -255,9 +342,12 @@ end
 
 -- Crosshair support: is the unit beyond `cutoff` yards? Probes the player's
 -- own harmful spells with ranges in [cutoff, cutoff+10] (the window keeps
--- outlier long-range utility spells from widening the answer), longest
--- first, first non-nil answer wins. Returns true/false, or nil when no
--- probe answered -- the caller falls back to the item ladder.
+-- outlier long-range utility spells from widening the answer), CLOSEST to
+-- cutoff first, first non-nil answer wins. Closest-first matters: a spell
+-- wider than cutoff answers in-range out to ITS OWN max and silently widens
+-- the cutoff -- a 40yd spell in a 30yd window answers true all the way to 40.
+-- Returns true/false, or nil when no probe answered -- the caller falls back
+-- to the item ladder.
 function EllesmereUI.Range_BeyondCutoff(unit, cutoff)
     if not unit or not UnitExists(unit) then return nil end
     if not (C_Spell and C_Spell.IsSpellInRange) then return nil end
@@ -267,10 +357,10 @@ function EllesmereUI.Range_BeyondCutoff(unit, cutoff)
         wipe(RG.probes)
         local maxWindow = cutoff + 10
         local ladder = RG.ladder
-        for i = #ladder, 1, -1 do -- ascending ladder walked backwards = longest first
+        for i = 1, #ladder do -- ascending ladder walked forwards = closest-to-cutoff first
             local rung = ladder[i]
-            if rung.range < cutoff then break end
-            if rung.range <= maxWindow then
+            if rung.range >= cutoff then
+                if rung.range > maxWindow then break end
                 local spells = rung.spells
                 for j = 1, #spells do
                     if #RG.probes >= MAX_PROBE_SPELLS then break end
@@ -292,6 +382,65 @@ function EllesmereUI.Range_BeyondCutoff(unit, cutoff)
     return nil
 end
 
+-- True/false when the unit can be classified against the supplied (or normal
+-- class/spec) attack range; nil when no spell or item probe answered.
+-- Single-unit consumers only (crosshair "target"): the item fallback rides
+-- the shared single-slot cache. Sweeps use Range_SweepBeyond below.
+function EllesmereUI.Range_IsBeyondAttackRange(unit, cutoff)
+    cutoff = cutoff or EllesmereUI.Range_GetAttackCutoff()
+    if cutoff > 5 then
+        local beyond = EllesmereUI.Range_BeyondCutoff(unit, cutoff)
+        if beyond ~= nil then return beyond end
+    end
+    local minY, maxY = EllesmereUI.Range_ItemBracket(unit, cutoff)
+    if minY == nil then return nil end
+    -- A bracket that straddles the cutoff (the first in-range rung sits past
+    -- it, the last out-of-range rung before it) cannot say which side the
+    -- unit is on: unknown, no fade, rather than a beyond guess.
+    if maxY and maxY > cutoff and minY < cutoff then return nil end
+    return maxY == nil or maxY > cutoff
+end
+
+-- Sweep-facing variant for MANY-unit consumers (nameplate out-of-range fade):
+-- verdicts ride a short-TTL per-unit map instead of the single-slot target
+-- caches (a 40-plate fan-out through those evicted the crosshair/QoL hits
+-- every tick), and the item fallback goes through the bare walk for the same
+-- reason. Encoded 0/1/2 = nil/true/false so cached nil verdicts still hit.
+-- NOTE the melee floor: at cutoff 5 the spell probes are skipped and the item
+-- walk is protection-gated (ItemChecksAllowed) -- in instanced combat against
+-- units whose attackability reads secret, melee verdicts degrade to nil (no
+-- fade) by design rather than risking a blocked action.
+local sweepCache = { t = 0, cutoff = nil, v = {} }
+local SWEEP_TTL = 0.4
+function EllesmereUI.Range_SweepBeyond(unit, cutoff)
+    if not unit or not UnitExists(unit) then return nil end
+    cutoff = cutoff or EllesmereUI.Range_GetAttackCutoff()
+    local now = GetTime()
+    if (now - sweepCache.t) > SWEEP_TTL or sweepCache.cutoff ~= cutoff then
+        wipe(sweepCache.v)
+        sweepCache.t = now
+        sweepCache.cutoff = cutoff
+    end
+    local hit = sweepCache.v[unit]
+    if hit ~= nil then
+        if hit == 0 then return nil end
+        return hit == 1
+    end
+    local beyond
+    if cutoff > 5 then
+        beyond = EllesmereUI.Range_BeyondCutoff(unit, cutoff)
+    end
+    if beyond == nil and C_Item and C_Item.IsItemInRange and ItemChecksAllowed(unit) then
+        local minY, maxY = ItemWalk(unit, cutoff)
+        -- Same straddle rule as Range_IsBeyondAttackRange: unknown, not beyond.
+        if minY ~= nil and not (maxY and maxY > cutoff and minY < cutoff) then
+            beyond = maxY == nil or maxY > cutoff
+        end
+    end
+    sweepCache.v[unit] = beyond == nil and 0 or (beyond and 1 or 2)
+    return beyond
+end
+
 
 -------------------------------------------------------------------------------
 --  Activation
@@ -311,6 +460,7 @@ function EllesmereUI.Range_SetActive(key, on)
             RG.evt = CreateFrame("Frame")
             RG.evt:SetScript("OnEvent", function()
                 RG.dirty = true
+                RG.cutoffBase, RG.cutoffHolyMelee = nil, nil
             end)
         end
         RG.evt:RegisterEvent("SPELLS_CHANGED")
@@ -319,6 +469,7 @@ function EllesmereUI.Range_SetActive(key, on)
         RG.evt:RegisterEvent("PLAYER_ENTERING_WORLD")
         -- Events were unregistered until now; anything may have changed.
         RG.dirty = true
+        RG.cutoffBase, RG.cutoffHolyMelee = nil, nil
     elseif not on and RG.activeCount == 0 then
         if RG.evt then RG.evt:UnregisterAllEvents() end
     end

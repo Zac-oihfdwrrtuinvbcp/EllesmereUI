@@ -72,8 +72,9 @@ end
 ------------------------------------------------------------------------------
 
 local durationFormatter, durationFormatterS
+local preciseDurationFormatters = {}
 
-local function BuildRuleDurationFormatter(withSecondsUnit)
+local function BuildRuleDurationFormatter(withSecondsUnit, preciseThreshold)
     if not (C_StringUtil and C_StringUtil.CreateNumericRuleFormatter
         and Enum.NumericRuleFormatRounding) then
         return nil
@@ -85,7 +86,7 @@ local function BuildRuleDurationFormatter(withSecondsUnit)
     -- live at the BREAKPOINT level; components carry only the divisor.
     -- (The original nested step/rounding inside components -- silently
     -- rejected or default-rounded depending on validation strictness.)
-    local ok = pcall(formatter.SetBreakpoints, formatter, {
+    local points = {
         { threshold = 0,     format = withSecondsUnit and "%ds" or "%d",  step = 1, rounding = Up },
         -- Minute-boundary catcher (field report: text flashed "0" just under a minute).
         -- Seconds round UP, so a raw value in (59, 60) can reach 60 and land at this
@@ -98,7 +99,29 @@ local function BuildRuleDurationFormatter(withSecondsUnit)
         { threshold = 61,    format = "%dm", step = 1, rounding = Down, components = { { div = 60 } } },
         { threshold = 3600,  format = "%dh", step = 1, rounding = Down, components = { { div = 3600 } } },
         { threshold = 86400, format = "%dd", step = 1, rounding = Down, components = { { div = 86400 } } },
-    })
+    }
+    -- > 60, not > 0: with the threshold at exactly one minute the m:ss band is
+    -- empty and the table would carry duplicate 60-thresholds -- the standard
+    -- table renders identically there.
+    if preciseThreshold and preciseThreshold > 60 then
+        -- Below the selected threshold, a clock-style value such as 5:23;
+        -- under a minute plain seconds ("45", or "45s" with the unit on),
+        -- matching the standard formatter's sub-minute look. The 60-band
+        -- catcher mirrors the stock table's: seconds round UP, so a raw value
+        -- in (59, 60) reaches 60 and must land as exactly 1:00, not wrap.
+        points = {
+            { threshold = 0, format = withSecondsUnit and "%ds" or "%d", step = 1, rounding = Up },
+            { threshold = 60, format = "%d:%02d", step = 1, rounding = Up,
+                components = { { div = 60 }, { mod = 60 } } },
+            { threshold = preciseThreshold, format = "%dm", step = 1, rounding = Down,
+                components = { { div = 60 } } },
+            { threshold = 3600, format = "%dh", step = 1, rounding = Down,
+                components = { { div = 3600 } } },
+            { threshold = 86400, format = "%dd", step = 1, rounding = Down,
+                components = { { div = 86400 } } },
+        }
+    end
+    local ok = pcall(formatter.SetBreakpoints, formatter, points)
     if not ok then return nil end
     return formatter
 end
@@ -127,7 +150,21 @@ end
 -- arg (every pre-existing caller) returns the original bare-seconds
 -- formatter unchanged. The SecondsFormatter fallback shows the unit in both
 -- variants (it cannot drop it) -- the accepted degraded look either way.
-function AK.GetDurationFormatter(showSecondsUnit)
+function AK.GetDurationFormatter(showSecondsUnit, preciseThreshold)
+    preciseThreshold = tonumber(preciseThreshold)
+    if preciseThreshold and preciseThreshold > 0 then
+        -- The UI tops out at 60 minutes. Keep that maximum just below one hour
+        -- internally so 59:59 stays in the precise bucket while 1h remains 1h.
+        -- Clamp saved/imported values too so malformed profiles cannot create
+        -- out-of-order formatter breakpoints.
+        preciseThreshold = math.max(60, math.floor(preciseThreshold + 0.5))
+        if preciseThreshold >= 3600 then preciseThreshold = 3599.0001 end
+        local key = (showSecondsUnit and "s" or "b") .. preciseThreshold
+        if preciseDurationFormatters[key] == nil then
+            preciseDurationFormatters[key] = BuildRuleDurationFormatter(showSecondsUnit, preciseThreshold) or false
+        end
+        return preciseDurationFormatters[key] or AK.GetDurationFormatter(showSecondsUnit)
+    end
     if showSecondsUnit then
         if not durationFormatterS then
             durationFormatterS = BuildRuleDurationFormatter(true) or BuildSecondsDurationFormatter()
@@ -176,6 +213,32 @@ end
 -- re-queue when the restriction lifts; see the lift watcher below the restyle worker.
 local deferredRestyles = {}
 
+-- Dispel-type ICON channel (style.dispelTypeIcon): ONE texture per button
+-- registered with the engine's NATIVE Icon style
+-- (Enum.CustomAuraButtonDispelTypeTextureStyle.Icon). Per aura, the engine
+-- stamps the RaidFrame-Icon-Debuff<Type> atlas via AuraUtil.
+-- SetAuraDispelTypeIcon, writes a white vertex color, and hides on untyped
+-- auras (ShouldShowDispelTypeForAura -- showWithoutDispelType unset), all in
+-- Blizzard_CustomAuraButton.lua. The aura's dispel type is never read by our
+-- code: identical in and out of the secret-value system. NO customDispelColorMap
+-- rides along -- the first build of this channel registered five one-hot
+-- alpha-mapped textures and the C-side options processor rejected the maps
+-- (all five rendered; the rollback also unhooked the ring until /reload).
+-- One options table shared across all buttons (engine securecopies per call).
+local DISPEL_ICON_POINTS = {
+    topleft = "TOPLEFT", top = "TOP", topright = "TOPRIGHT",
+    left = "LEFT", center = "CENTER", right = "RIGHT",
+    bottomleft = "BOTTOMLEFT", bottom = "BOTTOM", bottomright = "BOTTOMRIGHT",
+}
+local DISPEL_ICON_OPTS
+do
+    local iconStyle = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
+        and Enum.CustomAuraButtonDispelTypeTextureStyle.Icon
+    if iconStyle ~= nil then
+        DISPEL_ICON_OPTS = { style = iconStyle, showWhenHarmful = true, showWhenHelpful = false }
+    end
+end
+
 local function ApplyStyleToRegions(button, style)
     local d = bd[button]
     if not d then return end
@@ -194,6 +257,19 @@ local function ApplyStyleToRegions(button, style)
         d.appliedW, d.appliedH = w, h
     end
 
+    -- One mask shared by the icon, cooldown swipe, and base/dispel border art.
+    local shapeActive = style.iconShape and style.iconShape ~= "none" and style.shapeMaskPath
+    if shapeActive then
+        if not d.shapeMask then
+            d.shapeMask = button:CreateMaskTexture()
+        end
+        d.shapeMask:SetTexture(style.shapeMaskPath, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+        d.shapeMask:SetAllPoints(button)
+        d.shapeMask:Show()
+    elseif d.shapeMask then
+        d.shapeMask:Hide()
+    end
+
     if d.icon then
         if style.texCoord then
             d.icon:SetTexCoord(style.texCoord[1], style.texCoord[2], style.texCoord[3], style.texCoord[4])
@@ -203,13 +279,90 @@ local function ApplyStyleToRegions(button, style)
         else
             d.icon:SetTexCoord(0, 1, 0, 1)
         end
+
+        if shapeActive then
+            -- Grows the icon past button's rect to fill the mask's inset opening
+            -- edge-to-edge. SetPoint against button is change-guarded/deferred like
+            -- d.borderHost's anchor below; AddMaskTexture rides the same guard so a
+            -- denial rolls back mask + geometry together.
+            local insetPx = style.shapeInsetPx or 17
+            local visRatio = (128 - 2 * insetPx) / 128
+            local fullExpand = ((1 / visRatio) - 1) * 0.5
+            -- Coupled to Icon Zoom, mirroring Action Bars' shape-fill expansion: below
+            -- the zoom default the forced mask-fill magnification shrinks too (floor 0
+            -- -- button's own rect, no oversizing, at zoom 0), above it it grows past
+            -- fullExpand. 0.055 is PAB's own iconZoom default (BuildStyle), so a bar
+            -- that never touches the zoom slider renders identically to before.
+            local zoom = style.iconZoom or 0.055
+            local expand = math.max(fullExpand * (zoom / 0.055), 0)
+            local iconShapeKey = style.iconShape .. "|" .. w .. "|" .. h .. "|" .. zoom
+            if d.akIconShapeKey ~= iconShapeKey then
+                local ok = pcall(function()
+                    pcall(d.icon.RemoveMaskTexture, d.icon, d.shapeMask)
+                    d.icon:AddMaskTexture(d.shapeMask)
+                    d.icon:ClearAllPoints()
+                    d.icon:SetPoint("TOPLEFT", button, "TOPLEFT", -expand * w, expand * h)
+                    d.icon:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", expand * w, -expand * h)
+                end)
+                if ok then
+                    d.akIconShapeKey = iconShapeKey
+                elseif d.styleKey and AK.AurasRestricted() then
+                    deferredRestyles[d.styleKey] = true
+                end
+            end
+        elseif d.akIconShapeKey then
+            if d.shapeMask then pcall(d.icon.RemoveMaskTexture, d.icon, d.shapeMask) end
+            local ok = pcall(function()
+                d.icon:ClearAllPoints()
+                d.icon:SetAllPoints(button)
+            end)
+            if ok then
+                d.akIconShapeKey = nil
+            elseif d.styleKey and AK.AurasRestricted() then
+                deferredRestyles[d.styleKey] = true
+            end
+        end
     end
 
     if d.cooldown then
         d.cooldown:SetReverse(style.cooldownReverse ~= false)
         d.cooldown:SetDrawEdge(style.cooldownDrawEdge == true)
         d.cooldown:SetHideCountdownNumbers(true) -- duration text comes from the binding, not the swipe
-        d.cooldown:SetShown(style.hideSwipe ~= true)
+        -- Hidden-swipe gate. SetShown alone does not stick: the engine calls
+        -- Cooldown:SetCooldown on this frame whenever the slot's aura data
+        -- refreshes, and that native API implicitly re-Shows the frame.
+        -- Withholding the frame from SetDurationCooldown does not work either --
+        -- that registration is the button's DURATION SOURCE, so a button
+        -- without one loses its duration TEXT along with the swipe.
+        -- SetDrawSwipe is the knob that means what we want: keep the cooldown
+        -- registered and running, draw no swipe from it. It is persistent
+        -- cooldown STYLE rather than visibility (SetCooldown never resets it),
+        -- and it is annotated AllowedWhenTainted. With swipe, edge, and
+        -- countdown numbers all off, a re-shown frame draws nothing, so the
+        -- engine's re-Show is harmless.
+        local hideSwipe = style.hideSwipe == true
+        d.cooldown:SetShown(not hideSwipe)
+        if d.akHideSwipe ~= hideSwipe then
+            d.akHideSwipe = hideSwipe
+            if d.cooldown.SetDrawSwipe then d.cooldown:SetDrawSwipe(not hideSwipe) end
+        end
+
+        -- Clip the swipe to the shape and recolor its silhouette to match, instead
+        -- of a plain square/circle radial. Both calls are on our own d.cooldown
+        -- region, not the button -- no guard needed.
+        local cdMaskKey = shapeActive and style.iconShape or nil
+        if d.akCdMaskKey ~= cdMaskKey then
+            if cdMaskKey then
+                pcall(d.cooldown.AddMaskTexture, d.cooldown, d.shapeMask)
+                if d.cooldown.SetSwipeTexture then
+                    pcall(d.cooldown.SetSwipeTexture, d.cooldown, style.shapeMaskPath)
+                end
+            else
+                if d.shapeMask then pcall(d.cooldown.RemoveMaskTexture, d.cooldown, d.shapeMask) end
+                if d.cooldown.SetSwipeTexture then pcall(d.cooldown.SetSwipeTexture, d.cooldown, "") end
+            end
+            d.akCdMaskKey = cdMaskKey
+        end
     end
 
     -- Modules with their own text pipeline (fonts, anchors, outline rules) set
@@ -253,75 +406,239 @@ local function ApplyStyleToRegions(button, style)
         local PP = EllesmereUI.PP
         local b = style.border
         if PP and b then
-            if b.texture and EllesmereUI.ApplyBorderStyle then
-                -- Aura buttons can expose restricted geometry. Give the owned
-                -- border host an explicit public size (change-guarded because
-                -- anchoring to the aura button is denied while restricted).
-                local borderRect = (style.width or 18) .. "|" .. (style.height or style.width or 18)
-                if d.akBorderRect ~= borderRect then
-                    d.borderHost:ClearAllPoints()
-                    d.borderHost:SetPoint("CENTER", button, "CENTER")
-                    d.borderHost:SetSize(style.width or 18, style.height or style.width or 18)
-                    d.akBorderRect = borderRect
+            if shapeActive and style.shapeBorderPath then
+                -- A previous non-shaped style may have left either PP strips or
+                -- the secret-safe eight-slice texture set on this owned host.
+                -- Clear both before the shape ring takes over.
+                if d.borderMade then
+                    if EllesmereUI.ApplySecretSafeBorderStyle then
+                        EllesmereUI.ApplySecretSafeBorderStyle(d.borderHost, d, 0,
+                            0, 0, 0, 0, "solid")
+                    else
+                        PP.HideBorder(d.borderHost)
+                    end
                 end
-                if b.behindUnitFrame then
-                    d.borderHost:SetFrameLevel(math.max(0, (b.unitFrameLevel or 1) - 1))
-                else
-                    d.borderHost:SetFrameLevel(b.behind
-                        and math.max(0, button:GetFrameLevel() - 1)
-                        or (d.cooldown:GetFrameLevel() + 1))
-                end
-                EllesmereUI.ApplySecretSafeBorderStyle(d.borderHost, d, b.size or 1,
-                    b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1,
-                    b.texture or "solid", b.offsetX, b.offsetY, b.shiftX, b.shiftY,
-                    "unitframes", b.size or 1)
-                d.borderMade = true
-            elseif d.borderMade then
-                PP.UpdateBorder(d.borderHost, b.size or 1, b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1)
+                PP:ApplyMaskedShapeBorder(d.borderHost, d.shapeMask, style.shapeBorderPath,
+                    style.shapeBorderSize or b.size or 1, b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1)
             else
-                PP.CreateBorder(d.borderHost, b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1,
-                    b.size or 1, "OVERLAY", 7)
-                d.borderMade = true
+                PP:HideMaskedShapeBorder(d.borderHost)
+                if b.texture and EllesmereUI.ApplyBorderStyle then
+                    -- Aura buttons can expose restricted geometry. Give the owned
+                    -- border host an explicit public size (change-guarded because
+                    -- anchoring to the aura button is denied while restricted).
+                    local borderRect = (style.width or 18) .. "|" .. (style.height or style.width or 18)
+                    if d.akBorderRect ~= borderRect then
+                        d.borderHost:ClearAllPoints()
+                        d.borderHost:SetPoint("CENTER", button, "CENTER")
+                        d.borderHost:SetSize(style.width or 18, style.height or style.width or 18)
+                        d.akBorderRect = borderRect
+                    end
+                    if b.behindUnitFrame then
+                        d.borderHost:SetFrameLevel(math.max(0, (b.unitFrameLevel or 1) - 1))
+                    else
+                        d.borderHost:SetFrameLevel(b.behind
+                            and math.max(0, (d.buttonFrameLevel or 1) - 1)
+                            or (d.cooldown:GetFrameLevel() + 1))
+                    end
+                    -- addonKey/sizeKey pick the per-module texture offset defaults a
+                    -- style leaves nil; CDM passes its own so a textured border sits
+                    -- where the module's other icons put theirs.
+                    local appliedSize = (b.texture and b.texture ~= "" and b.texture ~= "solid")
+                        and (b.textureSize or b.size or 1) or (b.size or 1)
+                    -- b.edgePx: the surface's exact size (EllesmereUI.BorderPx), nil = legacy.
+                    EllesmereUI.ApplySecretSafeBorderStyle(d.borderHost, d, appliedSize,
+                        b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1,
+                        b.texture or "solid", b.offsetX, b.offsetY, b.shiftX, b.shiftY,
+                        b.addonKey or "unitframes", b.sizeKey or b.size or 1, b.edgeScale, b.edgePx)
+                    d.borderMade = true
+                else
+                    -- Solid border on the plain PP path. A style that came back
+                    -- from a textured pick leaves the eight-slice edges on this
+                    -- host and may never have built PP strips (the textured lane
+                    -- only hides them), so presence is decided by the strips
+                    -- themselves, not by borderMade.
+                    -- A textured exact size registered this host for the UI-scale
+                    -- re-apply: the size-0 solid call unregisters it and hides the
+                    -- edges (the strips and the host are shown again below).
+                    if d._pxsbEdge then
+                        EllesmereUI.ApplySecretSafeBorderStyle(d.borderHost, d, 0, 0, 0, 0, 0, "solid")
+                    else
+                        local edges = d._secretBorderEdges
+                        if edges then for _, tex in pairs(edges) do tex:Hide() end end
+                    end
+                    local solidPx = b.edgePx or b.size or 1
+                    if PP.GetBorders(d.borderHost) then
+                        PP.UpdateBorder(d.borderHost, solidPx, b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1)
+                        PP.ShowBorder(d.borderHost)
+                    else
+                        PP.CreateBorder(d.borderHost, b[1] or 0, b[2] or 0, b[3] or 0, b[4] or 1,
+                            solidPx, "OVERLAY", 7)
+                    end
+                    d.borderMade = true
+                end
             end
             d.borderHost:Show()
         else
+            if d._pxsbEdge then
+                EllesmereUI.ApplySecretSafeBorderStyle(d.borderHost, d, 0, 0, 0, 0, 0, "solid")
+            end
             d.borderHost:Hide()
+            if PP then PP:HideMaskedShapeBorder(d.borderHost) end
         end
     end
 
-    -- Engine dispel-type border (style.dispelBorder): one texture the engine shows
-    -- only on typed (dispellable) auras and tints per dispel type -- per-aura dispel
-    -- data is secret, so show/hide and color are ENGINE decisions. The Color style
-    -- never assigns a texture file, only vertex- tints: the ring ART is entirely ours
-    -- (media/textures/square-ring.png, a flat white band flush to a 64px canvas, 16
-    -- texels thick), registered purely as a tint target, and the user's dispel palette
-    -- rides in via customDispelColorMap (68824). The ring lives on a dedicated holder
-    -- one frame level over the static border host so the recolor always draws ON TOP
-    -- of the border strips; the text carrier sits one more above. Registration follows
-    -- the static border: no border configured, no dispel recolor (live parity). 68914
-    -- reworked the border API into the dispel-type texture system: the
-    -- tint-our-own-art style is now PreserveAsset on
+    -- Engine dispel-type border (style.dispelBorder): textures the engine shows only on
+    -- typed (dispellable) auras and tints per dispel type -- per-aura dispel data is
+    -- secret, so show/hide and color are ENGINE decisions. The ART is entirely ours,
+    -- registered purely as a tint target, and the user's dispel palette rides in via
+    -- customDispelColorMap (68824).
+    --
+    -- FOUR SOLID STRIPS, not one ring-shaped texture: the engine applies options,
+    -- visibility and SetVertexColor per registered texture (Blizzard_CustomAuraButton
+    -- iterates the whole list), so a four-texture ring is as legal as a one-texture
+    -- one. Thickness is GEOMETRY -- a cropped band texture goes sub-texel at large
+    -- icon sizes and bilinear-fades to alpha < 1, letting the static border bleed
+    -- into the dispel tint; solid strips never sample. Strips also stay off
+    -- SetTexCoord, which AddDispelTypeTexture stamps as a secret aspect on every
+    -- texture it takes (along with Alpha, VertexColor and Shown), and off
+    -- style.width: they hang from the holder, which SetAllPoints the button, so the
+    -- button rect drives the ring without ever being read (button rects are
+    -- restricted).
+    --
+    -- The strips live on a dedicated holder one frame level over the static border host
+    -- so the recolor always draws ON TOP of the border strips; the text carrier sits one
+    -- more above. Registration follows the static border: no border configured, no
+    -- dispel recolor (live parity). 68914 reworked the border API into the dispel-type
+    -- texture system: the tint-our-own-art style is now PreserveAsset on
     -- Enum.CustomAuraButtonDispelTypeTextureStyle (the old CustomAuraButtonBorderStyle
-    -- enum is deleted; its Color value is the ancestor, kept as a fallback for stale
-    -- PTR builds). The style MUST resolve: registering without it takes the
-    -- BorderWithIcon default, which stamps Blizzard atlas art over our ring texture.
+    -- enum is deleted; its Color value is the ancestor, kept as a fallback for stale PTR
+    -- builds). The style MUST resolve: registering without it takes the BorderWithIcon
+    -- default, which stamps Blizzard atlas art over ours. PreserveAsset is also the only
+    -- style that leaves our geometry alone -- it calls SetAuraBorderColor and nothing
+    -- else, no SetTexture and no SetTexCoord.
+    --
+    -- Shaped bars (style.iconShape) use a SEPARATE single-texture path (d.dispelShapeTex)
+    -- instead of the 4 strips: a hexagon/circle/etc outline cannot be built from 4
+    -- rectangles. It reuses the pre-shaped <shape>_border.tga art, WHOLE-texture (never
+    -- SetTexCoord-cropped -- that cropping is exactly what caused the bug the strips
+    -- above replaced) and clipped by the hardware mask (d.shapeMask), sized via the same
+    -- mask-expand math as the base border (bExp = 7 - borderPx). The two sets are
+    -- mutually exclusive per button; whichever is inactive is kept hidden every pass so a
+    -- shape toggle never leaves the other set's textures stuck visible after their
+    -- registration is cleared.
     local dispelTint = Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
         and Enum.CustomAuraButtonDispelTypeTextureStyle.PreserveAsset
     if dispelTint == nil then
         local legacy = (Enum and Enum.CustomAuraButtonBorderStyle) or AuraButtonBorderStyle
         dispelTint = legacy and legacy.Color
     end
-    if style.dispelBorder and not d.dispelBorder and d.dispelHolder
+    -- Blizzard Style (style.blizzBorder): ONE texture registered with the
+    -- engine's built-in Border style -- the engine stamps Blizzard's own
+    -- per-dispel-type debuff border atlas on it (red for untyped debuffs via
+    -- showWithoutDispelType), so this IS the stock aura border, art and colour
+    -- both engine-owned. No static border, no palette, no strips.
+    local blizzBorderStyle = style.blizzBorder and button.AddDispelTypeTexture
+        and Enum and Enum.CustomAuraButtonDispelTypeTextureStyle
+        and Enum.CustomAuraButtonDispelTypeTextureStyle.Border
+    if style.dispelBorder and d.dispelHolder
         and (button.AddDispelTypeTexture or button.SetAuraBorder) and dispelTint ~= nil then
-        d.dispelBorder = d.dispelHolder:CreateTexture(nil, "OVERLAY")
-        d.dispelBorder:SetTexture("Interface\\AddOns\\EllesmereUI\\media\\textures\\square-ring.png")
-        if d.dispelBorder.SetSnapToPixelGrid then
-            d.dispelBorder:SetSnapToPixelGrid(false)
-            d.dispelBorder:SetTexelSnappingBias(0)
+        if blizzBorderStyle then
+            if not d.blizzBorderTex then
+                -- Hidden on creation (the engine shows it per aura); no vertex
+                -- prewrite needed, the Border style writes white itself.
+                local tex = d.dispelHolder:CreateTexture(nil, "OVERLAY")
+                if tex.SetSnapToPixelGrid then
+                    tex:SetSnapToPixelGrid(false)
+                    tex:SetTexelSnappingBias(0)
+                end
+                tex:Hide()
+                d.blizzBorderTex = tex
+            end
+        elseif shapeActive and style.shapeBorderPath then
+            if not d.dispelShapeTex then
+                -- Neutral white tint base, written ONCE here (same rule as the strips
+                -- below): registration turns VertexColor into an engine-driven secret
+                -- aspect, so this must never be re-written on later restyle passes.
+                local tex = d.dispelHolder:CreateTexture(nil, "OVERLAY")
+                tex:SetVertexColor(1, 1, 1, 1)
+                if tex.SetSnapToPixelGrid then
+                    tex:SetSnapToPixelGrid(false)
+                    tex:SetTexelSnappingBias(0)
+                end
+                tex:Hide()
+                d.dispelShapeTex = tex
+            end
+            -- Unlike VertexColor, SetTexture isn't secret-tainted by registration --
+            -- must track shape changes here too, or the ring keeps whatever shape's
+            -- art was loaded when the texture was first created.
+            if d.akDispelShapeTexPath ~= style.shapeBorderPath then
+                d.dispelShapeTex:SetTexture(style.shapeBorderPath)
+                d.akDispelShapeTexPath = style.shapeBorderPath
+            end
+        elseif not d.dispelStrips then
+            -- Flat white: the engine multiplies its dispel color in through SetVertexColor,
+            -- so white is the neutral tint base. Written once here, while VertexColor is
+            -- still ours -- registration turns it into a secret aspect. Textures on our own
+            -- holder, never parented to the button, so creating them outside the button's
+            -- one legal creation window is fine.
+            --
+            -- Hidden on creation. A texture is shown by default, and the engine is what
+            -- shows these (per aura, on a typed one) -- if the registration below is denied
+            -- while auras are secret, an unhidden strip set would sit on the icon as a plain
+            -- WHITE ring until the restriction lifts and the deferred restyle re-runs.
+            local strips = {}
+            for i = 1, 4 do
+                local tex = d.dispelHolder:CreateTexture(nil, "OVERLAY")
+                tex:SetColorTexture(1, 1, 1, 1)
+                if tex.SetSnapToPixelGrid then
+                    tex:SetSnapToPixelGrid(false)
+                    tex:SetTexelSnappingBias(0)
+                end
+                tex:Hide()
+                strips[i] = tex
+            end
+            d.dispelStrips = strips
         end
-        d.dispelBorder:SetAllPoints(d.dispelHolder)
     end
-    if d.dispelBorder then
+
+    -- Dispel-type icon texture (see the channel catalog above). No art or tint
+    -- prewrites: the engine stamps atlas and vertex color per aura paint, and
+    -- registration turns Alpha/VertexColor/TexCoords/Shown into engine-driven
+    -- secret aspects anyway. Hidden on creation for the same reason as the
+    -- strips: the engine is what shows it. OVERLAY sublevel 2 draws it above
+    -- the recolor ring on the shared holder. Requires the NATIVE
+    -- AddDispelTypeTexture plus the Icon enum -- never the legacy alias.
+    if style.dispelTypeIcon and d.dispelHolder and not d.dispelIconTex
+        and button.AddDispelTypeTexture and DISPEL_ICON_OPTS then
+        local tex = d.dispelHolder:CreateTexture(nil, "OVERLAY", nil, 2)
+        if tex.SetSnapToPixelGrid then
+            tex:SetSnapToPixelGrid(false)
+            tex:SetTexelSnappingBias(0)
+        end
+        tex:Hide()
+        d.dispelIconTex = tex
+    end
+
+    local dispelTexSet
+    if blizzBorderStyle and d.blizzBorderTex then
+        dispelTexSet = { d.blizzBorderTex }
+        if d.dispelStrips then
+            for i = 1, 4 do d.dispelStrips[i]:Hide() end
+        end
+        if d.dispelShapeTex then d.dispelShapeTex:Hide() end
+    elseif shapeActive and d.dispelShapeTex then
+        dispelTexSet = { d.dispelShapeTex }
+        if d.dispelStrips then
+            for i = 1, 4 do d.dispelStrips[i]:Hide() end
+        end
+        if d.blizzBorderTex then d.blizzBorderTex:Hide() end
+    elseif d.dispelStrips then
+        dispelTexSet = d.dispelStrips
+        if d.dispelShapeTex then d.dispelShapeTex:Hide() end
+        if d.blizzBorderTex then d.blizzBorderTex:Hide() end
+    end
+
+    if dispelTexSet or d.dispelIconTex then
         -- Level re-assert (change-guarded): a style can move the border host's level;
         -- the ring stays FOUR levels above it (PP strip container at +1, DM fx
         -- border-override container at +2, DM per-filter glow at +3 -- the dispel
@@ -333,37 +650,137 @@ local function ApplyStyleToRegions(button, style)
             if d.stackCarrier then d.stackCarrier:SetFrameLevel(bl + 5) end
             d.akDispelLvl = bl
         end
-        -- Physical-pixel thickness by SOURCE CROPPING, never stretching:
-        -- the art is a flush band of B = 16 texels on a C = 64 canvas
-        -- (B/C = 1/4). Shrinking the sampled window inward by fraction a
-        -- per side leaves (B - C*a) band texels over a C*(1-2a) span, so
-        -- the rendered thickness at drawn size s is
-        --   t = s*(B - C*a) / (C*(1-2a))   =>   a = (s - 4t) / (4*(s - 2t)).
-        -- t converts the user's physical-pixel setting into this frame's
-        -- units via the holder's effective scale (our frame -- readable);
-        -- s is the style size, never a rect read (button rects are
-        -- restricted). The cropped band stays solid at any icon size.
-        local sw = style.width or 18
-        local px = style.dispelBorderPx or 2
-        local t = px
-        local eff = d.dispelHolder:GetEffectiveScale()
-        if eff and eff > 0 then
-            local PPx = EllesmereUI.PP
-            t = px * ((PPx and PPx.perfect) or 0.75) / eff
+
+        if not dispelTexSet then
+            -- Icons-only style: no ring set was ever created, skip ring geometry.
+        elseif blizzBorderStyle and d.blizzBorderTex then
+            -- The stock buff frame draws its 40px border round a 30px icon: a
+            -- sixth of the icon on each side. Anchored to the holder (button
+            -- rects are restricted) from the style's own size. Folded into
+            -- setKey below: the engine snapshots geometry at registration.
+            local bw, bh = style.width or 18, style.height or style.width or 18
+            local geomKey = bw .. "|" .. bh
+            if d.akBlizzGeom ~= geomKey then
+                local ox, oy = bw / 6, bh / 6
+                d.blizzBorderTex:ClearAllPoints()
+                d.blizzBorderTex:SetPoint("TOPLEFT", d.dispelHolder, "TOPLEFT", -ox, oy)
+                d.blizzBorderTex:SetPoint("BOTTOMRIGHT", d.dispelHolder, "BOTTOMRIGHT", ox, -oy)
+                d.akBlizzGeom = geomKey
+            end
+        elseif shapeActive and d.dispelShapeTex then
+            -- Same bExp mask-expand math as PP.ApplyMaskedShapeBorder, inlined since that
+            -- helper also writes SetVertexColor, which would fight the engine's per-aura
+            -- tint once registered. shapeBorderSize (not raw dispelBorderPx) so this ring
+            -- uses the same remapped units as the base shaped border.
+            local px = style.shapeBorderSize or style.dispelBorderPx or 2
+            local geomKey = style.iconShape .. "|" .. px
+            if d.akDispelGeom ~= geomKey then
+                local PPx = EllesmereUI.PP
+                local bExp = 7 - math.min(px, 7)
+                -- Pcall'd like the icon's own reposition above: an uncaught error would
+                -- abort the rest of this function, and the geomKey guard would never
+                -- retry with the same inputs.
+                local ok = pcall(function()
+                    d.dispelShapeTex:ClearAllPoints()
+                    PPx.Point(d.dispelShapeTex, "TOPLEFT", d.dispelHolder, "TOPLEFT", -bExp, bExp)
+                    PPx.Point(d.dispelShapeTex, "BOTTOMRIGHT", d.dispelHolder, "BOTTOMRIGHT", bExp, -bExp)
+                    if d.shapeMask then
+                        pcall(d.dispelShapeTex.RemoveMaskTexture, d.dispelShapeTex, d.shapeMask)
+                        pcall(d.dispelShapeTex.AddMaskTexture, d.dispelShapeTex, d.shapeMask)
+                    end
+                end)
+                if ok then
+                    d.akDispelGeom = geomKey
+                elseif d.styleKey and AK.AurasRestricted() then
+                    deferredRestyles[d.styleKey] = true
+                end
+            end
+        else
+            -- Physical-pixel thickness by GEOMETRY. t converts the user's setting into this
+            -- frame's units via the holder's effective scale (our frame -- readable). The
+            -- side strips are inset by t top and bottom so no two strips ever overlap at a
+            -- corner: a dispel color carrying alpha < 1 would double-blend there and read as
+            -- four darker corner pixels. Change-guarded on t alone -- the anchors are fixed
+            -- to the holder, which tracks the button, so nothing else can move them.
+            local px = style.dispelBorderPx or 2
+            local t = px
+            local eff = d.dispelHolder:GetEffectiveScale()
+            if eff and eff > 0 then
+                local PPx = EllesmereUI.PP
+                t = px * ((PPx and PPx.perfect) or 0.75) / eff
+            end
+            if d.akDispelT ~= t then
+                local st = d.dispelStrips
+                st[1]:ClearAllPoints()
+                st[1]:SetPoint("TOPLEFT", d.dispelHolder, "TOPLEFT", 0, 0)
+                st[1]:SetPoint("TOPRIGHT", d.dispelHolder, "TOPRIGHT", 0, 0)
+                st[1]:SetHeight(t)
+                st[2]:ClearAllPoints()
+                st[2]:SetPoint("BOTTOMLEFT", d.dispelHolder, "BOTTOMLEFT", 0, 0)
+                st[2]:SetPoint("BOTTOMRIGHT", d.dispelHolder, "BOTTOMRIGHT", 0, 0)
+                st[2]:SetHeight(t)
+                st[3]:ClearAllPoints()
+                st[3]:SetPoint("TOPLEFT", d.dispelHolder, "TOPLEFT", 0, -t)
+                st[3]:SetPoint("BOTTOMLEFT", d.dispelHolder, "BOTTOMLEFT", 0, t)
+                st[3]:SetWidth(t)
+                st[4]:ClearAllPoints()
+                st[4]:SetPoint("TOPRIGHT", d.dispelHolder, "TOPRIGHT", 0, -t)
+                st[4]:SetPoint("BOTTOMRIGHT", d.dispelHolder, "BOTTOMRIGHT", 0, t)
+                st[4]:SetWidth(t)
+                d.akDispelT = t
+            end
         end
-        local a = 0
-        if sw > 4 * t then a = (sw - 4 * t) / (4 * (sw - 2 * t)) end
-        local cropKey = string.format("%s|%.4f", tostring(sw), a)
-        if d.akDispelCrop ~= cropKey then
-            d.dispelBorder:SetTexCoord(a, 1 - a, a, 1 - a)
-            d.akDispelCrop = cropKey
+
+        -- Icon geometry (change-guarded; folded into setKey below because the
+        -- engine snapshots a texture's geometry at registration time, so any
+        -- change here must ride a clear+re-add cycle to take effect). Anchored
+        -- to the holder, never the button (button rects are restricted).
+        local icg = style.dispelTypeIcon
+        if icg and d.dispelIconTex then
+            local geomKey = (icg.pos or "center") .. "|" .. (icg.size or 16)
+                .. "|" .. (icg.offX or 0) .. "|" .. (icg.offY or 0)
+            if d.akDispelIconGeom ~= geomKey then
+                local point = DISPEL_ICON_POINTS[icg.pos] or "CENTER"
+                d.dispelIconTex:SetSize(icg.size or 16, icg.size or 16)
+                d.dispelIconTex:ClearAllPoints()
+                d.dispelIconTex:SetPoint(point, d.dispelHolder, point, icg.offX or 0, icg.offY or 0)
+                d.akDispelIconGeom = geomKey
+            end
         end
+
         -- Registration follows the static border AND a nonzero thickness
-        -- (0 = the user disabled the dispel recolor outright).
-        local want = (style.dispelBorder and style.border
-            and (style.dispelBorderPx or 2) > 0) and true or false
+        -- (0 = the user disabled the dispel recolor outright). setKey additionally
+        -- tracks WHICH texture set (strip vs shape) is meant to be registered, so a
+        -- shape toggle forces the same clear+re-add cycle a palette edit does --
+        -- AddDispelTypeTexture has no "swap one entry" semantics, the whole
+        -- registration is all-or-nothing either way.
+        local borderWant = (style.dispelBorder and dispelTexSet ~= nil
+            and ((blizzBorderStyle and d.blizzBorderTex)
+                or (style.border and (style.dispelBorderPx or 2) > 0))) and true or false
+        local iconWant = (style.dispelTypeIcon and d.dispelIconTex ~= nil) and true or false
+        local want = borderWant or iconWant
         local mapFP = style.dispelColorFP or ""
-        if d.dispelBorderOn ~= want or (want and d.akDispelMapFP ~= mapFP) then
+        -- Includes the size-derived px: the engine snapshots this texture's geometry
+        -- at registration time, so a border-size-only change (same shape, same want)
+        -- needs the same clear+re-add cycle or the OLD ring geometry keeps rendering.
+        -- Ring-only styles keep their historical keys ("strip"/"shape:...") so
+        -- shipping the icon channel forces no re-registration on them; the icon
+        -- suffix folds in the icon geometry for the same snapshot reason. The
+        -- Blizzard border folds in its own geometry key the same way.
+        local setKey = "noborder"
+        if borderWant then
+            if blizzBorderStyle and d.blizzBorderTex then
+                setKey = "blizz:" .. (d.akBlizzGeom or "")
+            elseif shapeActive and d.dispelShapeTex then
+                setKey = "shape:" .. style.iconShape .. "|" .. (style.shapeBorderSize or style.dispelBorderPx or 2)
+            else
+                setKey = "strip"
+            end
+        end
+        if iconWant then
+            setKey = setKey .. "|icons:" .. (d.akDispelIconGeom or "")
+        end
+        if d.dispelBorderOn ~= want or (want and (d.akDispelMapFP ~= mapFP or d.akDispelSet ~= setKey)) then
             -- Stamp only on SUCCESS: these are button calls, denied while auras are
             -- secret; a pre-stamped failure would strand the registration in the wrong
             -- state after the restriction lifts. A restricted failure defers this
@@ -371,25 +788,82 @@ local function ApplyStyleToRegions(button, style)
             -- old set-semantics alias), so a re-registration must clear first -- and
             -- if the clear is denied, the add is skipped too, or the button would
             -- accumulate duplicate entries.
+            local clearFn = button.ClearDispelTypeTextures or button.ClearAuraBorder
             if want then
                 local proceed = true
                 if d.dispelBorderOn then
-                    local clearFn = button.ClearDispelTypeTextures or button.ClearAuraBorder
                     proceed = (clearFn and pcall(clearFn, button)) and true or false
                 end
-                local addFn = button.AddDispelTypeTexture or button.SetAuraBorder
-                if proceed and pcall(addFn, button, d.dispelBorder,
-                    { style = dispelTint, showWhenHarmful = true, showWhenHelpful = false,
-                      customDispelColorMap = style.dispelColorMap }) then
-                    d.dispelBorderOn = want
-                    d.akDispelMapFP = mapFP
+                if proceed then
+                    -- ALL OR NOTHING (1 add for a shape, 4 for strips). A denial can land
+                    -- on any one of them, and a partial set is worse than none: the engine
+                    -- would tint some sides/none and leave the rest sitting in the user's
+                    -- static border color. On any failure the whole set is cleared again
+                    -- (the clear is a full reset -- "self.dispelTypeTextures = {}") and
+                    -- the style key is deferred to the restriction lift, which re-runs
+                    -- this from a known-empty state. One options table shared across every
+                    -- add: the engine securecopies it per call, so sharing it cannot leak
+                    -- between them.
+                    local addFn = button.AddDispelTypeTexture or button.SetAuraBorder
+                    -- Nothing is registered right now (fresh or just cleared), so
+                    -- Shown is ours again: park whichever set this cycle does not
+                    -- re-add, or it would keep the engine's last visible state.
+                    if not borderWant and dispelTexSet then
+                        for i = 1, #dispelTexSet do dispelTexSet[i]:Hide() end
+                    end
+                    if not iconWant and d.dispelIconTex then
+                        d.dispelIconTex:Hide()
+                    end
+                    local added = true
+                    if borderWant then
+                        local opts
+                        if blizzBorderStyle and d.blizzBorderTex then
+                            -- Stock art needs no palette; untyped debuffs get the
+                            -- stock red "None" border like the buff frame.
+                            opts = { style = blizzBorderStyle, showWhenHarmful = true,
+                                showWhenHelpful = false, showWithoutDispelType = true }
+                        else
+                            opts = { style = dispelTint, showWhenHarmful = true,
+                                showWhenHelpful = false, customDispelColorMap = style.dispelColorMap }
+                        end
+                        for i = 1, #dispelTexSet do
+                            if not pcall(addFn, button, dispelTexSet[i], opts) then
+                                added = false
+                                break
+                            end
+                        end
+                    end
+                    if added and iconWant then
+                        -- Native call only (creation gated on it): the legacy
+                        -- alias predates the Icon style.
+                        if not pcall(button.AddDispelTypeTexture, button,
+                            d.dispelIconTex, DISPEL_ICON_OPTS) then
+                            added = false
+                        end
+                    end
+                    if added then
+                        d.dispelBorderOn = want
+                        d.akDispelMapFP = mapFP
+                        d.akDispelSet = setKey
+                    else
+                        -- Rollback. dispelBorderOn goes FALSE rather than keeping its old
+                        -- value: the clear above already succeeded, so nothing is
+                        -- registered now whatever the flag said before.
+                        if clearFn then pcall(clearFn, button) end
+                        d.dispelBorderOn = false
+                        if d.styleKey and AK.AurasRestricted() then
+                            deferredRestyles[d.styleKey] = true
+                        end
+                    end
                 elseif d.styleKey and AK.AurasRestricted() then
                     deferredRestyles[d.styleKey] = true
                 end
             else
-                local clearFn = button.ClearDispelTypeTextures or button.ClearAuraBorder
                 if clearFn and pcall(clearFn, button) then
-                    d.dispelBorder:Hide()
+                    if dispelTexSet then
+                        for i = 1, #dispelTexSet do dispelTexSet[i]:Hide() end
+                    end
+                    if d.dispelIconTex then d.dispelIconTex:Hide() end
                     d.dispelBorderOn = want
                 elseif d.styleKey and AK.AurasRestricted() then
                     deferredRestyles[d.styleKey] = true
@@ -453,9 +927,41 @@ local function ApplyStyleToRegions(button, style)
     -- noTooltips). Running here also covers every Restyle, so a settings change cannot
     -- re-open either one. Same deferral as the neighbours above when the button is
     -- locked down while auras are secret.
-    if not style.cancelButtons and button.SetMouseClickEnabled then
-        if not pcall(button.SetMouseClickEnabled, button, false)
-            and d.styleKey and AK.AurasRestricted() then
+    -- The click channel is symmetric, unlike the click-off-only pass this used to be.
+    -- A style that GAINS cancelButtons later only reaches its already-created buttons
+    -- through Restyle (PAB's per-bar "Right-Click to Cancel" toggled off and back on, a
+    -- profile switch into a profile that has it on), and nothing undid the earlier
+    -- SetMouseClickEnabled(false) -- the bar stayed click-through until the next
+    -- /reload, with the right-click landing on the container below the icon. Field
+    -- report 2026-08-12: player buffs that cannot be right-click cancelled, /fstack
+    -- showing no button above the AuraContainer. SetCancelAuraButtons is re-asserted in
+    -- the same breath: it ran at button creation only, so the re-enabled toggle also
+    -- needed its click token registered again (Blizzard's own
+    -- AuraButtonSharedMixin:SetCancelAuraButtons -> RegisterForClicks). Change-guarded
+    -- by stamps, both deferred to the restriction lift like the neighbours above.
+    if style.cancelButtons then
+        if d.akClickOff and button.SetMouseClickEnabled then
+            if pcall(button.SetMouseClickEnabled, button, true) then
+                d.akClickOff = nil
+            elseif d.styleKey and AK.AurasRestricted() then
+                deferredRestyles[d.styleKey] = true
+            end
+        end
+        if d.akCancel ~= style.cancelButtons and button.SetCancelAuraButtons then
+            if pcall(button.SetCancelAuraButtons, button, style.cancelButtons) then
+                d.akCancel = style.cancelButtons
+            elseif d.styleKey and AK.AurasRestricted() then
+                deferredRestyles[d.styleKey] = true
+            end
+        end
+    elseif button.SetMouseClickEnabled then
+        -- Re-asserted every pass (not stamp-guarded): configuring tooltip behaviour on
+        -- an engine button turns its mouse back on, which silently re-opened the
+        -- nameplate click-eater. The stamp only records that WE own the off state, for
+        -- the re-arm above.
+        if pcall(button.SetMouseClickEnabled, button, false) then
+            d.akClickOff = true
+        elseif d.styleKey and AK.AurasRestricted() then
             deferredRestyles[d.styleKey] = true
         end
     end
@@ -468,6 +974,15 @@ local function ApplyStyleToRegions(button, style)
         elseif d.styleKey and AK.AurasRestricted() then
             deferredRestyles[d.styleKey] = true
         end
+    end
+
+    -- Weapon-enchant cells (stamped by AK.EnchantCellInit): the stock
+    -- temp-enchant ring under Blizzard Style, re-fitted on every restyle.
+    if d.enchantCell then AK.ApplyBlizzEnchantRing(button, d, style) end
+
+    -- Blizzard Style nameplate cells: the stock rounded mask and ring.
+    if style.blizzRoundArt or d.blizzRoundRing then
+        AK.ApplyBlizzRoundArt(button, d, style, shapeActive)
     end
 
     -- Module-specific styling pass; runs at init and on every Restyle.
@@ -588,6 +1103,10 @@ function AK.MakeInitializer(styleKey, extra)
         d.borderHost:SetAllPoints(button)
         d.borderHost:SetFrameLevel(d.cooldown:GetFrameLevel() + 1)
         d.borderHost:EnableMouse(false)
+        -- Cache while initializeFrame still has legal button access. A textured
+        -- Shadow selected later must never call button:GetFrameLevel() after the
+        -- engine has applied DenyTaintedAccessWhenAurasAreSecret.
+        d.buttonFrameLevel = button:GetFrameLevel()
 
         -- Dispel-ring holder: its own frame between the border host and the text
         -- carrier so the engine-tinted ring ALWAYS WINS over every border AND the DM
@@ -633,16 +1152,23 @@ function AK.MakeInitializer(styleKey, extra)
         button:SetDurationCooldown(d.cooldown)
         button:SetApplicationCount(d.stack, {})
 
+        -- style.durationFormatter: a module whose countdown must agree with a
+        -- neighboring non-AuraKit display supplies its own rule formatter.
+        -- Omitted (every pre-existing style) keeps the shared one.
         local durationOpts = AK.BuildDurationTextOpts(
-            AK.GetDurationFormatter(style.durationShowSeconds),
+            style.durationFormatter or AK.GetDurationFormatter(style.durationShowSeconds, style.durationPrecisionThreshold),
             style.durationColorCurve, style.durationUpdateInterval)
         AK.SetDurationTextSafe(button, d.duration, durationOpts)
         -- Formatter-choice stamp for live rebinds (style.applyExtra reruns on
         -- restyles; duration opts otherwise land only here at creation).
-        d.durationFmtS = style.durationShowSeconds and true or false
+        d.durationFmtS = (style.durationShowSeconds and "s" or "b") .. tostring(style.durationPrecisionThreshold or 0)
 
-        if style.cancelButtons then
+        -- Creation-time guarantee, stamp-guarded: ApplyStyleToRegions above already
+        -- wires the click token on this pass, so this only fires if that call was
+        -- denied (secret-value lockdown), leaving the deferred restyle to repair it.
+        if style.cancelButtons and d.akCancel ~= style.cancelButtons then
             button:SetCancelAuraButtons(style.cancelButtons)
+            d.akCancel = style.cancelButtons
         end
 
         GetStyleSet(styleKey)[button] = true
@@ -867,6 +1393,9 @@ function AK.CreateContainerShell(parent, spec)
     -- Combat creation is legal since 68914 (PTR-7 notes; /euit3 field PASS
     -- 2026-07-23). The old in-combat zombie soft-fail -- and the OOC assert
     -- that guarded against it -- are gone.
+    if not C_AddOns.IsAddOnLoaded("Blizzard_AuraContainer") then
+        C_AddOns.LoadAddOn("Blizzard_AuraContainer")
+    end
     local container = CreateFrame("AuraContainer", nil, parent, "CustomAuraContainerTemplate")
 
     -- Anchor and a provisional size up front: the engine drains its parse and
@@ -909,6 +1438,180 @@ function AK.AddSlotToContainer(container, s)
     local cd = containerData[container]
     if cd then cd.slotFrames[s.key] = f end
     return f
+end
+
+------------------------------------------------------------------------------
+-- Item enchantments (temporary weapon enchants: oils, imbues, stones)
+--
+-- Not auras (an enchantID, no spell ID) but engine display sources since
+-- 12.1: the container builds the frame through the SAME initializer as an
+-- aura group, resolves the icon off the inventory slot, shows the item
+-- tooltip, and runs the protected CancelTemporaryEnchantment on a cancel
+-- click (style.cancelButtons feeds SetCancelAuraButtons, as for auras).
+AK.ITEM_ENCH_SLOTS = { "MainHand", "OffHand", "Ranged" }
+
+-- Blizzard Style (style.blizzEnchant, set by the consumers' style builders):
+-- the stock purple temp-enchant ring round a weapon-enchant cell, the one
+-- piece of aura border art the engine does not stamp itself (its Border
+-- style is harmful-only). 32px round a 30px icon in the stock buff frame,
+-- so a thirtieth of the cell on each side; anchored to the border host
+-- (button rects are restricted). Hidden, never destroyed, without the flag.
+function AK.ApplyBlizzEnchantRing(button, d, style)
+    local ring = d.blizzEnchantRing
+    if not style.blizzEnchant then
+        if ring then ring:Hide() end
+        return
+    end
+    local host = d.borderHost or button
+    if not ring then
+        ring = host:CreateTexture(nil, "OVERLAY")
+        ring:SetTexture("Interface\\Buttons\\UI-TempEnchant-Border")
+        if ring.SetSnapToPixelGrid then
+            ring:SetSnapToPixelGrid(false)
+            ring:SetTexelSnappingBias(0)
+        end
+        d.blizzEnchantRing = ring
+    end
+    local w = style.width or 32
+    local h = style.height or w
+    local key = w .. "|" .. h
+    if d.blizzEnchantGeom ~= key then
+        local ex, ey = w / 30, h / 30
+        ring:ClearAllPoints()
+        ring:SetPoint("TOPLEFT", host, "TOPLEFT", -ex, ey)
+        ring:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", ex, -ey)
+        d.blizzEnchantGeom = key
+    end
+    ring:Show()
+end
+
+-- extraInit for AddItemEnchantmentsToContainer: marks the cell so the style
+-- pass (ApplyStyleToRegions, at init and on every restyle) can tell it from
+-- an aura button, and fits the ring once now (the pass ran before this hook).
+function AK.EnchantCellInit(button, d, style)
+    d.enchantCell = true
+    AK.ApplyBlizzEnchantRing(button, d, style)
+end
+
+-- Blizzard Style (style.blizzRoundArt, set by the nameplate style builder):
+-- the stock nameplate aura item look -- the full icon art under the rounded
+-- Cooldown Manager mask, the ring overlay hung round the cell (6px by 5px
+-- past a 25px item, so the overhang scales with the cell) and the rounded
+-- stock swipe. The mask goes on the engine's icon region, so it rides the
+-- same restriction guard as the shape mask; the ring sits on the border
+-- host (button rects are restricted). Hidden, never destroyed, without the
+-- flag. Yields to an icon shape, which owns the mask and swipe itself.
+AK.BLIZZ_ROUND_MASK  = "UI-HUD-CoolDownManager-Mask"
+AK.BLIZZ_ROUND_RING  = "UI-HUD-CoolDownManager-IconOverlay"
+AK.BLIZZ_ROUND_SWIPE = "Interface\\HUD\\UI-HUD-CoolDownManager-Icon-Swipe"
+function AK.ApplyBlizzRoundArt(button, d, style, shapeActive)
+    local ring = d.blizzRoundRing
+    local want = style.blizzRoundArt and not shapeActive
+    if want and AK._blizzRoundOK == nil then
+        AK._blizzRoundOK = (C_Texture and C_Texture.GetAtlasInfo
+            and C_Texture.GetAtlasInfo(AK.BLIZZ_ROUND_MASK)
+            and C_Texture.GetAtlasInfo(AK.BLIZZ_ROUND_RING)) and true or false
+    end
+    if not (want and AK._blizzRoundOK) then
+        if ring then ring:Hide() end
+        if d.akBlizzRoundMasked then
+            if d.icon and d.blizzRoundMask then
+                pcall(d.icon.RemoveMaskTexture, d.icon, d.blizzRoundMask)
+            end
+            if d.cooldown and d.cooldown.SetSwipeTexture then
+                pcall(d.cooldown.SetSwipeTexture, d.cooldown, "")
+            end
+            d.akBlizzRoundMasked = nil
+        end
+        return
+    end
+    local host = d.borderHost or button
+    if not ring then
+        ring = host:CreateTexture(nil, "OVERLAY")
+        ring:SetAtlas(AK.BLIZZ_ROUND_RING)
+        if ring.SetSnapToPixelGrid then
+            ring:SetSnapToPixelGrid(false)
+            ring:SetTexelSnappingBias(0)
+        end
+        d.blizzRoundRing = ring
+    end
+    if not d.blizzRoundMask then
+        local mask = button:CreateMaskTexture()
+        mask:SetAtlas(AK.BLIZZ_ROUND_MASK)
+        mask:SetAllPoints(button)
+        d.blizzRoundMask = mask
+    end
+    if not d.akBlizzRoundMasked and d.icon then
+        if pcall(d.icon.AddMaskTexture, d.icon, d.blizzRoundMask) then
+            d.akBlizzRoundMasked = true
+            if d.cooldown and d.cooldown.SetSwipeTexture then
+                pcall(d.cooldown.SetSwipeTexture, d.cooldown, AK.BLIZZ_ROUND_SWIPE)
+            end
+        elseif d.styleKey and AK.AurasRestricted() then
+            deferredRestyles[d.styleKey] = true
+        end
+    end
+    local w = style.width or 32
+    local h = style.height or w
+    if d.blizzRoundW ~= w or d.blizzRoundH ~= h then
+        local ex, ey = w * 0.24, h * 0.2
+        ring:ClearAllPoints()
+        ring:SetPoint("TOPLEFT", host, "TOPLEFT", -ex, ey)
+        ring:SetPoint("BOTTOMRIGHT", host, "BOTTOMRIGHT", ex, -ey)
+        d.blizzRoundW, d.blizzRoundH = w, h
+    end
+    ring:Show()
+end
+
+-- Their position is LAYOUT data: they are a flow group of their own, and
+-- `placement`/`layoutIndex` decides whether they lead or trail the aura
+-- groups. Nothing may be anchored to a container (forbidden aspects).
+function AK.SetContainerItemEnchantmentLayout(container, layout)
+    if not (container and layout and container.SetItemEnchantmentLayout) then return end
+    container:SetItemEnchantmentLayout(layout)
+end
+
+-- BOTH halves required: the inbound setter validates before it defaults, so a
+-- method without a direction is a hard error engine-side.
+function AK.SetContainerItemEnchantmentSort(container, sortMethod, sortDirection)
+    if not (container and sortMethod and sortDirection
+        and container.SetItemEnchantmentSortMethod) then return end
+    container:SetItemEnchantmentSortMethod(sortMethod, sortDirection)
+end
+
+-- e = { style, extraInit, hidePermanent (default true: duration-bearing
+-- only), maxSlots (declare only the first N of ITEM_ENCH_SLOTS, for a
+-- display too small to hold all three), layout, sortMethod, sortDirection }.
+-- ONE-WAY: with no addon-facing unregister, a consumer that must stop
+-- showing them releases the container and builds a fresh one. Re-calling is
+-- idempotent and re-applies layout and sort only.
+function AK.AddItemEnchantmentsToContainer(container, e)
+    if not (container and e and container.AddItemEnchantment) then return end
+    local slotEnum = AuraContainerItemEnchantmentSlot
+    if not slotEnum then return end
+    local cd = containerData[container]
+    if cd and not cd.itemEnchFrames then cd.itemEnchFrames = {} end
+    local tracked = cd and cd.itemEnchFrames
+    local names = AK.ITEM_ENCH_SLOTS
+    local last = math.min(e.maxSlots or #names, #names)
+    for i = 1, last do
+        local name = names[i]
+        local slot = slotEnum[name]
+        -- HasItemEnchantment is engine-private and a second declaration for
+        -- the same slot asserts, so the declared set is ours to keep. pcall'd
+        -- anyway: ReleaseContainer drops the whole containerData entry, so a
+        -- container that is released and then re-declared (no consumer does
+        -- that today) would hit that assert with the tracking gone.
+        if slot ~= nil and not (tracked and tracked[name]) then
+            local ok, frame = pcall(container.AddItemEnchantment, container, slot, {
+                initializeFrame = AK.MakeInitializer(e.style, e.extraInit),
+                hidePermanent = e.hidePermanent ~= false,
+            })
+            if ok and tracked then tracked[name] = frame or true end
+        end
+    end
+    AK.SetContainerItemEnchantmentLayout(container, e.layout)
+    AK.SetContainerItemEnchantmentSort(container, e.sortMethod, e.sortDirection)
 end
 
 -- Unit LAST: unit assignment re-evaluates event registrations, and those
@@ -957,7 +1660,7 @@ local BUILD_BUDGET_MS = 8
 -- fire only AFTER the loading screen drops, so their build jobs cannot be caught by
 -- the behind-the-screen burst -- they drain through the worker on low,
 -- streaming-world fps. At the mid-session 8ms budget that read as seconds of missing
--- auras. Inside the window the worker runs a near-burst budget instead: the whole
+-- auras. Outside raids, the window runs a near-burst budget instead: the whole
 -- post-login queue lands in a handful of frames during the world fade-in (the
 -- user-stated contract: "spread over a few frames on reload/login"), and the gentle
 -- budget resumes for everything mid-session.
@@ -996,13 +1699,13 @@ local buildWorker = CreateFrame("Frame")
 buildWorker:Hide()
 buildWorker:SetScript("OnUpdate", function(self)
     local inCombat = InCombatLockdown()
-    -- The turbo budget is OOC-ONLY: combat frames run under the client's combat script
-    -- watchdog (a 250ms drain tick after an in-combat /reload tripped "script ran too
-    -- long"), and a quarter-second hitch is unacceptable while fighting anyway. In
-    -- combat the backlog drains at the gentle budget; the regen wake re-arms the turbo
-    -- (loginStamp) so whatever remains snaps in at regen.
+    -- The turbo budget is OOC and non-raid only: raid-instance login can use the lower
+    -- script watchdog before combat lockdown reflects the new world, so a 250ms drain
+    -- can abort this outer loop beyond the per-job pcall. Restricted frames drain at
+    -- the gentle budget; the regen wake re-arms the turbo for safe worlds.
     local budget = BUILD_BUDGET_MS
-    if not inCombat and GetTime() - loginStamp < LOGIN_WINDOW_S then
+    if not inCombat and select(2, IsInInstance()) ~= "raid"
+        and GetTime() - loginStamp < LOGIN_WINDOW_S then
         budget = BUILD_BUDGET_LOGIN_MS
     end
     local t0 = debugprofilestop()
@@ -1028,8 +1731,8 @@ buildWorker:SetScript("OnUpdate", function(self)
     self:Hide()
 end)
 
--- Regen wake: a backlog that accrued under the combat-clamped budget
--- snaps in at the turbo budget instead of trickling.
+-- Regen wake: a backlog that accrued under the gentle budget snaps in at the turbo
+-- budget instead of trickling when the current world allows it.
 buildWorker:RegisterEvent("PLAYER_REGEN_ENABLED")
 buildWorker:SetScript("OnEvent", function(self)
     if buildHead <= buildTail then
@@ -1054,44 +1757,31 @@ end
 -- every other addon's login work in ONE script execution and trips the client watchdog
 -- ("script ran too long") -- field-hit at 1500ms. It also cannot reach the RF/UF jobs,
 -- which are enqueued by timer-deferred module setup AFTER the screen drops. PEW only
--- opens the worker's login-window turbo budget: the whole demand- architecture queue
--- drains in a handful of 250ms frames DURING the world fade-in (per-frame executions
--- never approach the watchdog).
+-- opens the worker's login window: outside raids the whole demand-architecture queue
+-- drains in a handful of 250ms frames during the world fade-in; raids retain the safe
+-- 8ms budget.
 local burstFrame = CreateFrame("Frame")
 burstFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 burstFrame:SetScript("OnEvent", function()
-    loginStamp = GetTime()
+    -- A reconnect mid-pull lands here before InCombatLockdown reflects the fight;
+    -- the turbo drain would run straight into the lower in-combat watchdog, so the
+    -- window opens only out of combat (the regen wake above snaps the backlog in
+    -- at turbo once the pull ends).
+    local fighting = UnitAffectingCombat("player")
+    if issecretvalue and issecretvalue(fighting) then fighting = false end
+    if not fighting then loginStamp = GetTime() end
     buildWorker:Show() -- in case jobs were queued behind the screen
 end)
 
--- Combat-safe wrapper: fulfills immediately out of combat, otherwise queues
--- until PLAYER_REGEN_ENABLED. The listener frame is never handed to the
--- restricted environment, so its event registration is aspect-safe.
-local pending = {}
-local regenListener
-
+-- Synchronous create-and-callback, in ANY combat state. Container creation
+-- has been combat-legal since 68914 (see CreateContainerShell; RF/NP build
+-- in combat through the queue above); the pre-68914 "queue until
+-- PLAYER_REGEN_ENABLED" gate this wrapper used to carry left Player Aura Bars
+-- (and the Movement Alert) blank until combat ended after an in-combat reload.
+-- Kept as a wrapper so callers keep one entry point.
 function AK.RequestContainer(parent, unitToken, spec, callback)
-    if not InCombatLockdown() then
-        local container, slotFrames = AK.CreateContainer(parent, unitToken, spec)
-        if callback then callback(container, slotFrames) end
-        return
-    end
-
-    pending[#pending + 1] = { parent = parent, unit = unitToken, spec = spec, callback = callback }
-
-    if not regenListener then
-        regenListener = CreateFrame("Frame")
-        regenListener:RegisterEvent("PLAYER_REGEN_ENABLED")
-        regenListener:SetScript("OnEvent", function()
-            local queue = pending
-            pending = {}
-            for i = 1, #queue do
-                local q = queue[i]
-                local container, slotFrames = AK.CreateContainer(q.parent, q.unit, q.spec)
-                if q.callback then q.callback(container, slotFrames) end
-            end
-        end)
-    end
+    local container, slotFrames = AK.CreateContainer(parent, unitToken, spec)
+    if callback then callback(container, slotFrames) end
 end
 
 function AK.GetContainerData(container)
@@ -1107,16 +1797,22 @@ end
 function AK.ReleaseContainer(container)
     if not container then return end
     local data = containerData[container]
-    if data and data.slotFrames then
-        for _, slotButton in pairs(data.slotFrames) do
-            local d = bd[slotButton]
-            if d then
-                if d.styleKey and styleButtons[d.styleKey] then
-                    styleButtons[d.styleKey][slotButton] = nil
-                end
-                bd[slotButton] = nil
+    local function Untrack(button)
+        local d = type(button) == "table" and bd[button]
+        if d then
+            if d.styleKey and styleButtons[d.styleKey] then
+                styleButtons[d.styleKey][button] = nil
             end
+            bd[button] = nil
         end
+    end
+    if data and data.slotFrames then
+        for _, slotButton in pairs(data.slotFrames) do Untrack(slotButton) end
+    end
+    -- Item enchantment frames come back as handles on declaration, so unlike
+    -- group buttons they can be untracked instead of left as restyle zombies.
+    if data and data.itemEnchFrames then
+        for _, enchButton in pairs(data.itemEnchFrames) do Untrack(enchButton) end
     end
     containerData[container] = nil
     container:Hide()
@@ -1125,9 +1821,8 @@ end
 ------------------------------------------------------------------------------
 -- Restriction probe
 --
--- There is no official "are auras secret" query. This is a best-effort helper
--- for the surviving spellID-lookup paths that want to know whether silent
--- absence semantics are in effect. Never treat it as a data source.
+-- Prefer Blizzard's official secrecy query; retain the aura-data probe as a fallback
+-- for builds where that API is unavailable. Never treat either as a data source.
 --
 -- Cached per frame time: while restricted, the probe THROWS (and catches) a
 -- real Lua error, and error construction is the expensive part -- callers
@@ -1145,10 +1840,118 @@ end
 local restrictedStamp = -1
 function AK.AurasRestricted()
     local now = GetTime()
+    if C_Secrets and C_Secrets.ShouldAurasBeSecret and C_Secrets.ShouldAurasBeSecret() then
+        restrictedStamp = now
+        return true
+    end
     if now == restrictedStamp then return true end
     if pcall(C_UnitAuras.GetAuraDataByIndex, "player", 1, "HELPFUL") then
         return false
     end
     restrictedStamp = now
     return true
+end
+
+------------------------------------------------------------------------------
+-- Offensive dispel capability: can the PLAYER remove Magic buffs or enrages
+-- from an enemy (purge, spellsteal, soothe, tranquilizing shot). This asks
+-- what the player knows, never what an aura is, so it keeps working in
+-- restricted content. Shared by the nameplate and unit frame purge glows.
+-- Lazy: the watcher frame exists only once a consumer asks or subscribes.
+------------------------------------------------------------------------------
+do
+    -- { spellID, category ("Magic", "Enrage", or "Both"), requiredClass or nil, requiredTalent or nil }
+    local SPELLS = {
+        { 370,    "Magic",  nil       },  -- Purge (Shaman)
+        { 378773, "Magic",  nil       },  -- Greater Purge (Shaman)
+        { 528,    "Magic",  nil       },  -- Dispel Magic (Priest)
+        { 32375,  "Magic",  nil       },  -- Mass Dispel (Priest)
+        { 278326, "Magic",  nil       },  -- Consume Magic (Demon Hunter)
+        { 19505,  "Magic",  "WARLOCK" },  -- Devour Magic (Felhunter)
+        { 19801,  "Both",   nil       },  -- Tranquilizing Shot (Hunter)
+        { 2908,   "Enrage", nil       },  -- Soothe (Druid)
+        { 30449,  "Magic",  nil       },  -- Spellsteal (Mage)
+        { 115078, "Enrage", "MONK", 450432 },  -- Paralysis (w/ Pressure Points talent)
+    }
+    local magic, enrage, built, watcher = false, false, false, nil
+    local listeners = {}
+
+    -- IsSpellKnown answers "does the player have this", which is the question a
+    -- PASSIVE talent needs -- IsSpellInSpellBook says no for one. The globals
+    -- IsPlayerSpell / IsSpellKnown exist only in Blizzard_DeprecatedSpellBook,
+    -- behind the loadDeprecationFallbacks CVar, so they are never used here.
+    local function Knows(spellID, bank)
+        local BANK = Enum and Enum.SpellBookSpellBank
+        if not (C_SpellBook and C_SpellBook.IsSpellKnown and BANK) then return false end
+        local ok, v = pcall(C_SpellBook.IsSpellKnown, spellID, bank or BANK.Player)
+        return ok and v == true
+    end
+    local function InBook(spellID, bank)
+        local BANK = Enum and Enum.SpellBookSpellBank
+        if not (C_SpellBook and BANK) then return false end
+        if not C_SpellBook.IsSpellKnownOrInSpellBook then return Knows(spellID, bank) end
+        local ok, v = pcall(C_SpellBook.IsSpellKnownOrInSpellBook, spellID, bank or BANK.Player)
+        return ok and v == true
+    end
+
+    local function Rebuild()
+        local wasMagic, wasEnrage = magic, enrage
+        magic, enrage = false, false
+        local _, playerClass = UnitClass("player")
+        local BANK = Enum and Enum.SpellBookSpellBank
+        for i = 1, #SPELLS do
+            local e = SPELLS[i]
+            local spellID, cat, reqClass, reqTalent = e[1], e[2], e[3], e[4]
+            if not (reqClass and playerClass ~= reqClass) then
+                local known
+                if reqTalent then
+                    known = Knows(reqTalent)
+                elseif reqClass then
+                    -- Pet bank: true only while that pet is actually out, which
+                    -- is why UNIT_PET is registered below.
+                    known = InBook(spellID, BANK and BANK.Pet)
+                else
+                    known = InBook(spellID)
+                end
+                if known then
+                    if cat == "Magic" or cat == "Both" then magic = true end
+                    if cat == "Enrage" or cat == "Both" then enrage = true end
+                end
+            end
+        end
+        -- The first pass has nothing to compare against, so it never notifies:
+        -- consumers read the capability when they build.
+        if built and (wasMagic ~= magic or wasEnrage ~= enrage) then
+            for i = 1, #listeners do listeners[i]() end
+        end
+        built = true
+    end
+
+    local function Ensure()
+        if watcher then return end
+        watcher = CreateFrame("Frame")
+        watcher:RegisterEvent("SPELLS_CHANGED")
+        watcher:RegisterEvent("UNIT_PET")
+        -- A talent swap does not reliably reach SPELLS_CHANGED first, and without
+        -- these a talent-gated entry is only correct after a /reload.
+        watcher:RegisterEvent("TRAIT_CONFIG_UPDATED")
+        watcher:RegisterEvent("PLAYER_ENTERING_WORLD")
+        watcher:SetScript("OnEvent", function(_, event, unit)
+            if event == "UNIT_PET" and unit ~= "player" then return end
+            Rebuild()
+        end)
+        Rebuild()
+    end
+
+    -- canDispelMagic, canDispelEnrage.
+    function AK.OffensiveDispelTypes()
+        Ensure()
+        return magic, enrage
+    end
+
+    -- fn() runs whenever either answer flips (talents, spec, pet).
+    function AK.OnOffensiveDispelChange(fn)
+        Ensure()
+        listeners[#listeners + 1] = fn
+    end
 end

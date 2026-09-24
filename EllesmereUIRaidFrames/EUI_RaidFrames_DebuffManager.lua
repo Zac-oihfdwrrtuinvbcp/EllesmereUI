@@ -5,9 +5,14 @@
 -- BASE GRID: one container group per enabled filter checkbox, negation-chained so an aura renders in exactly one
 -- record wherever expressible. Priority order cc > dispel > raid > raidcombat: token records exclude higher-priority
 -- ones via !TOKEN in declaration-fixed filter strings; typed-dispel has no token, excluded instead via
--- excludeDispelTypes (live candidates). Boolean records (boss/role, priority) negate every enabled token record
--- since positive-only candidates cannot be negated, so token records own their overlaps and boolean records fill in
--- the rest; boolean x boolean overlap is inexpressible and accepted.
+-- excludeDispelTypes (live candidates). Boolean records (boss/role, priority, canapply, nonplayer) negate every
+-- enabled token record, so token records own their overlaps and boolean records fill in the rest. Candidate
+-- booleans compare exactly in both directions (a false value is a real "not"), so boolean x boolean overlap is
+-- partitionable: the boolean records rank Important > Boss > Role > Can Apply > Non-Player, each owning its
+-- overlaps with every record ranked below it (see the ownership fold in BuildRecords).
+--
+-- MATCH ALL (dm.match == "all", All Debuffs off, 2+ show picks): the base show lane builds ONE conjunction record
+-- (MatchSpec) instead of the per-category union; nil = Match Any = the union.
 --
 -- TILES: an "icons" tile CLAIMS a category, moving its record into the tile's own container (own anchor/size/cap)
 -- while negation/exclude contributions stay global (negations read the EFFECTIVE set = base checkboxes OR claims),
@@ -100,13 +105,41 @@ local function EnsureFilterV2(dm)
     end
 end
 
+-- One-shot lane split (per profile, after EnsureFilterV2): the base Filters
+-- dropdown became two-lane (show/hide), so the single mode-dependent selection
+-- splits into dm[cat] (SHOW lane) and dm.neg[cat] (HIDE lane). Show All
+-- profiles' checked categories were subtracting -- move them to the hide lane
+-- so record synthesis is bit-identical (incl. cc: checked-under-All meant "park
+-- the cc group"); add-mode selections already mean SHOW and stay put.
+local function EnsureFilterLanes(dm)
+    if dm.lanesV1 then return end
+    dm.lanesV1 = true
+    if dm.all ~= false then
+        local neg
+        local function Move(cat)
+            if dm[cat] == true then
+                neg = neg or {}
+                neg[cat] = true
+                dm[cat] = nil
+            end
+        end
+        Move("boss"); Move("role"); Move("priority"); Move("cc")
+        Move("raid"); Move("raidcombat"); Move("dispel"); Move("nonplayer")
+        if neg then dm.neg = neg end
+    end
+end
+
 -- One-shot: maps the retired Auras-tab preset onto the manager, runs ONLY
 -- while the profile has no dmDebuff yet (a brand-new profile maps nil/"all" preset to the defaults, harmless). No
 -- display/style key mapping needed; the base grid reads legacy debuff keys directly (nondestructive view).
 local function EnsureMigrated()
     local p = ns.db and ns.db.profile
     if not p then return end
-    if p.dmDebuff then EnsureFilterV2(p.dmDebuff); return end
+    if p.dmDebuff then
+        EnsureFilterV2(p.dmDebuff)
+        EnsureFilterLanes(p.dmDebuff)
+        return
+    end
     local preset = p.debuffFilter
     local dm = { _fromPreset = preset or "default" }
     if preset == "raid" then
@@ -143,6 +176,7 @@ local function EnsureMigrated()
     end
     p.dmDebuff = dm
     EnsureFilterV2(dm)
+    EnsureFilterLanes(dm)
 end
 
 function ns.DM_Active()
@@ -165,12 +199,208 @@ local function ClassToken(d)
     return "raid"
 end
 
+-- Debuff Manager tile sizes live inside dmDebuff rather than as top-level
+-- profile keys, so the raid-frame proxy cannot scale them through
+-- INDICATOR_SCALE_KEYS. Keep their physical size on the same class-specific
+-- scale as the base debuff grid.
+local function EffectiveIconSizeForClass(rawSize, classToken)
+    local scale
+    if classToken == "party" then
+        scale = ns._partyIndicatorScale or 1
+    else
+        scale = ns._indicatorScale or 1
+        if classToken == "extra" then
+            scale = scale * (ns._xfExtraRatio or 1)
+        end
+    end
+    return (tonumber(rawSize) or 18) * scale
+end
+
+local function EffectiveIconSize(d, rawSize)
+    return EffectiveIconSizeForClass(rawSize, ClassToken(d))
+end
+
 local function StyleKeyFor(d)
     return "rf:debuff:" .. ClassToken(d)
 end
 
--- The category vocabulary. token = filter-string routing (negatable); cand = candidate-boolean routing (positive-only, identity-gated).
-local CATS = { "boss", "role", "priority", "cc", "raid", "raidcombat", "dispel" }
+-- The category vocabulary. token = filter-string routing (negatable); cand = candidate-boolean routing (exact in
+-- both directions, a false value negates; never identity-gated -- the engine gates only spell-ID candidates).
+local CATS = { "boss", "role", "priority", "cc", "raid", "raidcombat", "dispel", "nonplayer",
+    -- Less common filters: the PLAYER token, one include map per dispel type, and
+    -- the canApplyAura boolean. "From Any Player" is a FLAVOR of nonplayer
+    -- (dm.nonplayerMode == "any"), never a category of its own: both sides share
+    -- one engine field, so the dropdown keeps them mutually exclusive like the
+    -- two dispel flavors.
+    "castbyme", "magic", "curse", "poison", "disease", "bleed", "canapply" }
+local LESS_CATS = { "castbyme", "magic", "curse", "poison", "disease", "bleed", "canapply" }
+-- Per-type dispel categories: engine dispel name + a static single-type include
+-- map per category (never mutated; type folds copy on write).
+local TYPE_ORDER = { "magic", "curse", "poison", "disease", "bleed" }
+local TYPE_CATS = { magic = "Magic", curse = "Curse", poison = "Poison", disease = "Disease", bleed = "Bleed" }
+local TYPE_INCLUDE = {}
+for cat, T in pairs(TYPE_CATS) do TYPE_INCLUDE[cat] = { [T] = true } end
+
+-------------------------------------------------------------------------------
+-- MATCH ALL (base show lane, dm.match == "all"): every show pick ANDs into ONE
+-- record instead of one record per category. Live only with All Debuffs off and
+-- 2+ show picks; anything else takes the union path unchanged. A spec is
+-- { tok = { TOKEN = true|false }, cf = { field = bool }, inc = set, exc = set,
+-- empty = bool }: MatchApply ANDs one category (pos) or its complement, and a
+-- contradiction marks the spec empty (it can never match, so nothing builds).
+-------------------------------------------------------------------------------
+local MATCH_TOKEN = { cc = "CROWD_CONTROL", raid = "RAID", raidcombat = "RAID_IN_COMBAT", castbyme = "PLAYER" }
+local MATCH_BOOL = { boss = "isBossAura", role = "isRoleAura", priority = "isPriorityAura", canapply = "canApplyAura" }
+local MATCH_TOK_ORDER = { "CROWD_CONTROL", "RAID_PLAYER_DISPELLABLE", "RAID", "RAID_IN_COMBAT", "PLAYER" }
+
+local function MatchOn(bv)
+    if bv.match ~= "all" or bv.all ~= false then return false end
+    local n = 0
+    for i = 1, #CATS do
+        if bv[CATS[i]] == true then
+            n = n + 1
+            if n >= 2 then return true end
+        end
+    end
+    return false
+end
+
+local function MatchCopy(m)
+    local o = { tok = {}, cf = {}, empty = m.empty }
+    for k, v in pairs(m.tok) do o.tok[k] = v end
+    for k, v in pairs(m.cf) do o.cf[k] = v end
+    if m.inc then o.inc = {}; for T in pairs(m.inc) do o.inc[T] = true end end
+    if m.exc then o.exc = {}; for T in pairs(m.exc) do o.exc[T] = true end end
+    return o
+end
+
+local function MatchSet(m, map, k, v)
+    local cur = map[k]
+    if cur ~= nil and cur ~= v then m.empty = true end
+    map[k] = v
+end
+
+-- Dispel types: a positive set intersects the include set (a debuff has one
+-- type), a negative set joins the exclude set.
+local function MatchTypes(m, set, pos)
+    if not pos then
+        m.exc = m.exc or {}
+        for T in pairs(set) do m.exc[T] = true end
+    elseif m.inc then
+        for T in pairs(m.inc) do
+            if not set[T] then m.inc[T] = nil end
+        end
+    else
+        m.inc = {}
+        for T in pairs(set) do m.inc[T] = true end
+    end
+end
+
+-- ANDs category `cat` (pos) or its complement onto the spec; the dispel and
+-- Non-Player flavors come from the profile table. False = unknown category.
+local function MatchApply(m, cat, pos, dm)
+    local tok = MATCH_TOKEN[cat]
+    if tok then MatchSet(m, m.tok, tok, pos) return true end
+    local field = MATCH_BOOL[cat]
+    if field then MatchSet(m, m.cf, field, pos) return true end
+    if cat == "nonplayer" then
+        -- Flavor value when shown (false = Non-Player Auras, true = From Any Player), its complement when not.
+        MatchSet(m, m.cf, "isFromPlayerOrPlayerPet", pos == (dm.nonplayerMode == "any"))
+        return true
+    end
+    if cat == "dispel" then
+        if dm.dispelMode == "typed" then
+            MatchTypes(m, TYPED_DEBUFFS, pos)
+        else
+            MatchSet(m, m.tok, "RAID_PLAYER_DISPELLABLE", pos)
+        end
+        return true
+    end
+    if TYPE_INCLUDE[cat] then MatchTypes(m, TYPE_INCLUDE[cat], pos) return true end
+    return false
+end
+
+-- The base spec, from the RAW show lane (never the effective set, which mixes in
+-- claims and effects): every pick ANDed, dispel-type picks OR'd into one include
+-- set (so Magic + Dispels means Magic), the hide lane as plain vetoes, and every
+-- category an indicator claims excluded (the indicator keeps rendering it).
+-- Returns the spec and the sorted pick list.
+local function MatchSpec(bv, dm, claims)
+    local m = { tok = {}, cf = {} }
+    local cats, types = {}, nil
+    for i = 1, #CATS do
+        local cat = CATS[i]
+        if bv[cat] == true then
+            cats[#cats + 1] = cat
+            if TYPE_CATS[cat] then
+                types = types or {}
+                types[TYPE_CATS[cat]] = true
+            end
+        end
+    end
+    if types then MatchTypes(m, types, true) end
+    for i = 1, #cats do
+        if not TYPE_CATS[cats[i]] then MatchApply(m, cats[i], true, dm) end
+    end
+    local neg = bv.neg
+    for i = 1, #CATS do
+        local cat = CATS[i]
+        if neg and neg[cat] == true then MatchApply(m, cat, false, dm) end
+        if claims and claims[cat] then MatchApply(m, cat, false, dm) end
+    end
+    table.sort(cats)
+    return m, cats
+end
+
+-- Resolves a spec into filter tokens + a fresh candidate table, or nil when it
+-- can never match.
+local function MatchFinish(m)
+    if m.empty then return nil end
+    -- PLAYER (your casts, pet and vehicle included) is always a player source.
+    if m.tok.PLAYER == true and m.cf.isFromPlayerOrPlayerPet == false then return nil end
+    local cf = {}
+    for k, v in pairs(m.cf) do cf[k] = v end
+    if m.inc then
+        local inc
+        for T in pairs(m.inc) do
+            if not (m.exc and m.exc[T]) then
+                inc = inc or {}
+                inc[T] = true
+            end
+        end
+        if not inc then return nil end
+        cf.includeDispelTypes = inc
+    elseif m.exc and next(m.exc) then
+        local exc = {}
+        for T in pairs(m.exc) do exc[T] = true end
+        cf.excludeDispelTypes = exc
+    end
+    local toks = { "HARMFUL" }
+    for i = 1, #MATCH_TOK_ORDER do
+        local tok = MATCH_TOK_ORDER[i]
+        local pos = m.tok[tok]
+        if pos == true then
+            toks[#toks + 1] = tok
+        elseif pos == false then
+            toks[#toks + 1] = "!" .. tok
+        end
+    end
+    return toks, cf
+end
+
+-- A tile hosts a catch-all record when All Debuffs is checked, or when Has
+-- Duration (an AND-modifier) is checked with no claimed categories -- checked
+-- alone it acts as the timed catch-all, mirroring the base dropdown.
+local function TileCatchAllOn(t)
+    if t.all == true then return true end
+    if t.hasDuration ~= true then return false end
+    if t.claim then
+        for _, v in pairs(t.claim) do
+            if v then return false end
+        end
+    end
+    return true
+end
 
 -- Fingerprint inputs the record/tile synthesis reads beyond the containers file's DebuffCfgFP (which appends this);
 -- a missed key = that option never live-applies. Per-tile style keys VIEW the base debuff style keys (nil = inherit,
@@ -198,6 +428,9 @@ local function TileStyleView(s, t)
     if not o then return s end
     return setmetatable(o, { __index = s })
 end
+-- The options preview renders tile runs through this same view, so what the
+-- page shows for a tile's Display values is what the live frames resolve.
+ns.DM_TileStyleView = TileStyleView
 -- Sorted fingerprint of one tile's style overrides (part of DM_CfgFP).
 local function TileStyleFP(t)
     local o = {}
@@ -276,14 +509,23 @@ end
 -- Per-filter Size for a record category: FIRST matching ACTIVE block owns the
 -- category outright (same rule as the glow/border applier's DmFxBlockFor, so
 -- a later block's Size never reaches an already-matched category). Merged
--- "bossrole" record matches either constituent, like the applier.
+-- "bossrole" record matches either constituent, like the applier. `cat` may
+-- also be a category LIST (a Match All or Icon Effect split record): the
+-- first active block matching any of them wins.
 local function FxSizeFor(list, cat)
     if not list then return nil end
+    local multi = type(cat) == "table"
     for i = 1, #list do
         local e = list[i]
         if FxEntryActive(e) then
             local f = e.filters
-            if f and (f[cat] or (cat == "bossrole" and (f.boss or f.role))) then
+            local hit = f and not multi and (f[cat] or (cat == "bossrole" and (f.boss or f.role)))
+            if f and multi then
+                for j = 1, #cat do
+                    if f[cat[j]] then hit = true; break end
+                end
+            end
+            if hit then
                 local sz = tonumber(e.size)
                 if sz and sz > 0 then return sz end
                 return nil
@@ -304,23 +546,396 @@ function ns.DM_FxFP()
     return FxListFP(dm and dm.fxList)
 end
 
+-------------------------------------------------------------------------------
+-- Debuff tooltip modifier ("Shown on Modifier" mode + the Use Modifier cog,
+-- p.debuffTooltipModifier: none | shift | control | alt). Style-side the
+-- mode renders as plain Shown (native engine tooltips, no button writes);
+-- the gating is a MOTION EATER per debuff container: a frame WE own, laid
+-- over the container above the engine buttons, motion-only (EnableMouse
+-- false, clicks pass through untouched) and CONSUMING motion. While the
+-- eater is shown, hover never reaches the aura buttons and no tooltip
+-- appears (the eater forwards OnEnter/OnLeave to the unit button, so the
+-- frame's own hover behaviour is untouched); holding the configured key hides it. Show/Hide on our own frames
+-- stays legal while auras are secret, so this behaves identically under
+-- /euidev, in instanced combat and in the open world -- unlike
+-- button-surface writes (SetMouseMotionEnabled), which the engine refuses
+-- under secrecy (field-confirmed 2026-08-24; the tooltip frame itself,
+-- AuraButtonTooltip, is forbidden + hideFromGlobalEnv, so no alpha/hook
+-- lever exists there either). The eater IS a unit button: a named
+-- SecureUnitButton sub-button of the unit button (useparent-unit), so
+-- targeting, the unit menu, mouseover and click-cast bindings all work on
+-- the band natively; the click-cast header wraps its enter/leave (secure,
+-- combat-legal) and runs the peek: the hovered eater hides itself while the
+-- modifier is held, so hover falls through to the aura button beneath, and
+-- re-shows on release -- one macro-conditional check per key edge and no
+-- work at all for an unhovered press (see EUI_RaidFrames_ClickCast.lua,
+-- tooltip-modifier eaters). Creation, geometry and parking are out-of-combat
+-- writes on a protected frame; an in-combat need latches d.rfcBmPending and
+-- the regen reload re-runs the ensure. "none" and the other modes cost
+-- nothing: eaters park hidden and the header driver is released.
+-------------------------------------------------------------------------------
+function ns.DM_TipMod()
+    local p = ns.db and ns.db.profile
+    local m = p and p.debuffTooltipModifier
+    if m == "shift" or m == "control" or m == "alt" then return m end
+    return "none"
+end
+
+-- All live eaters (eater frame -> true), weak-keyed so eaters of released
+-- unit buttons drop out with their hosts. Per-container handles live on the
+-- unit button's own data table (d.tipModEaters, keyed "base" / tile id).
+local tipModEaters = setmetatable({}, { __mode = "k" })
+
+-- Park one eater: hide it and drop the header's peek/hover references to it.
+-- Protected frame, so this is an out-of-combat write; callers latch the regen
+-- reload otherwise.
+local function ParkEater(e)
+    e._euiActive = false
+    e:Hide()
+    if ns.CC_ReleaseTipEater then ns.CC_ReleaseTipEater(e) end
+end
+
+-- Is any debuff display actually in the "Shown on Modifier" mode? Base row
+-- plus enabled icon tiles' overrides (nil override inherits the base).
+local function TipModeInUse()
+    local p = ns.db and ns.db.profile
+    if not p then return false end
+    if p.debuffHideTooltips == "modifier" then return true end
+    local dm = DM()
+    local tiles = dm and dm.tiles
+    if tiles then
+        for i = 1, #tiles do
+            local t = tiles[i]
+            if t.enabled ~= false and t.hideTooltips == "modifier" then return true end
+        end
+    end
+    return false
+end
+
+-- Arm state + the header's peek key. The ensure pass calls this on every
+-- containers reload, so login, setting edits and profile switches all land
+-- here; RF fully disabled never reloads. A stored key is a no-op outside the
+-- "modifier" mode: every eater parks and the header driver is released.
+-- Header and eater writes are out-of-combat; in combat the calling button
+-- latches the regen reload, which re-enters here.
+local tipModArmed = false
+-- Key last pushed to the click-cast header; starts DISARMED so a profile
+-- without the feature never touches the header at all (zero cost while off).
+local tipModKeyApplied = false
+
+-- Feature wanted at all: a key is set AND some debuff display is in the
+-- "modifier" mode. The apply pass gates every footprint/ensure write on this.
+function ns.DM_TipModWanted()
+    return ns.DM_TipMod() ~= "none" and TipModeInUse()
+end
+
+function ns.DM_TipModSync(d)
+    local key = ns.DM_TipMod()
+    local want = key ~= "none" and TipModeInUse()
+    local wantKey = want and key or false
+    if want == tipModArmed and wantKey == tipModKeyApplied then return end
+    if InCombatLockdown() then
+        if d then d.rfcBmPending = true end
+        return
+    end
+    tipModArmed = want
+    if wantKey ~= tipModKeyApplied then
+        tipModKeyApplied = wantKey
+        if ns.CC_SetTipModKey then ns.CC_SetTipModKey(wantKey or nil) end
+    end
+    if not want then
+        for eater in pairs(tipModEaters) do
+            if eater._euiActive then ParkEater(eater) end
+        end
+    end
+end
+
+-- Icon-tile pin: the point on the health frame the tile's flow starts from.
+-- Shared by AnchorTileContainer (the container) and the tooltip eater below,
+-- so the two can never drift apart. Party Frames kit: grid tiles seat under
+-- the kit's debuff row instead (ns.DM_KitTileY), flowing right.
+local function TilePin(t, s, d)
+    local ky = ns.DM_KitTileY(t, s, d)
+    if ky then
+        local _, _, bx = ns.RFC_DebuffPin(s)
+        return "TOPLEFT", "TOPLEFT", bx, ky
+    end
+    local pl = t.position or "top"
+    local corner = CORNERS[pl] or "TOP"
+    local point = corner
+    if (t.growDirection or "CENTER") == "CENTER" then
+        -- Center only the growth axis on the position point; the vertical
+        -- seat stays flush with the anchored edge (see AnchorTileContainer).
+        point = pl:find("top", 1, true) and "TOP"
+            or (pl:find("bottom", 1, true) and "BOTTOM" or "CENTER")
+    end
+    return point, corner, t.offsetX or 0, t.offsetY or 0
+end
+
+-- Maximum footprint of a flow display: n cells of `cell` px with `spacing`
+-- between them, wrapped every `per` cells (per < 2 = one unbounded line),
+-- lines stacked across; `vertical` flips the line axis (columns). Width, height.
+local function TipFootprint(n, cell, spacing, per, vertical)
+    if not n or n < 1 then return 0, 0 end
+    local lineCells, lines = n, 1
+    if per and per >= 2 then
+        if n > per then lineCells = per end
+        lines = math.ceil(n / per)
+    end
+    local along = lineCells * cell + (lineCells - 1) * spacing
+    local across = lines * cell + (lines - 1) * spacing
+    if vertical then return across, along end
+    return along, across
+end
+
+-- Party Frames kit (user 2026-09-22: all debuffs below the frame): each grid
+-- tile (icons / square) the apply pass renders seats as its own block under
+-- the kit's debuff row, below the base row's maximum footprint and every
+-- earlier rendered grid tile's -- the seat is worked out by that pass from
+-- the same counts it declares (d.dmTipGeo). Bar and effect tiles keep their
+-- own placement. Returns the seat's Y offset on the kit host (X is the base
+-- row's), or nil off the kit.
+function ns.DM_KitTileY(t, s, d)
+    if not (d and d.kit and t and (t.type == "icons" or t.type == "square")) then return nil end
+    local geo = d.dmTipGeo
+    local gt = geo and geo.tiles and geo.tiles[t.id]
+    return gt and gt.kitY
+end
+
+-- One eater per gated container; after creation only Show/Hide and, on a
+-- geometry change, one re-pin ever touch it. Host = the unit button (our
+-- frame). The rect is OURS end to end: pinned to the health frame at the
+-- container's own pin and sized to the display's maximum footprint from
+-- settings (declared caps x largest cell), never anchored to the engine
+-- container -- the engine sizes that one from secret aura content, and a rect
+-- container -- the engine lays the icons out around the container's anchor
+-- and never resizes the container frame itself (it stays at its 1x1
+-- provisional size; probed live 2026-08-25), so a frame anchored to the
+-- container's corners is a 1x1 frame nobody can hover (the first field
+-- builds: "tooltip always shows").
+-- Motion is CONSUMED: SetPropagateMouseMotion(true) is pass-through -- it
+-- un-blocks everything beneath, aura buttons included (probed live with a
+-- working eater: focus stack = eater + unit button, tooltip still showed).
+-- The unit frame's own hover is restored by FORWARDING: the eater's
+-- OnEnter/OnLeave call the unit button's handlers with the button as self,
+-- so highlight and unit tooltip behave as in every other tooltip mode.
+-- Mouseover resolves through the unit button's subtree exactly as it does
+-- for the aura buttons themselves.
+-- CLICKS pass through: a motion-only frame is still the mouse focus, and a
+-- click delivered to a focus frame with clicks disabled is dropped, nothing
+-- beneath sees it (field: "clicks dead over the debuff band"). Propagating
+-- clicks is the pass-through we want here -- the aura buttons beneath are
+-- click-disabled (AuraKit, raid-frame styles), so the click lands on the
+-- unit button exactly as it did before the eater existed.
+local function ForwardEnter(self)
+    local h = self:GetParent()
+    local f = h and h:GetScript("OnEnter")
+    if f then f(h) end
+end
+local function ForwardLeave(self)
+    local h = self:GetParent()
+    local f = h and h:GetScript("OnLeave")
+    if f then f(h) end
+end
+
+-- Every write below lands on a PROTECTED frame (creation, geometry, level,
+-- show/hide), so the whole apply is out-of-combat: when something actually
+-- needs to change in combat the button latches d.rfcBmPending and the regen
+-- reload re-runs this ensure. An unchanged eater costs a few compares and
+-- never touches the frame.
+local tipEaterCount = 0
+local function EnsureEater(d, slot, host, container, active, pinHost, point, corner, offX, offY, w, h)
+    local map = d.tipModEaters
+    local e = map and map[slot]
+    if not active or not pinHost then
+        if e and e._euiActive then
+            if InCombatLockdown() then d.rfcBmPending = true; return end
+            ParkEater(e)
+        end
+        return
+    end
+    -- Clamp the footprint to the unit it serves: the settings maximum (cap
+    -- per declared group, stacked in rows) can be taller than the frame, and
+    -- with a centered or inward pin the excess would sit on the neighbouring
+    -- units at a higher level, stealing their hover and clicks for this unit.
+    -- Bounds = the smaller of the button and the pin host (both our frames,
+    -- settings-sized); pins that deliberately place icons outside the frame
+    -- keep their overshoot exactly as the icons themselves do.
+    local maxW, maxH = host:GetSize()
+    local pw, ph = pinHost:GetSize()
+    if pw and pw > 0 and pw < maxW then maxW = pw end
+    if ph and ph > 0 and ph < maxH then maxH = ph end
+    if w > maxW then w = maxW end
+    if h > maxH then h = maxH end
+    local lvl = (container:GetFrameLevel() or 1) + 30
+    local geoChanged = not e or e._euiPin ~= point or e._euiCorner ~= corner
+        or e._euiOX ~= offX or e._euiOY ~= offY or e._euiHost ~= pinHost
+        or e._euiW ~= w or e._euiH ~= h
+    local lvlChanged = not e or e._euiLvl ~= lvl
+    local armChanged = not e or not e._euiActive
+    if not (geoChanged or lvlChanged or armChanged) then
+        e._euiContainer = container
+        return
+    end
+    if InCombatLockdown() then d.rfcBmPending = true; return end
+    if not e then
+        -- Named: click-cast's frame keybinds route by frame name. Unit from
+        -- the parent (useparent-unit) for the action path; the header's enter
+        -- wrap also stamps a real "unit" for the engine's mouseover.
+        tipEaterCount = tipEaterCount + 1
+        e = CreateFrame("Button", "EUIRFTipEater" .. tipEaterCount, host, "SecureUnitButtonTemplate")
+        e:RegisterForClicks("AnyUp")
+        e:SetAttribute("useparent-unit", true)
+        e:SetAttribute("eui_tipeater", true)
+        -- Native clicks mirror the unit button: left = target, right = the
+        -- secure unit menu. Click-cast re-writes these when it is enabled.
+        e:SetAttribute("type1", "target")
+        e:SetAttribute("*type1", "target")
+        if EllesmereUI.AttachSecureUnitMenu then EllesmereUI.AttachSecureUnitMenu(e) end
+        -- HookScript, not SetScript: the click-cast header wraps these same
+        -- script slots securely, and a hook never displaces a wrap. The Lua
+        -- side forwards the unit button's own hover (highlight, unit tooltip).
+        e:HookScript("OnEnter", ForwardEnter)
+        e:HookScript("OnLeave", ForwardLeave)
+        e._euiD = d
+        if not map then map = {}; d.tipModEaters = map end
+        map[slot] = e
+        tipModEaters[e] = true
+        if ns.CC_RegisterTipEater then ns.CC_RegisterTipEater(e) end
+    end
+    e._euiContainer = container
+    if lvlChanged then
+        e._euiLvl = lvl
+        e:SetFrameLevel(lvl)
+    end
+    if geoChanged then
+        e._euiPin, e._euiCorner, e._euiOX, e._euiOY = point, corner, offX, offY
+        e._euiHost, e._euiW, e._euiH = pinHost, w, h
+        e:ClearAllPoints()
+        e:SetPoint(point, pinHost, corner, offX, offY)
+        e:SetSize(w, h)
+    end
+    if armChanged then
+        e._euiActive = true
+        e:Show()
+    end
+end
+
+-- Per-unit ensure, called from the containers reload loop and from the tail
+-- of every DM_ApplyDebuffConfig (fresh footprint inputs; tile containers
+-- built on the deferred lanes re-enter through that apply): base container
+-- plus every icon tile whose effective tooltip mode (own override, else the
+-- base mode) is "modifier". Cheap when the feature is off -- a few reads and
+-- existing eaters just park hidden.
+function ns.DM_TipModEnsure(button, d, s)
+    ns.DM_TipModSync(d)
+    -- Off (no key, or no display in the mode): the sync above parked any
+    -- eaters on the flip, so there is nothing per button to do -- zero cost.
+    if not tipModArmed then return end
+    local baseMode = s and s.debuffHideTooltips
+    local health = d.rfcHealth
+    local pinHost = health and ((ns.RF_AnchorHost and ns.RF_AnchorHost(health, s)) or health)
+    local geo = d.dmTipGeo
+    if d.rfcDebuffs then
+        local active = baseMode == "modifier"
+        local point, corner, offX, offY, w, h
+        if active and pinHost and ns.RFC_DebuffPin then
+            local size, spacing, per, vertical
+            point, corner, offX, offY, size, spacing, per, vertical = ns.RFC_DebuffPin(s)
+            local g = geo and geo.base
+            w, h = TipFootprint((g and g.n) or (s.debuffCap or 3), (g and g.cell) or size,
+                spacing, per, vertical)
+        end
+        EnsureEater(d, "base", button, d.rfcDebuffs, active and point ~= nil,
+            pinHost, point, corner, offX, offY, w, h)
+    end
+    local hosts = d.dmTiles
+    if hosts then
+        local dm = DM()
+        local list = dm and dm.tiles
+        if list then
+            for i = 1, #list do
+                local t = list[i]
+                local c = hosts[t.id]
+                if c and t.type == "icons" then
+                    local eff = t.hideTooltips
+                    if eff == nil then eff = baseMode end
+                    local active = t.enabled ~= false and eff == "modifier"
+                    local point, corner, offX, offY, w, h
+                    if active and pinHost then
+                        point, corner, offX, offY = TilePin(t, s, d)
+                        local grow = ns.DM_KitTileY(t, s, d) and "RIGHT" or (t.growDirection or "CENTER")
+                        local g = geo and geo.tiles and geo.tiles[t.id]
+                        w, h = TipFootprint((g and g.n) or (t.cap or s.debuffCap or 3),
+                            (g and g.cell) or EffectiveIconSize(d, t.size or 18), t.spacing or 1,
+                            tonumber(t.iconsPerRow) or 0, (grow == "UP" or grow == "DOWN"))
+                    end
+                    EnsureEater(d, t.id, button, c, active and point ~= nil,
+                        pinHost, point, corner, offX, offY, w, h)
+                end
+            end
+        end
+    end
+end
+
+-- Base Icons view for the CURRENT spec. The base grid lives in All Specs
+-- like any indicator there, so a concrete spec can switch it off for itself
+-- (ns.DM_SetBaseDisabled): every base-owned input (mode, lanes, duration
+-- modifier, base effects) then reads this empty view and no base record is
+-- built -- tiles, claims and the shared dispel flavor (always read off the
+-- profile table) are untouched. Read-only by construction.
+local BASE_OFF_VIEW = { all = false }
+local function BaseView(dm)
+    if ns.DM_CurrentSpecBaseOff and ns.DM_CurrentSpecBaseOff() then return BASE_OFF_VIEW end
+    return dm
+end
+
 function ns.DM_CfgFP()
     EnsureMigrated() -- profile switches re-fingerprint before rendering
     local dm = DM() or {}
     FxHeal(dm)
+    local bv = BaseView(dm)
     local prof = ns.db and ns.db.profile
+    local neg = bv.neg
     local parts = {
         "on",
-        dm.all ~= false and 1 or 0, dm.boss and 1 or 0, dm.role and 1 or 0,
-        dm.priority and 1 or 0, dm.cc == true and 1 or 0, dm.raid and 1 or 0,
-        dm.raidcombat and 1 or 0, dm.dispel and 1 or 0,
-        dm.nonplayer and 1 or 0,
+        bv.all ~= false and 1 or 0, bv.hasDuration == true and 1 or 0,
+        bv.boss and 1 or 0, bv.role and 1 or 0,
+        bv.priority and 1 or 0, bv.cc == true and 1 or 0, bv.raid and 1 or 0,
+        bv.raidcombat and 1 or 0, bv.dispel and 1 or 0,
+        bv.nonplayer and 1 or 0,
+        -- Hide lane (dm.neg): subtracts in both modes, so every entry is a
+        -- record-shape input.
+        neg and table.concat({
+            neg.boss and 1 or 0, neg.role and 1 or 0, neg.priority and 1 or 0,
+            neg.cc and 1 or 0, neg.raid and 1 or 0, neg.raidcombat and 1 or 0,
+            neg.dispel and 1 or 0, neg.nonplayer and 1 or 0 }, "") or "-",
         (dm.dispelMode == "typed") and "typed" or "you",
-        FxListFP(dm.fxList), -- base effects force records
+        FxListFP(bv.fxList), -- base effects force records
         -- Exclude set varies only with the lust-debuff opt-out (hardcoded lists are load-constant).
         (not prof or prof.hideLustDebuff ~= false) and "lx1" or "lx0",
     }
-    local tiles = dm.tiles
+    -- Max Duration joins the fingerprint only when set, so Unlimited profiles
+    -- keep a byte-identical print (no re-apply on the update).
+    if bv.maxDurSec then parts[#parts + 1] = "md" .. tostring(bv.maxDurSec) end
+    -- Match All: same only-when-set rule (nil = Match Any).
+    if bv.match == "all" then parts[#parts + 1] = "mA" end
+    -- Less common categories (both lanes) and the Non-Player flavor: appended
+    -- only when set, same byte-identical rule.
+    do
+        local lc
+        for i = 1, #LESS_CATS do
+            local c = LESS_CATS[i]
+            if bv[c] == true then lc = lc or {}; lc[#lc + 1] = c end
+            if neg and neg[c] == true then lc = lc or {}; lc[#lc + 1] = "-" .. c end
+        end
+        if dm.nonplayerMode == "any" then lc = lc or {}; lc[#lc + 1] = "npany" end
+        if lc then parts[#parts + 1] = table.concat(lc, "+") end
+    end
+    -- Fingerprint the ACTIVE union: spec swaps, bucket edits and per-spec
+    -- disables all land here, so the containers re-apply exactly when the
+    -- rendered tile set changes (edits to buckets other specs own don't).
+    local tiles = ns.DM_ActiveTiles()
     if tiles then
         for i = 1, #tiles do
             local t = tiles[i]
@@ -344,10 +959,26 @@ function ns.DM_CfgFP()
                     t.claim.boss and 1 or 0, t.claim.role and 1 or 0,
                     t.claim.priority and 1 or 0, t.claim.cc and 1 or 0,
                     t.claim.raid and 1 or 0, t.claim.raidcombat and 1 or 0,
-                    t.claim.dispel and 1 or 0 }, "") or "-",
+                    t.claim.dispel and 1 or 0,
+                    t.claim.nonplayer and 1 or 0 }, "") or "-",
+                -- Tile hide lane + catch-all + duration modifier: all record-shape inputs.
+                t.neg and table.concat({
+                    t.neg.boss and 1 or 0, t.neg.role and 1 or 0,
+                    t.neg.priority and 1 or 0, t.neg.cc and 1 or 0,
+                    t.neg.raid and 1 or 0, t.neg.raidcombat and 1 or 0,
+                    t.neg.dispel and 1 or 0, t.neg.nonplayer and 1 or 0 }, "") or "-",
+                t.all == true and 1 or 0, t.hasDuration == true and 1 or 0,
                 TileStyleFP(t),
                 FxListFP(t.fxList),
             }, ",")
+            if t.maxDurSec then
+                parts[#parts] = parts[#parts] .. ",md" .. tostring(t.maxDurSec)
+            end
+            for li = 1, #LESS_CATS do
+                local c = LESS_CATS[li]
+                if t.claim and t.claim[c] then parts[#parts] = parts[#parts] .. "," .. c end
+                if t.neg and t.neg[c] == true then parts[#parts] = parts[#parts] .. ",-" .. c end
+            end
         end
     end
     return table.concat(parts, ":")
@@ -361,46 +992,94 @@ end
 -- an enabled icons tile claims it; negations key off THESE (a claimed
 -- category must still be excluded from every other record). Also resolves
 -- claims[cat] = tile table (first enabled claimer wins).
-local function EffectiveState(dm)
+local function EffectiveState(dm, matchOn)
     -- Every category key is an explicit checkbox (true/nil); cc's base-grid default-on lives in the apply pass's Show All branch, not here.
-    local eff = { boss = dm.boss, role = dm.role, priority = dm.priority,
-        cc = dm.cc == true, raid = dm.raid, raidcombat = dm.raidcombat, dispel = dm.dispel,
-        nonplayer = dm.nonplayer }
+    -- Show-lane checkboxes are DORMANT while Show All is on (the dropdown dims the
+    -- lane and lanes persist across mode flips): a dormant pick must not leak into
+    -- the eff-driven negation gates (dispelToken/!RAID/!RAID_IN_COMBAT would strip
+    -- content from other records with no record of its own re-adding it). Claims
+    -- and fx routing below still force categories on in both modes. Has Duration
+    -- is an AND-modifier, never a mode: it does not touch the show lane.
+    -- Match All reads the show lane as empty the same way: its picks build the
+    -- one conjunction record, never per-category records or negations elsewhere.
+    local eff
+    if dm.all ~= false or matchOn then
+        eff = { cc = false }
+    else
+        eff = { boss = dm.boss, role = dm.role, priority = dm.priority,
+            cc = dm.cc == true, raid = dm.raid, raidcombat = dm.raidcombat, dispel = dm.dispel,
+            nonplayer = dm.nonplayer,
+            castbyme = dm.castbyme, magic = dm.magic, curse = dm.curse, poison = dm.poison,
+            disease = dm.disease, bleed = dm.bleed, canapply = dm.canapply }
+    end
     local claims = {}
-    local tiles = dm.tiles
+    -- First enabled grid tile in catch-all state (TileCatchAllOn: All Debuffs
+    -- checked, or Has Duration alone): it hosts a tile catch-all record, with
+    -- the tile's hide lane and duration modifier folded in by BuildRecords.
+    local claimsAll = nil
+    -- The ACTIVE union (all-specs + group buckets + own spec, per-spec
+    -- disables applied): claims follow whatever the current spec renders.
+    local tiles = ns.DM_ActiveTiles()
     if tiles then
         for i = 1, #tiles do
             local t = tiles[i]
-            if t.enabled and (t.type == "icons" or t.type == "square") and t.claim then
-                for c = 1, #CATS do
-                    local cat = CATS[c]
-                    if t.claim[cat] and not claims[cat] then
-                        claims[cat] = t
-                        eff[cat] = true
+            if t.enabled and (t.type == "icons" or t.type == "square") then
+                if not claimsAll and TileCatchAllOn(t) then claimsAll = t end
+                if t.claim then
+                    for c = 1, #CATS do
+                        local cat = CATS[c]
+                        if t.claim[cat] and not claims[cat] then
+                            claims[cat] = t
+                            eff[cat] = true
+                        end
                     end
                 end
             end
         end
     end
-    return eff, claims
+    return eff, claims, claimsAll
 end
 
+-- Boolean ownership rank, read by the ownership fold in BuildRecords:
+-- Important > Boss > Role > Can Apply > Non-Player, the catch-alls last. The
+-- merged Boss/Role record ranks as Boss and hands both constituents down.
+-- field: the category's candidate boolean (a split below a record takes it).
+-- cats: the categories a record's own buttons stamp. npKey/npCats: the
+-- Non-Player effect split of a record ranked above Non-Player (its record key
+-- and the category list its buttons stamp).
+local BOOL_OWN = {
+    priority = { rank = 1, cats = { "priority" }, npKey = "prinp", npCats = { "nonplayer", "priority" } },
+    boss = { rank = 2, field = "isBossAura", cats = { "boss" }, npKey = "bossnp", npCats = { "nonplayer", "boss" } },
+    bossrole = { rank = 2, cats = { "boss", "role" }, npKey = "bossrolenp", npCats = { "nonplayer", "boss", "role" } },
+    role = { rank = 3, field = "isRoleAura", cats = { "role" }, npKey = "rolenp", npCats = { "nonplayer", "role" } },
+    canapply = { rank = 4, field = "canApplyAura", cats = { "canapply" }, npKey = "canapplynp", npCats = { "nonplayer", "canapply" } },
+    nonplayer = { rank = 5, field = "isFromPlayerOrPlayerPet" },
+    all = { rank = 6 },
+}
+
 -- Builds ALL active records. Each: key, tokens (declaration-fixed filter
--- parts), cand (fresh candidate table), gated (candidate-boolean record),
--- tile (hosting tile table or nil = base). Also returns the cc candidate
+-- parts), cand (fresh candidate table), tile (hosting tile table or nil =
+-- base), cats (Match All and Icon Effect split records only: the
+-- category list stamped on their buttons). Also returns the cc candidate
 -- table: while cc is UNCLAIMED the base drives the legacy "cc" group (fixed
 -- filter, CC glow style); a claimed cc renders in its tile with the tile
 -- style, and the CC glow stays a base-group property.
 local function BuildRecords(s, dm)
-    local eff, claims = EffectiveState(dm)
+    -- Base-owned inputs read the current spec's base view (empty when the
+    -- spec switched the All Specs base grid off); dm keeps the shared flavor.
+    local bv = BaseView(dm)
+    local matchOn = MatchOn(bv)
+    local eff, claims, claimsAll = EffectiveState(bv, matchOn)
     -- EFFECTS routing: per-filter icon effects need their categories as
     -- SEPARATE base records even under Show All (like claims, but rendering in
     -- the base container) so the effect can target exactly those buttons
-    -- (stamped d.dmCat). Token categories negate out of the all-record;
-    -- boolean categories duplicate (accepted, same limitation as claims).
+    -- (stamped d.dmCat). Token categories negate out of the all-record, and
+    -- boolean categories leave it through the ownership fold below.
+    -- Under Match All effects only PAINT: nothing is forced here, the
+    -- conjunction record splits instead (see the Match All block).
     local fxCats = {}
-    do
-        local fl = dm.fxList
+    if not matchOn then
+        local fl = bv.fxList
         if fl then
             for i = 1, #fl do
                 local e = fl[i]
@@ -415,30 +1094,95 @@ local function BuildRecords(s, dm)
             end
         end
     end
-    local allOn = dm.all ~= false -- Show All defaults ON (legacy "all" preset parity)
-    -- With Show All on, CHECKED categories SUBTRACT from the base grid instead
-    -- of adding records (dropdown live in both modes): token categories negate
-    -- straight off the all-record, typed dispels ride excludeDispelTypes,
-    -- boolean categories use false-valued candidate booleans (nonplayer
-    -- record's complementary-boolean mechanism, inverted per flag).
+    local allOn = bv.all ~= false -- Show All defaults ON (legacy "all" preset parity)
+    -- Has Duration is an AND-MODIFIER (user directive 2026-08-16): it rides
+    -- every base-owned record via the duration fold at the bottom. The base
+    -- catch-all record joins when Show All is on, or when Has Duration is
+    -- checked with no show-lane picks (checked alone = every timed debuff).
+    local durOn = bv.hasDuration == true
+    local anyShow = bv.boss == true or bv.role == true or bv.priority == true
+        or bv.cc == true or bv.raid == true or bv.raidcombat == true
+        or bv.dispel == true or bv.nonplayer == true
+        or bv.castbyme == true or bv.magic == true or bv.curse == true or bv.poison == true
+        or bv.disease == true or bv.bleed == true or bv.canapply == true
+    local durAlone = durOn and not allOn and not anyShow
+    -- HIDE lane (dm.neg): subtracts in BOTH modes. Token categories negate off
+    -- every lower-ranked record (ownership rank cc > dispel > raid > raidcombat
+    -- holds for subtraction too -- a higher-ranked shown category keeps its
+    -- overlap, same doctrine as cc owning dispellable CC), typed dispels ride
+    -- excludeDispelTypes, boolean categories use false-valued candidate booleans
+    -- (nonplayer via the complementary TRUE).
+    local neg = bv.neg
+    local function NegHas(cat) return neg ~= nil and neg[cat] == true end
     local sub = allOn and {
-        boss = dm.boss == true, role = dm.role == true,
-        priority = dm.priority == true, raid = dm.raid == true,
-        raidcombat = dm.raidcombat == true, dispel = dm.dispel == true,
-        nonplayer = dm.nonplayer == true,
+        boss = NegHas("boss"), role = NegHas("role"),
+        priority = NegHas("priority"), raid = NegHas("raid"),
+        raidcombat = NegHas("raidcombat"), dispel = NegHas("dispel"),
+        nonplayer = NegHas("nonplayer"), canapply = NegHas("canapply"),
     } or nil
-    -- Non-cc records always exclude CROWD_CONTROL under Show All: cc group
-    -- renders CC while on, and a subtracted cc (parked by the apply pass) must stay hidden everywhere.
-    local ccOn = allOn or (eff.cc and true or false)
+    -- Non-cc records always exclude CROWD_CONTROL under Show All (cc group
+    -- renders CC while on, and a subtracted cc -- parked by the apply pass --
+    -- must stay hidden everywhere), when cc is effectively on, and when the
+    -- hide lane subtracts cc in add mode.
+    local ccOn = allOn or (eff.cc and true or false) or NegHas("cc")
+    -- Non-Player flavor: the nonplayer category renders isFromPlayerOrPlayerPet
+    -- = false ("Non-Player Auras") or = true ("From Any Player"); every fold the
+    -- category applies to OTHER records carries the complement.
+    local npAny = dm.nonplayerMode == "any"
+    local npHideVal = not npAny
+    -- Cast By You (PLAYER token) ranks lowest among token categories: it negates
+    -- every other token owner, and every non-token record negates !PLAYER while
+    -- it is shown or hidden anywhere (same shape as raid/raidcombat).
+    local castActive = (eff.castbyme and true or false) or NegHas("castbyme")
+    -- Per-type dispel ownership: a type shown as its own record, or hidden, is
+    -- excluded from every other record (the typed dispel record loses it from
+    -- its include map, everything else gains an exclude entry). Per-type records
+    -- negate only crowd control, so they own their type outright.
+    local typeEx
+    for i = 1, #TYPE_ORDER do
+        local cat = TYPE_ORDER[i]
+        if (eff[cat] and (claims[cat] or fxCats[cat] or not allOn)) or NegHas(cat) then
+            typeEx = typeEx or {}
+            typeEx[TYPE_CATS[cat]] = true
+        end
+    end
+    -- Copy-on-write type exclusion. Include maps derived from TYPED_DEBUFFS (the
+    -- typed dispel record) shrink; a per-type record's own single-type include is
+    -- never touched; every other record grows an exclude map. Static vocabulary
+    -- tables are never mutated.
+    local typedCopies = {}
+    local function ExcludeType(cf, T)
+        local inc = cf.includeDispelTypes
+        if inc then
+            if (inc == TYPED_DEBUFFS or typedCopies[inc]) and inc[T] then
+                local m = {}
+                for k, v in pairs(inc) do m[k] = v end
+                m[T] = nil
+                typedCopies[m] = true
+                cf.includeDispelTypes = m
+            end
+            return
+        end
+        local exm = cf.excludeDispelTypes
+        if exm == TYPED_DEBUFFS or (exm and exm[T]) then return end
+        local m = {}
+        if exm then for k, v in pairs(exm) do m[k] = v end end
+        m[T] = true
+        cf.excludeDispelTypes = m
+    end
 
     -- Two dispel flavors: "you" = RAID_PLAYER_DISPELLABLE token; "typed" = any dispel
     -- type (candidate include map, not tokenizable, dedup rides excludeDispelTypes instead of a !token).
+    -- dispelActive covers the hide lane too: a hidden dispel category emits no
+    -- record but its !token / typed exclude must still reach the others.
     local dispelOn = eff.dispel and true or false
+    local dispelActive = dispelOn or NegHas("dispel")
     local dispelMode = (dm.dispelMode == "typed") and "typed" or "you"
-    local dispelToken = (dispelOn and dispelMode == "you") and "RAID_PLAYER_DISPELLABLE" or nil
-    -- Typed exclude applies only while the typed dispel record is really BUILT (claimed, or base without Show All), else Show All excludes debuffs nothing re-adds.
-    local typedMap = dispelOn and dispelMode == "typed"
-        and ((claims.dispel or fxCats.dispel or not allOn or (sub and sub.dispel)) and true or false)
+    local dispelToken = (dispelActive and dispelMode == "you") and "RAID_PLAYER_DISPELLABLE" or nil
+    -- Typed exclude applies only while the typed dispel record is really BUILT (claimed, or base without Show All)
+    -- or the category is hidden, else Show All excludes debuffs nothing re-adds.
+    local typedMap = dispelActive and dispelMode == "typed"
+        and ((claims.dispel or fxCats.dispel or not allOn or NegHas("dispel")) and true or false)
 
     -- Internal exclude set: hardcoded sated list (honoring Show Lust Debuff
     -- opt-out) plus the always-hide pair. 68824's never-secret identity-gate
@@ -459,6 +1203,23 @@ local function BuildRecords(s, dm)
         if typedMap and not cf.includeDispelTypes then
             cf.excludeDispelTypes = TYPED_DEBUFFS
         end
+        -- Per-type ownership folds (see typeEx); a per-type record's own include
+        -- map is left alone inside ExcludeType.
+        if typeEx then
+            for T in pairs(typeEx) do ExcludeType(cf, T) end
+        end
+        -- Add-mode hide lane, boolean categories: false-valued candidate booleans
+        -- ride every positive record (never overriding a record's own positive
+        -- boolean; the merged bossrole record skips both constituents). Under
+        -- Show All the all-record's explicit sub block owns this instead, so
+        -- legacy record shapes stay byte-identical.
+        if neg and not allOn then
+            if neg.boss and cf.isBossAura == nil and cf.isBossOrRoleAura == nil then cf.isBossAura = false end
+            if neg.role and cf.isRoleAura == nil and cf.isBossOrRoleAura == nil then cf.isRoleAura = false end
+            if neg.priority and cf.isPriorityAura == nil then cf.isPriorityAura = false end
+            if neg.nonplayer and cf.isFromPlayerOrPlayerPet == nil then cf.isFromPlayerOrPlayerPet = npHideVal end
+            if neg.canapply and cf.canApplyAura == nil then cf.canApplyAura = false end
+        end
         return cf
     end
 
@@ -471,25 +1232,32 @@ local function BuildRecords(s, dm)
     local function Neg(toks, negCC, negDispel, negRaid)
         if negCC and ccOn then toks[#toks + 1] = "!CROWD_CONTROL" end
         if negDispel and dispelToken then toks[#toks + 1] = "!" .. dispelToken end
-        if negRaid and eff.raid then toks[#toks + 1] = "!RAID" end
+        if negRaid and (eff.raid or NegHas("raid")) then toks[#toks + 1] = "!RAID" end
         return toks
     end
 
-    -- Show All short-circuits the BASE union (other base records would be pure duplicates in one row) but tiles still
-    -- render their claims; all-record negates claimed TOKEN categories to stay single-rendered (boolean claims duplicate: cannot be negated).
-    if allOn then
+    -- Show All (or Has Duration alone) short-circuits the BASE union (other base records would be pure duplicates
+    -- in one row) but tiles still render their claims; the catch-all record negates claimed TOKEN categories to
+    -- stay single-rendered (boolean claims leave it through the ownership fold below). The NegHas terms are
+    -- byte-identical under Show All (sub mirrors NegHas) and carry the hide lane when durAlone builds this with
+    -- sub nil.
+    if allOn or durAlone then
         local toks = { "HARMFUL" }
         Neg(toks, true,
-            (sub.dispel or claims.dispel or fxCats.dispel) and true or false,
-            (sub.raid or claims.raid or fxCats.raid) and true or false)
-        if sub.raidcombat or claims.raidcombat or fxCats.raidcombat then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+            ((sub and sub.dispel) or claims.dispel or fxCats.dispel or NegHas("dispel")) and true or false,
+            ((sub and sub.raid) or claims.raid or fxCats.raid or NegHas("raid")) and true or false)
+        if (sub and sub.raidcombat) or claims.raidcombat or fxCats.raidcombat or NegHas("raidcombat") then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+        if castActive then toks[#toks + 1] = "!PLAYER" end
         local cf = Cand(false)
         -- Subtracted boolean categories (see `sub`); fx-routed keeps its forced base record (effect wins over
-        -- subtraction, same accepted edge as duplicating boolean claims).
-        if sub.boss then cf.isBossAura = false end
-        if sub.role then cf.isRoleAura = false end
-        if sub.priority then cf.isPriorityAura = false end
-        if sub.nonplayer then cf.isFromPlayerOrPlayerPet = true end
+        -- subtraction). Under durAlone (add mode) Cand's own hide-lane branch already applied these.
+        if sub then
+            if sub.boss then cf.isBossAura = false end
+            if sub.role then cf.isRoleAura = false end
+            if sub.priority then cf.isPriorityAura = false end
+            if sub.nonplayer then cf.isFromPlayerOrPlayerPet = npHideVal end
+            if sub.canapply then cf.canApplyAura = false end
+        end
         recs[#recs + 1] = { key = "all", tokens = toks, cand = cf }
     end
 
@@ -502,7 +1270,7 @@ local function BuildRecords(s, dm)
 
     -- Sized base crowd control: Icon Effects Size cannot resize the legacy "cc" group (group->style binding fixed
     -- at declare), so cc becomes a base record variant carrying the CC-glow style; apply pass parks the legacy group while this record exists.
-    if eff.cc and not claims.cc and FxSizeFor(dm.fxList, "cc") then
+    if eff.cc and not claims.cc and FxSizeFor(bv.fxList, "cc") then
         recs[#recs + 1] = { key = "cc", tokens = { "HARMFUL", "CROWD_CONTROL" },
             cand = { excludeSpellIDs = ex } }
     end
@@ -533,8 +1301,26 @@ local function BuildRecords(s, dm)
 
     local function BoolTokens()
         local toks = Neg({ "HARMFUL" }, true, true, true)
-        if eff.raidcombat then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+        if eff.raidcombat or NegHas("raidcombat") then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+        if castActive then toks[#toks + 1] = "!PLAYER" end
         return toks
+    end
+    -- Cast By You: token record, lowest token rank (negates every other token
+    -- owner; per-type dispel ownership reaches it through Cand's type folds).
+    if eff.castbyme and (claims.castbyme or fxCats.castbyme or not allOn) then
+        local toks = Neg({ "HARMFUL", "PLAYER" }, true, true, true)
+        if eff.raidcombat or NegHas("raidcombat") then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+        recs[#recs + 1] = { key = "castbyme", tokens = toks, cand = Cand(false), tile = claims.castbyme }
+    end
+    -- Per-type dispels: one include-map record per shown type. Only crowd
+    -- control is negated (cc owns every overlap); every other record excludes
+    -- the type through typeEx, so each record owns its type outright.
+    for i = 1, #TYPE_ORDER do
+        local cat = TYPE_ORDER[i]
+        if eff[cat] and (claims[cat] or fxCats[cat] or not allOn) then
+            recs[#recs + 1] = { key = cat, tokens = Neg({ "HARMFUL" }, true, false, false),
+                cand = Cand(false, { includeDispelTypes = TYPE_INCLUDE[cat] }), tile = claims[cat] }
+        end
     end
     -- Boss/role merge into one record only when they route to the SAME place; split claims build separate records.
     local bossTile, roleTile = claims.boss, claims.role
@@ -542,38 +1328,372 @@ local function BuildRecords(s, dm)
     local roleOn = eff.role and (roleTile or fxCats.role or not allOn)
     if bossOn and roleOn and bossTile == roleTile then
         recs[#recs + 1] = { key = "bossrole", tokens = BoolTokens(),
-            cand = Cand(true, { isBossOrRoleAura = true }), gated = true, tile = bossTile }
+            cand = Cand(true, { isBossOrRoleAura = true }), tile = bossTile }
     else
         if bossOn then
             recs[#recs + 1] = { key = "boss", tokens = BoolTokens(),
-                cand = Cand(true, { isBossAura = true }), gated = true, tile = bossTile }
+                cand = Cand(true, { isBossAura = true }), tile = bossTile }
         end
         if roleOn then
             recs[#recs + 1] = { key = "role", tokens = BoolTokens(),
-                cand = Cand(true, { isRoleAura = true }), gated = true, tile = roleTile }
+                cand = Cand(true, { isRoleAura = true }), tile = roleTile }
         end
     end
     if eff.priority and (claims.priority or fxCats.priority or not allOn) then
         recs[#recs + 1] = { key = "priority", tokens = BoolTokens(),
-            cand = Cand(true, { isPriorityAura = true }), gated = true, tile = claims.priority }
+            cand = Cand(true, { isPriorityAura = true }), tile = claims.priority }
+    end
+    -- Can Apply Aura: boolean record (debuffs the player's own class can apply),
+    -- same shape and overlap doctrine as the other boolean categories.
+    if eff.canapply and (claims.canapply or fxCats.canapply or not allOn) then
+        recs[#recs + 1] = { key = "canapply", tokens = BoolTokens(),
+            cand = Cand(true, { canApplyAura = true }), tile = claims.canapply }
     end
 
     -- Non-Player Auras: boolean record (isFromPlayerOrPlayerPet = false -- debuffs not caused by ANY player or
-    -- player pet, engine-evaluated; a !PLAYER token would exclude only YOUR casts, never other players' Sated/Forbearance noise). Base-only, no tile/fx routing. Full
-    -- token negation set keeps token categories owning their overlaps; overlap with boolean records accepted like
-    -- boolean x boolean. Pure subset of the all-record under Show All, so skipped there too.
-    if eff.nonplayer and not allOn then
+    -- player pet, engine-evaluated; a !PLAYER token would exclude only YOUR casts, never other players' Sated/Forbearance noise). Full
+    -- token negation set keeps token categories owning their overlaps; Important, Boss, Role and Can Apply own
+    -- theirs through the ownership fold below. Pure subset of the all-record
+    -- under Show All, so the base skips it there; a claiming tile or a per-filter effect still forces it (same
+    -- routing as the other boolean categories).
+    if eff.nonplayer and (claims.nonplayer or fxCats.nonplayer or not allOn) then
         recs[#recs + 1] = { key = "nonplayer", tokens = BoolTokens(),
-            cand = Cand(false, { isFromPlayerOrPlayerPet = false }) }
+            cand = Cand(false, { isFromPlayerOrPlayerPet = npAny }), tile = claims.nonplayer }
     end
 
-    -- Stamp each record with its owner list's resolved Size (base reads base blocks, tile-hosted reads its tile's).
+    -- MATCH ALL: ONE base conjunction record from the raw show lane (MatchSpec).
+    -- Icon Effects only PAINT here: a block on a category inside the set paints
+    -- the whole group (its stamped category list matches the block); a block on
+    -- a category X outside the set splits the rest into (set AND X, painted) and
+    -- (set AND NOT X), in block order, until a block reaches inside the set.
+    -- A part that can never match is skipped, so a hidden or claimed X paints
+    -- nothing (Hide beats an effect). Exact complements (every category, the
+    -- boolean ones included, has an exact opposite): no debuff lands in two
+    -- parts. A set that can never match builds nothing (ns.DM_MatchEmpty is the
+    -- options warning's test).
+    if matchOn then
+        local rest, cats = MatchSpec(bv, dm, claims)
+        local restT, restC = MatchFinish(rest)
+        local fl = bv.fxList
+        if restT and fl then
+            local inSet, split = {}, {}
+            for i = 1, #cats do inSet[cats[i]] = true end
+            for i = 1, #fl do
+                local e = fl[i]
+                if FxEntryActive(e) then
+                    local xs, inside = {}, false
+                    for cat, on in pairs(e.filters) do
+                        if on then
+                            if inSet[cat] then inside = true end
+                            xs[#xs + 1] = cat
+                        end
+                    end
+                    if inside then break end
+                    table.sort(xs)
+                    for k = 1, #xs do
+                        local X = xs[k]
+                        if restT and not split[X] then
+                            split[X] = true
+                            local pos = MatchCopy(rest)
+                            if MatchApply(pos, X, true, dm) then
+                                local pT, pC = MatchFinish(pos)
+                                if pT then
+                                    local pcats = { X }
+                                    for c = 1, #cats do pcats[#pcats + 1] = cats[c] end
+                                    table.sort(pcats)
+                                    pC.excludeSpellIDs = ex
+                                    recs[#recs + 1] = { key = "match:" .. table.concat(pcats, "+"),
+                                        tokens = pT, cand = pC, cats = pcats }
+                                    local negm = MatchCopy(rest)
+                                    MatchApply(negm, X, false, dm)
+                                    rest = negm
+                                    restT, restC = MatchFinish(negm)
+                                end
+                            end
+                        end
+                    end
+                    if not restT then break end
+                end
+            end
+        end
+        if restT then
+            restC.excludeSpellIDs = ex
+            recs[#recs + 1] = { key = "match:" .. table.concat(cats, "+"),
+                tokens = restT, cand = restC, cats = cats }
+        end
+    end
+
+    -- Tile-hosted catch-all: the first enabled grid tile in catch-all state
+    -- (All Debuffs checked, or Has Duration alone -- the duration fold below
+    -- narrows it) renders its own broad record. Independent of the base record
+    -- on purpose: negating "everything" out of the base would empty it, so
+    -- overlap with a broad base is accepted (a deliberate user config). BoolTokens
+    -- negates token categories rendered or hidden elsewhere, and the ownership
+    -- fold below drops every boolean record's content, so categorized
+    -- content stays single-rendered. Under Match All the base conjunction is
+    -- NOT negated here (NOT(A AND B) is no single filter), so its content also
+    -- shows in this indicator (accepted, like a broad base).
+    if claimsAll then
+        local cf = Cand(false)
+        if sub then
+            if sub.boss then cf.isBossAura = false end
+            if sub.role then cf.isRoleAura = false end
+            if sub.priority then cf.isPriorityAura = false end
+            if sub.nonplayer then cf.isFromPlayerOrPlayerPet = npHideVal end
+            if sub.canapply then cf.canApplyAura = false end
+        end
+        recs[#recs + 1] = { key = "all", tokens = BoolTokens(),
+            cand = cf, tile = claimsAll }
+    end
+
+    -- Dead-corpse catch-all: ONE indicator showing Non-Player Auras drops ALL its
+    -- filters while its unit is dead and shows every debuff instead (persist-through-
+    -- death NPC debuffs matter for res decisions). Compiled as an extra token-only
+    -- record (HARMFUL + hygiene excludes; token-only on purpose -- candidate flags
+    -- don't stream on dead units) parked at 0; the apply pass wires the death-edge
+    -- swap (park the indicator's normal records, unpark this). Qualifier = first
+    -- enabled ICONS tile whose show lane includes nonplayer, else the base grid's
+    -- nonplayer checkbox; suppressed entirely when a literal All Debuffs indicator
+    -- exists (base Show All or a grid tile's All bit) -- everything already shows.
+    do
+        local deadTile, deadBlocked
+        if allOn then deadBlocked = true end
+        local dtiles = ns.DM_ActiveTiles()
+        if dtiles then
+            for i = 1, #dtiles do
+                local t = dtiles[i]
+                if t.enabled and (t.type == "icons" or t.type == "square") and t.all == true then
+                    deadBlocked = true
+                end
+                if not deadTile and t.enabled and t.type == "icons" and t.claim and t.claim.nonplayer then
+                    deadTile = t
+                end
+            end
+        end
+        -- The From Any Player flavor is not "Non-Player Auras": no corpse swap.
+        if not deadBlocked and not npAny and (deadTile or bv.nonplayer == true) then
+            recs[#recs + 1] = { key = "npdead", tokens = { "HARMFUL" },
+                cand = { excludeSpellIDs = ex }, deadOnly = true, tile = deadTile }
+        end
+    end
+
+    -- Ownership fold: one linear owner order over the boolean records (BOOL_OWN:
+    -- Important > Boss > Role > Can Apply > Non-Player, catch-alls last).
+    -- Candidate booleans compare exactly, so false values partition in and out
+    -- of restriction. While a boolean record exists anywhere (base show lane, a
+    -- claiming indicator or an Icon Effect), every record ranked below it drops
+    -- its content (a false value; Non-Player's complement for the catch-alls),
+    -- so a debuff lands in the highest-ranked record it matches and both
+    -- catch-alls (the base and the indicator All Debuffs records) keep only
+    -- what no boolean record shows. A record takes only HIGHER ranks, and only
+    -- from a higher record that does not already hide its category, so the
+    -- order never cycles. Only empty fields are set, so a record's own filter
+    -- and the hide lanes' folds (same values) always win; cc, npdead and Match
+    -- All records take no fold. A setup without two of these records side by
+    -- side builds byte-identical payloads, and a changed payload declares its
+    -- new variant once through the usual missing-group path.
+    do
+        local hasPri, hasBoss, hasRole, hasCan, hasNp = false, false, false, false, false
+        local byCat = {}
+        for i = 1, #recs do
+            local r = recs[i]
+            local k = r.key
+            if k == "priority" then hasPri = true; byCat.priority = r
+            elseif k == "boss" then hasBoss = true; byCat.boss = r
+            elseif k == "role" then hasRole = true; byCat.role = r
+            elseif k == "bossrole" then hasBoss = true; hasRole = true; byCat.boss = r; byCat.role = r
+            elseif k == "canapply" then hasCan = true; byCat.canapply = r
+            elseif k == "nonplayer" then hasNp = true end
+        end
+        -- True when record h already keeps category c out: the base add-mode
+        -- hide lane Cand folded in, or its indicator's hide lane (applied below).
+        local function Hides(h, c)
+            local tn = h.tile and h.tile.neg
+            if tn and tn[c] == true then return true end
+            if c == "nonplayer" then return h.cand.isFromPlayerOrPlayerPet == npHideVal end
+            return h.cand[MATCH_BOOL[c]] == false
+        end
+        -- A lower record keyed lk takes h's NOT only while h can show part of
+        -- lk's content: an h that already hides lk's category shares none of it,
+        -- and folding it too would drop that overlap from both. A merged
+        -- Boss/Role record with either half hidden keeps its overlap.
+        local function Owns(h, lk)
+            if not h then return false end
+            if lk == "all" then return true end
+            if lk == "bossrole" then return not (Hides(h, "boss") or Hides(h, "role")) end
+            return not Hides(h, lk)
+        end
+        if hasPri or hasBoss or hasRole or hasCan or hasNp then
+            for i = 1, #recs do
+                local r = recs[i]
+                local own = BOOL_OWN[r.key]
+                if own then
+                    local cf, rank, k = r.cand, own.rank, r.key
+                    if rank > 1 and cf.isPriorityAura == nil and Owns(byCat.priority, k) then cf.isPriorityAura = false end
+                    if rank > 2 and cf.isBossAura == nil and Owns(byCat.boss, k) then cf.isBossAura = false end
+                    if rank > 3 and cf.isRoleAura == nil and Owns(byCat.role, k) then cf.isRoleAura = false end
+                    if rank > 4 and cf.canApplyAura == nil and Owns(byCat.canapply, k) then cf.canApplyAura = false end
+                    if rank > 5 and hasNp and cf.isFromPlayerOrPlayerPet == nil then
+                        cf.isFromPlayerOrPlayerPet = npHideVal
+                    end
+                end
+            end
+        end
+        -- An Icon Effect on a lower-ranked boolean keeps painting what the fold
+        -- above moved out of that category's group: each record ranked above it
+        -- walks its OWN owner list in block order, stops at a block that already
+        -- paints its own category (first matching block wins), and splits its
+        -- remainder into an exact complement pair per lower category a block
+        -- names. The matching half stamps both categories (the Non-Player half
+        -- keeps BOOL_OWN npKey/npCats); the rest keeps its key. A merged
+        -- Boss/Role group paints both constituents, so a split below it takes
+        -- both. Setups without such a block build byte-identical records.
+        local has = { boss = hasBoss, role = hasRole, canapply = hasCan, nonplayer = hasNp }
+        local merged = byCat.boss ~= nil and byCat.boss == byCat.role
+        local n0 = #recs
+        for i = 1, n0 do
+            local r = recs[i]
+            local own = BOOL_OWN[r.key]
+            local fl
+            if own and own.cats then
+                if r.tile then fl = r.tile.fxList else fl = bv.fxList end
+            end
+            if fl then
+                local cf, tn, done = r.cand, r.tile and r.tile.neg, {}
+                for j = 1, #fl do
+                    local e = fl[j]
+                    if FxEntryActive(e) then
+                        local f, inside = e.filters, false
+                        for c = 1, #own.cats do
+                            if f[own.cats[c]] then inside = true end
+                        end
+                        if inside then break end
+                        local xs = {}
+                        for cat, on in pairs(f) do
+                            if on then xs[#xs + 1] = cat end
+                        end
+                        if merged and (f.boss or f.role) then
+                            if not f.boss then xs[#xs + 1] = "boss" end
+                            if not f.role then xs[#xs + 1] = "role" end
+                        end
+                        table.sort(xs)
+                        for x = 1, #xs do
+                            local X = xs[x]
+                            local xo = BOOL_OWN[X]
+                            if xo and xo.field and xo.rank > own.rank and has[X] and not done[X]
+                                and cf[xo.field] == nil and not (tn and tn[X] == true) then
+                                done[X] = true
+                                local c2, t2 = {}, {}
+                                for kk, v in pairs(cf) do c2[kk] = v end
+                                for kk = 1, #r.tokens do t2[kk] = r.tokens[kk] end
+                                local key, pcats = own.npKey, own.npCats
+                                if X == "nonplayer" then
+                                    c2[xo.field], cf[xo.field] = npAny, npHideVal
+                                else
+                                    c2[xo.field], cf[xo.field] = true, false
+                                    key = r.key .. "+" .. X
+                                    pcats = { X }
+                                    if merged and (X == "boss" or X == "role") then
+                                        pcats[2] = (X == "boss") and "role" or "boss"
+                                    end
+                                    for c = 1, #own.cats do pcats[#pcats + 1] = own.cats[c] end
+                                end
+                                recs[#recs + 1] = { key = key, tokens = t2, cand = c2,
+                                    tile = r.tile, cats = pcats }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- Tile HIDE lanes: a hosting tile's hide lane folds into every record it
+    -- hosts, additive to the base lane (which already rode Cand/sub above).
+    -- Token categories negate via tokens, typed dispels via the exclude map,
+    -- boolean categories via false-valued candidate booleans -- always
+    -- deferring to a record's own positive filter (own-category hides are
+    -- UI-locked; the key checks here are the engine-side guard). The cc
+    -- record takes NO folds at all (base parity: ccCand bypasses Cand, so the
+    -- base hide lane never touches cc content either -- cc owns its overlaps,
+    -- and a magic stun must never vanish from both cc and dispel).
+    local function HasTok(toks, tok)
+        for i = 1, #toks do if toks[i] == tok then return true end end
+        return false
+    end
     for i = 1, #recs do
         local r = recs[i]
-        r.fxSize = FxSizeFor(r.tile and r.tile.fxList or dm.fxList, r.key)
+        local tn = r.tile and r.tile.neg
+        -- npdead ignores ALL filters by definition: no hide-lane folds, no duration cap.
+        if tn and r.key ~= "cc" and r.key ~= "npdead" then
+            local toks, cf, key = r.tokens, r.cand, r.key
+            if tn.cc == true and not HasTok(toks, "!CROWD_CONTROL") then
+                toks[#toks + 1] = "!CROWD_CONTROL"
+            end
+            if tn.dispel == true and key ~= "dispel" then
+                if dispelMode == "typed" then
+                    if not cf.includeDispelTypes then cf.excludeDispelTypes = TYPED_DEBUFFS end
+                elseif not HasTok(toks, "!RAID_PLAYER_DISPELLABLE") then
+                    toks[#toks + 1] = "!RAID_PLAYER_DISPELLABLE"
+                end
+            end
+            if tn.raid == true and key ~= "raid" and not HasTok(toks, "!RAID") then
+                toks[#toks + 1] = "!RAID"
+            end
+            if tn.raidcombat == true and key ~= "raidcombat" and not HasTok(toks, "!RAID_IN_COMBAT") then
+                toks[#toks + 1] = "!RAID_IN_COMBAT"
+            end
+            if tn.boss == true and cf.isBossAura == nil and cf.isBossOrRoleAura == nil then cf.isBossAura = false end
+            if tn.role == true and cf.isRoleAura == nil and cf.isBossOrRoleAura == nil then cf.isRoleAura = false end
+            if tn.priority == true and cf.isPriorityAura == nil then cf.isPriorityAura = false end
+            if tn.nonplayer == true and key ~= "nonplayer" and cf.isFromPlayerOrPlayerPet == nil then
+                cf.isFromPlayerOrPlayerPet = npHideVal
+            end
+            -- Less common categories: token, boolean, and per-type folds.
+            if tn.castbyme == true and key ~= "castbyme" and not HasTok(toks, "!PLAYER") then
+                toks[#toks + 1] = "!PLAYER"
+            end
+            if tn.canapply == true and cf.canApplyAura == nil then cf.canApplyAura = false end
+            for ti = 1, #TYPE_ORDER do
+                local tcat = TYPE_ORDER[ti]
+                if tn[tcat] == true and key ~= tcat then ExcludeType(cf, TYPE_CATS[tcat]) end
+            end
+        end
     end
 
-    return recs, ccCand, claims, Cand, fxCats
+    -- Has Duration fold: the owner surface's modifier ANDs the native duration
+    -- gate onto every record it owns (base records read dm, tile-hosted read
+    -- their tile). maxDuration rejects duration == 0 (permanents) and anything
+    -- above the cap, so math.huge keeps every timed debuff and drops only
+    -- permanents. cc records are exempt like every other fold: the legacy cc
+    -- group's candidates are declaration-fixed (no live retake), so the base
+    -- cc surfaces could never honor a flip -- crowd control always shows.
+    -- Also stamp each record with its owner list's resolved Size (base reads
+    -- base blocks, tile-hosted reads its tile's).
+    for i = 1, #recs do
+        local r = recs[i]
+        local owner = r.tile or bv
+        -- Max Duration (seconds) is the same native gate with a real cap; it
+        -- implies Has Duration (a capped aura is a timed aura). nil = Unlimited
+        -- = no field on the candidate table at all.
+        local cap = owner.maxDurSec or (owner.hasDuration == true and math.huge) or nil
+        if cap and r.key ~= "cc" and r.key ~= "npdead" then
+            r.cand.maxDuration = cap
+        end
+        r.fxSize = FxSizeFor(r.tile and r.tile.fxList or bv.fxList, r.cats or r.key)
+    end
+
+    return recs, ccCand, claims, Cand, fxCats, matchOn
+end
+
+-- Shared "Match All can never match" test: the builder above builds nothing
+-- for such a set, and the options page's empty-selection warning asks the
+-- same question through this. False whenever Match All is not live.
+function ns.DM_MatchEmpty(view)
+    local dm = DM()
+    if not (view and dm and MatchOn(view)) then return false end
+    local _, claims = EffectiveState(view, true)
+    return MatchFinish((MatchSpec(view, dm, claims))) == nil
 end
 
 -- Order-independent fingerprint of a candidate-filter table. Candidate payloads are DECLARATION-FIXED
@@ -624,20 +1744,122 @@ end
 
 -- Effect-tile category resolution: one live-settable slot per tile.
 local function EffectFilterFor(dm, cat)
-    if cat == "cc" then return { "HARMFUL", "CROWD_CONTROL" }, nil, false end
-    if cat == "raid" then return { "HARMFUL", "RAID" }, nil, false end
-    if cat == "raidcombat" then return { "HARMFUL", "RAID_IN_COMBAT" }, nil, false end
+    if cat == "cc" then return { "HARMFUL", "CROWD_CONTROL" }, nil end
+    if cat == "raid" then return { "HARMFUL", "RAID" }, nil end
+    if cat == "raidcombat" then return { "HARMFUL", "RAID_IN_COMBAT" }, nil end
     if cat == "dispel" then
         -- Follows the base dispel flavor: by-you token or typed include map.
         if dm.dispelMode == "typed" then
-            return { "HARMFUL" }, { includeDispelTypes = TYPED_DEBUFFS }, false
+            return { "HARMFUL" }, { includeDispelTypes = TYPED_DEBUFFS }
         end
-        return { "HARMFUL", "RAID_PLAYER_DISPELLABLE" }, nil, false
+        return { "HARMFUL", "RAID_PLAYER_DISPELLABLE" }, nil
     end
-    if cat == "boss" then return { "HARMFUL" }, { isBossAura = true }, true end
-    if cat == "role" then return { "HARMFUL" }, { isRoleAura = true }, true end
+    if cat == "boss" then return { "HARMFUL" }, { isBossAura = true } end
+    if cat == "role" then return { "HARMFUL" }, { isRoleAura = true } end
+    -- Follows the base Non-Player flavor (false = Non-Player Auras, true = From Any Player).
+    if cat == "nonplayer" then return { "HARMFUL" }, { isFromPlayerOrPlayerPet = dm.nonplayerMode == "any" } end
+    if cat == "castbyme" then return { "HARMFUL", "PLAYER" }, nil end
+    if TYPE_CATS[cat] then return { "HARMFUL" }, { includeDispelTypes = TYPE_INCLUDE[cat] } end
+    if cat == "canapply" then return { "HARMFUL" }, { canApplyAura = true } end
+    -- Catch-all pseudo-category (TileCatchAllOn tiles; the duration modifier folds in via EffectFilterForTile).
+    if cat == "all" then return { "HARMFUL" }, nil end
     -- "priority" (default)
-    return { "HARMFUL" }, { isPriorityAura = true }, true
+    return { "HARMFUL" }, { isPriorityAura = true }
+end
+
+-- Effect-slot resolution with the tile's HIDE lane and Has Duration modifier
+-- folded in (same doctrine as record synthesis: tokens for token categories,
+-- the typed exclude map for typed dispels, false-valued candidate booleans for
+-- the rest, maxDuration for the modifier; a slot's own category defers, and
+-- the cc slot takes no folds at all -- cc owns its overlaps, base parity with
+-- ccCand bypassing Cand).
+local function EffectFilterForTile(dm, t, cat)
+    local toks, cf = EffectFilterFor(dm, cat)
+    local cap = t and (t.maxDurSec or (t.hasDuration == true and math.huge)) or nil
+    if cap and cat ~= "cc" then
+        cf = cf or {}
+        if cf.maxDuration == nil then cf.maxDuration = cap end
+    end
+    local tn = t and t.neg
+    if tn and cat ~= "cc" then
+        if tn.cc == true then toks[#toks + 1] = "!CROWD_CONTROL" end
+        if tn.dispel == true and cat ~= "dispel" then
+            if dm.dispelMode == "typed" then
+                cf = cf or {}
+                if not cf.includeDispelTypes then cf.excludeDispelTypes = TYPED_DEBUFFS end
+            else
+                toks[#toks + 1] = "!RAID_PLAYER_DISPELLABLE"
+            end
+        end
+        if tn.raid == true and cat ~= "raid" then toks[#toks + 1] = "!RAID" end
+        if tn.raidcombat == true and cat ~= "raidcombat" then toks[#toks + 1] = "!RAID_IN_COMBAT" end
+        if tn.boss == true and cat ~= "boss" then
+            cf = cf or {}
+            if cf.isBossAura == nil then cf.isBossAura = false end
+        end
+        if tn.role == true and cat ~= "role" then
+            cf = cf or {}
+            if cf.isRoleAura == nil then cf.isRoleAura = false end
+        end
+        if tn.priority == true and cat ~= "priority" then
+            cf = cf or {}
+            if cf.isPriorityAura == nil then cf.isPriorityAura = false end
+        end
+        if tn.nonplayer == true and cat ~= "nonplayer" then
+            cf = cf or {}
+            if cf.isFromPlayerOrPlayerPet == nil then cf.isFromPlayerOrPlayerPet = (dm.nonplayerMode ~= "any") end
+        end
+        if tn.castbyme == true and cat ~= "castbyme" then toks[#toks + 1] = "!PLAYER" end
+        if tn.canapply == true and cat ~= "canapply" then
+            cf = cf or {}
+            if cf.canApplyAura == nil then cf.canApplyAura = false end
+        end
+        -- Per-type hides: the typed dispel slot's include map shrinks (copy),
+        -- any other slot gains an exclude entry; a slot's own type is skipped.
+        for ti = 1, #TYPE_ORDER do
+            local tcat = TYPE_ORDER[ti]
+            if tn[tcat] == true and cat ~= tcat then
+                local T = TYPE_CATS[tcat]
+                cf = cf or {}
+                local inc = cf.includeDispelTypes
+                if inc then
+                    if inc[T] then
+                        local m = {}
+                        for k, v in pairs(inc) do m[k] = v end
+                        m[T] = nil
+                        cf.includeDispelTypes = m
+                    end
+                elseif cf.excludeDispelTypes ~= TYPED_DEBUFFS then
+                    local m = {}
+                    if cf.excludeDispelTypes then
+                        for k, v in pairs(cf.excludeDispelTypes) do m[k] = v end
+                    end
+                    m[T] = true
+                    cf.excludeDispelTypes = m
+                end
+            end
+        end
+    end
+    return toks, cf
+end
+
+-- Effect-tile category set: claimed categories plus the "all" pseudo-category
+-- while the tile is in catch-all state (nil when the tile targets nothing).
+local function EffectCatSet(t)
+    local set
+    if t.claim then
+        for cat, on in pairs(t.claim) do
+            if on then
+                set = set or {}
+                set[cat] = true
+            end
+        end
+    end
+    if TileCatchAllOn(t) then
+        set = set or {}
+        set.all = true
+    end
+    return set
 end
 
 -------------------------------------------------------------------------------
@@ -671,7 +1893,9 @@ local function FxCreateVisuals(button, dd, kind, hostBtn, health)
     if not dd then return end
     if kind == "glow" then
         local g = CreateFrame("Frame", nil, button)
-        g:SetAllPoints(hostBtn)
+        -- The Party Frames kit glows round the visible party frame; the
+        -- level band stays the unit button's.
+        g:SetAllPoints((health and health._euiKitRef) or hostBtn)
         g:SetFrameLevel((hostBtn:GetFrameLevel() or 1) + 15)
         g:EnableMouse(false)
         g:Hide()
@@ -689,6 +1913,7 @@ local function FxCreateVisuals(button, dd, kind, hostBtn, health)
         f:Hide()
         dd.dmFxHcFrame = f
         dd.dmFxHc = tex
+        ns.RF_RegisterBarTint(health, tex, f, "dm")
     elseif kind == "square" then
         local f = CreateFrame("Frame", nil, button)
         f:SetPoint("CENTER", health, "CENTER")
@@ -734,8 +1959,9 @@ local function FxApplyInner(button, dd, refs, fx)
             cr, cg, cb = 1.0, 0.788, 0.137
         end
         -- Size from the unit frame's REAL rect (refs.host is ours, outside the forbidden subtree, so the read is legal here).
-        local gw = refs.host:GetWidth() or 0
-        local gh = refs.host:GetHeight() or 0
+        local rect = (refs.health and refs.health._euiKitRef) or refs.host
+        local gw = rect:GetWidth() or 0
+        local gh = rect:GetHeight() or 0
         if gw < 1 then gw = 24 end
         if gh < 1 then gh = gw end
         -- One style only: the animation-driven pixel march (driver-ticked glows freeze on the forbidden slot subtree; this runs C-side).
@@ -749,7 +1975,9 @@ local function FxApplyInner(button, dd, refs, fx)
         local tex = dd.dmFxHc
         if not (f and tex) then return end -- created in extraInit
         -- Level tie set at creation; NO re-check here -- subtree reads (ours included) are denied outside the creation window and would kill this branch.
-        tex:SetColorTexture(fx.r or 1, fx.g or 0.2, fx.b or 0.2, fx.a or 0.5)
+        -- The bar itself is OURS and outside that subtree, so the tint can read its
+        -- fill texture here and keep the health bar's shading instead of flattening it.
+        ns.RF_TintOverBarFill(tex, refs.health, fx.r or 1, fx.g or 0.2, fx.b or 0.2, fx.a or 0.5)
         f:Show()
 
     elseif fx.kind == "square" then
@@ -837,10 +2065,13 @@ local function FxApply(button, dd, style)
     -- Per-filter gating: an effect tile declares one slot per EVER-checked category
     -- (add-only engine -- a slot cannot be un-declared), so a slot whose category is
     -- currently UNCHECKED must render nothing. dd.dmCat is stamped at slot creation
-    -- and fx.filters is the live checked set, so the two together are the gate.
+    -- and fx.filters is the live checked set, so the two together are the gate. The
+    -- catch-all pseudo-slot ("all") gates on the live tile's current catch-all
+    -- state instead (never a claim key).
     -- Both paths stay pcall-wrapped: this runs inside the engine's CreateFrameBatch,
     -- where an uncaught error aborts the whole batch and the slot never appears.
-    if dd and fx.filters and fx.filters[dd.dmCat] then
+    if dd and fx.filters and (fx.filters[dd.dmCat]
+        or (dd.dmCat == "all" and fx.tile and TileCatchAllOn(fx.tile))) then
         pcall(FxApplyInner, button, dd, refs, fx)
     else
         pcall(FxHideAll, dd)
@@ -848,25 +2079,33 @@ local function FxApply(button, dd, style)
 end
 
 -- Icon-tile flow anchoring: corner-pinned chain, CENTER growth centers the
--- row on the anchor point (the defensives-row math, with tile settings).
-local function AnchorTileContainer(container, health, s, t)
+-- row on the anchor point's X (based on the defensives-row math, with tile
+-- settings and the vertical seat kept flush with the anchored edge).
+local function AnchorTileContainer(container, health, s, t, d)
     health = ns.RF_AnchorHost and ns.RF_AnchorHost(health, s) or health
-    local corner = CORNERS[t.position or "top"] or "TOP"
-    local grow = t.growDirection or "CENTER"
-    local offX = t.offsetX or 0
-    local offY = t.offsetY or 0
+    -- Pin shared with the tooltip-modifier eater (TilePin): point = corner for
+    -- directional growth, the flush edge midpoint for CENTER growth.
+    local point, corner, offX, offY = TilePin(t, s, d)
+    -- Party Frames kit seat (TilePin): a TOPLEFT block flowing right,
+    -- wrapping down.
+    local kitSeat = point == "TOPLEFT" and ns.DM_KitTileY(t, s, d) ~= nil
+    local grow = kitSeat and "RIGHT" or (t.growDirection or "CENTER")
 
     AK = AK or EllesmereUI.AuraKit
     -- Grid wrap: Icons Per Row >= 2 wraps lines away from the anchored edge (simple-grid convention, lowercase
     -- position tokens here); vertical growth flips the flow axis so lines become columns. Below 2 =
     -- single run, corner pick untouched.
     local per = tonumber(t.iconsPerRow) or 0
-    local pl = t.position or "top"
+    local pl = kitSeat and "topleft" or (t.position or "top")
     local wrapUp = pl:find("bottom", 1, true) ~= nil
     local wrapLeft = pl:find("right", 1, true) ~= nil
     container:ClearAllPoints()
     if grow == "CENTER" then
-        container:SetPoint("CENTER", health, corner, offX, offY)
+        -- Center ONLY the growth (horizontal) axis on the position point; the
+        -- vertical component sits flush with the anchored edge exactly like
+        -- the directional branch below. (A full CENTER pin -- the raw
+        -- defensives-row math -- straddled top/bottom edges by half an icon.)
+        container:SetPoint(point, health, corner, offX, offY)
         local gV = (per >= 2 and wrapUp) and "UP" or "DOWN"
         AK.SetContainerAnchor(container, (gV == "UP") and "BOTTOMLEFT" or "TOPLEFT")
         AK.SetContainerGrowth(container, FlowDir("RIGHT"), FlowDir(gV))
@@ -888,7 +2127,7 @@ local function AnchorTileContainer(container, health, s, t)
         AK.SetContainerGrowth(container, FlowDir(gH), FlowDir(gV))
     end
 
-    local size = t.size or 18
+    local size = EffectiveIconSize(d, t.size or 18)
     local spacing = t.spacing or 1
     local vertical = (grow == "UP" or grow == "DOWN")
     if per >= 2 then
@@ -906,6 +2145,32 @@ local dmTileFP = {}
 -- Ensures one tile's per-class style exists and is current: icon tiles reuse the debuff style at tile size; effect
 -- tiles get a bare noRegions style whose applyExtra renders style.fx. szOv/szCat: an Icon Effects Size hosts the
 -- sized record on its own STABLE per-category variant (content rebuilds on size edits, group variant swaps only at sized/unsized).
+-- Grid-tile style core, shared by EnsureTileStyle and DM_RefreshSizedStyles: tile styles VIEW the base debuff
+-- style keys, so a pure base-style edit must re-derive them here too or they render stale (same as sized siblings).
+local function RefreshTileGridStyle(key, st, s, t, renderSize, font)
+    local sv = TileStyleView(s, t)
+    local v = ((ns.RFC_DebuffStyleFP and ns.RFC_DebuffStyleFP(sv, font)) or "")
+        .. "|" .. tostring(renderSize)
+        .. "|" .. FxListFP(t.fxList)
+    if t.type == "square" then
+        local c = t.color or {}
+        v = v .. "|sq" .. string.format("%.2f,%.2f,%.2f,%.2f",
+            c.r or 1, c.g or 0.35, c.b or 0.35, c.a or 1)
+    end
+    if st.style ~= v and ns.RFC_BuildDebuffStyle then
+        st.style = v
+        local sty = ns.RFC_BuildDebuffStyle(sv, renderSize)
+        if t.type == "square" then
+            -- Square grid: flat color block over the icon (shared applier).
+            sty.squareColor = t.color or { r = 1, g = 0.35, b = 0.35, a = 1 }
+        end
+        -- Per-tile Effects override the base-injected fx explicitly, including nil: a tile without blocks must not inherit the base.
+        sty.fxList = FxListView(t.fxList)
+        AK.styles[key] = sty
+        AK.RestyleSoon(key)
+    end
+end
+
 local function EnsureTileStyle(d, s, t, szOv, szCat)
     local cls = ClassToken(d)
     local key
@@ -922,27 +2187,10 @@ local function EnsureTileStyle(d, s, t, szOv, szCat)
     local font = (EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("raidFrames")) or ""
     local v
     if isGrid then
-        local sv = TileStyleView(s, t)
-        v = ((ns.RFC_DebuffStyleFP and ns.RFC_DebuffStyleFP(sv, font)) or "")
-            .. "|" .. tostring(szOv or t.size or 18)
-            .. "|" .. FxListFP(t.fxList)
-        if t.type == "square" then
-            local c = t.color or {}
-            v = v .. "|sq" .. string.format("%.2f,%.2f,%.2f,%.2f",
-                c.r or 1, c.g or 0.35, c.b or 0.35, c.a or 1)
-        end
-        if st.style ~= v and ns.RFC_BuildDebuffStyle then
-            st.style = v
-            local sty = ns.RFC_BuildDebuffStyle(sv, szOv or t.size or 18)
-            if t.type == "square" then
-                -- Square grid: flat color block over the icon (shared applier).
-                sty.squareColor = t.color or { r = 1, g = 0.35, b = 0.35, a = 1 }
-            end
-            -- Per-tile Effects override the base-injected fx explicitly, including nil: a tile without blocks must not inherit the base.
-            sty.fxList = FxListView(t.fxList)
-            AK.styles[key] = sty
-            AK.RestyleSoon(key)
-        end
+        -- Rebuild handles for DM_RefreshSizedStyles (base-style edits re-derive this key without an apply pass).
+        st.cls, st.tid, st.szOv, st.grid = cls, t.id, szOv, true
+        RefreshTileGridStyle(key, st, s, t,
+            EffectiveIconSizeForClass(szOv or t.size or 18, cls), font)
     else
         local c = t.color or {}
         local bgc = t.barBgColor or {}
@@ -962,7 +2210,7 @@ local function EnsureTileStyle(d, s, t, szOv, szCat)
             tostring(t.frameLevel),
             string.format("%.2f,%.2f,%.2f,%.2f", c.r or 1, c.g or 1, c.b or 1, c.a or 1),
             string.format("%.2f,%.2f,%.2f", bgc.r or 0, bgc.g or 0, bgc.b or 0),
-            table.concat(cl, "+"),
+            table.concat(cl, "+"), tostring(t.all), tostring(t.hasDuration),
         }, "|")
         if st.style ~= v then
             st.style = v
@@ -973,6 +2221,8 @@ local function EnsureTileStyle(d, s, t, szOv, szCat)
                     kind = t.type,
                     -- Checked-filter set: the applier's per-slot gate (live table reference; the FP above rebuilds on changes).
                     filters = t.claim or {},
+                    -- Live tile reference: the catch-all pseudo-slot's gate (see FxApply).
+                    tile = t,
                     glowType = t.glowType or 1, glowLines = t.glowLines,
                     glowThickness = t.glowThickness, glowSpeed = t.glowSpeed,
                     glowMode = t.glowColorMode,
@@ -1007,7 +2257,8 @@ local function EnsureBaseSizeStyle(d, s, cat, size)
     local key = "rf:dmsz:" .. cls .. ":" .. tostring(cat)
     local st = dmSizeFP[key]
     if not st then st = { cls = cls, cat = cat }; dmSizeFP[key] = st end
-    st.size = size
+    st.rawSize = size
+    size = EffectiveIconSizeForClass(size, cls)
     local font = (EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("raidFrames")) or ""
     local v = ((ns.RFC_DebuffStyleFP and ns.RFC_DebuffStyleFP(s, font)) or "")
         .. "|" .. tostring(size)
@@ -1034,19 +2285,35 @@ function ns.DM_RefreshSizedStyles(baseStyleKey, s)
     if not cls then return end
     local font = (EllesmereUI.GetFontPath and EllesmereUI.GetFontPath("raidFrames")) or ""
     for key, st in pairs(dmSizeFP) do
-        if st.cls == cls and st.style and st.size then
+        if st.cls == cls and st.style and st.rawSize then
+            local size = EffectiveIconSizeForClass(st.rawSize, cls)
             local v = ((ns.RFC_DebuffStyleFP and ns.RFC_DebuffStyleFP(s, font)) or "")
-                .. "|" .. tostring(st.size)
+                .. "|" .. tostring(size)
             if st.style ~= v and ns.RFC_BuildDebuffStyle then
                 st.style = v
                 local sty
                 if st.cat == "cc" and ns.RFC_BuildDebuffCCStyle then
-                    sty = ns.RFC_BuildDebuffCCStyle(s, st.size)
+                    sty = ns.RFC_BuildDebuffCCStyle(s, size)
                 else
-                    sty = ns.RFC_BuildDebuffStyle(s, st.size)
+                    sty = ns.RFC_BuildDebuffStyle(s, size)
                 end
                 AK.styles[key] = sty
                 AK.RestyleSoon(key)
+            end
+        end
+    end
+    -- Grid tiles view the same base style keys; refresh them on this edge too.
+    local act = ns.DM_ActiveTiles and ns.DM_ActiveTiles()
+    if act then
+        local byId = {}
+        for i = 1, #act do byId[act[i].id] = act[i] end
+        for key, st in pairs(dmTileFP) do
+            if st.grid and st.cls == cls then
+                local t = byId[st.tid]
+                if t then
+                    local size = EffectiveIconSizeForClass(st.szOv or t.size or 18, cls)
+                    RefreshTileGridStyle(key, st, s, t, size, font)
+                end
             end
         end
     end
@@ -1071,16 +2338,21 @@ local function EnsureTileContainer(d, t)
         local health = d.rfcHealth
         local unit = d.rfcUnit
         if not (button and health) then return end
-        local dm2 = DM()
+        -- Re-resolve from the ACTIVE union: a tile that left it between
+        -- queue and run (delete, spec swap, per-spec disable) builds nothing.
+        local act = ns.DM_ActiveTiles()
         local t2
-        if dm2 and dm2.tiles then
-            for i = 1, #dm2.tiles do
-                if dm2.tiles[i].id == tileId then t2 = dm2.tiles[i] break end
+        if act then
+            for i = 1, #act do
+                if act[i].id == tileId then t2 = act[i] break end
             end
         end
         if not t2 then return end
         local s2 = SettingsFor(d)
         if not s2 then return end
+        -- EffectFilterFor below reads dm (dispelMode); the active-union
+        -- re-resolve above no longer carries it.
+        local dm2 = DM() or {}
         local styleKey = EnsureTileStyle(d, s2, t2)
         local container = AK.CreateContainerShell(button, {
             point = { "CENTER", health, "CENTER" },
@@ -1102,10 +2374,11 @@ local function EnsureTileContainer(d, t)
             local tDecl = tGroups[tileId]
             if not tDecl then tDecl = {}; tGroups[tileId] = tDecl end
             local tileKind = t2.type
-            for cat, on in pairs(t2.claim or {}) do
-                if on then
+            local cs = EffectCatSet(t2)
+            if cs then
+                for cat in pairs(cs) do
                     local catKey = cat
-                    local filter, cand = EffectFilterFor(dm2, catKey)
+                    local filter, cand = EffectFilterForTile(dm2, t2, catKey)
                     AK.AddSlotToContainer(container, {
                         key = "fx_" .. catKey,
                         filter = filter,
@@ -1154,8 +2427,18 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
         elementWidth = size, elementHeight = size,
         elementSpacing = s.debuffSpacing or 1, lineSpacing = s.debuffSpacing or 1,
     }
+    -- Tooltip-modifier eaters: every footprint sum, stash and ensure below
+    -- is gated on the feature being wanted, so the plain apply pays nothing.
+    local tipOn = ns.DM_TipModWanted and ns.DM_TipModWanted() or false
+    -- The same footprint counts seat the Party Frames kit's grid tiles.
+    local geoOn = tipOn or (d.kit and true) or false
 
-    local recs, ccCand, claims, _, fxCats = BuildRecords(s, dm)
+    local recs, ccCand, claims, _, fxCats, matchOn = BuildRecords(s, dm)
+
+    -- Dead-corpse swap state rebuilds fresh every apply; a config that lost its
+    -- npdead record sheds the swap here (the stale variant parks below).
+    d.dmDeadSwap = nil
+    local deadRec, ccParkCount
 
     -- Partition records: base container vs per-tile containers.
     local wantedBase, missingBase = {}, false
@@ -1164,6 +2447,7 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
     for i = 1, #recs do
         local r = recs[i]
         r.gkey = GroupKey(AK, r)
+        if r.deadOnly then deadRec = r end
         if r.tile then
             local id = r.tile.id
             local list = tileRecs[id]
@@ -1187,36 +2471,54 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
     -- hosts it as a normal record instead (tile style, glow stays base-only).
     if declared.cc then
         -- A sized base cc record supplants the legacy group: park it or CC debuffs render twice. Under Show All
-        -- the cc lead/glow group is on unless Crowd Control is checked (= subtracted); in add mode it is on
-        -- exactly when checked; fx routing forces it either way.
-        local allOn = dm.all ~= false
-        local ccPicked = (allOn and dm.cc ~= true) or (not allOn and dm.cc == true)
+        -- the cc lead/glow group is on unless Crowd Control rides the hide lane (dm.neg.cc = subtracted); in add
+        -- mode it is on exactly when the show lane checks it; fx routing forces it either way. Has Duration never
+        -- flips this: cc surfaces are exempt from the duration fold (declaration-fixed candidates). Under Match
+        -- All a picked cc lives inside the conjunction record (AND the rest), so the lead group stays parked.
+        local bv = BaseView(dm)
+        local allOn = bv.all ~= false
+        local ccHidden = bv.neg ~= nil and bv.neg.cc == true
+        local ccPicked = (allOn and not ccHidden) or (not allOn and bv.cc == true and not matchOn)
         local ccBase = (ccPicked or (fxCats and fxCats.cc)) and not claims.cc
             and not baseSizedCC
-        container:SetAuraGroupMaxFrameCount("cc", ccBase and cap or 0)
+        ccParkCount = ccBase and cap or 0
+        container:SetAuraGroupMaxFrameCount("cc", ccParkCount)
         container:SetAuraGroupCandidateFilters("cc", ccCand)
         container:SetAuraGroupLayout("cc", layout)
     end
 
-    local assist = d.rfcAssist ~= false
-    local gatedKeys
+    -- NO ASSIST GATE: records render on every unit, assistable or not. Candidate
+    -- booleans (boss/role/Important/Can Apply) are never identity-gated by the
+    -- engine -- only spell-ID candidates are, and those (the internal exclude
+    -- set) ride every record alike -- so parking the boolean records on a
+    -- non-assistable unit (Friendly Boss slots) would only hide correct
+    -- content, and with the ownership fold the Non-Player record would drop
+    -- Important debuffs there with nothing left to show them.
+
+    -- Tooltip-eater footprint inputs (Shown on Modifier): the base row's
+    -- maximum icon count = cap per DECLARED group, regardless of death
+    -- parking (it flips live without a re-apply), plus the cc group's
+    -- live count (0 while claimed, hidden or supplanted), and the largest
+    -- cell (sized records).
+    local tipN, tipCell = ccParkCount or 0, size
 
     -- Base records.
     for gkey, r in pairs(wantedBase) do
         if declared[gkey] then
-            local n = cap
-            if r.gated then
-                gatedKeys = gatedKeys or {}
-                gatedKeys[#gatedKeys + 1] = gkey
-                if not assist then n = 0 end
+            local recordSize = r.fxSize and EffectiveIconSize(d, r.fxSize)
+            if geoOn then
+                tipN = tipN + cap
+                if recordSize and recordSize > tipCell then tipCell = recordSize end
             end
+            local n = cap
+            if r.deadOnly then n = 0 end -- parked until the death edge unparks it
             container:SetAuraGroupMaxFrameCount(gkey, n)
             container:SetAuraGroupCandidateFilters(gkey, r.cand)
             if r.fxSize then
                 -- Sized record: keep the stable per-category style fresh (size edits restyle existing buttons) + same size in the flow math.
                 EnsureBaseSizeStyle(d, s, r.key, r.fxSize)
                 container:SetAuraGroupLayout(gkey, {
-                    elementWidth = r.fxSize, elementHeight = r.fxSize,
+                    elementWidth = recordSize, elementHeight = recordSize,
                     elementSpacing = s.debuffSpacing or 1,
                     lineSpacing = s.debuffSpacing or 1,
                 })
@@ -1225,8 +2527,37 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
             end
         end
     end
-    d.dmGatedKeys = gatedKeys
-    d.dmCap = cap
+    if geoOn then
+        local geo = d.dmTipGeo
+        if not geo then geo = { tiles = {} }; d.dmTipGeo = geo end
+        local gb = geo.base
+        if not gb then gb = {}; geo.base = gb end
+        gb.n, gb.cell = tipN, tipCell
+        -- Tiles re-stash below as they render (a tile that stopped
+        -- rendering must not keep reserving room).
+        wipe(geo.tiles)
+        -- Party Frames kit: the first grid tile seats under the base row.
+        if d.kit and ns.RFC_DebuffPin then
+            local _, _, _, by, _, bSpc, bPer, bVert = ns.RFC_DebuffPin(s)
+            local _, bh = TipFootprint(tipN, tipCell, bSpc, bPer, bVert)
+            geo.kitY = by - ((bh > 0) and (bh + bSpc) or 0)
+        else
+            geo.kitY = nil
+        end
+    end
+
+    -- Base-hosted dead swap: park set = every normal base record (legacy cc group
+    -- included) with its restore count; the death edge zeroes them and unparks npdead.
+    if deadRec and not deadRec.tile and declared[deadRec.gkey] then
+        local park = {}
+        for gkey, r in pairs(wantedBase) do
+            if declared[gkey] and not r.deadOnly then
+                park[gkey] = cap
+            end
+        end
+        if declared.cc then park.cc = ccParkCount end
+        d.dmDeadSwap = { show = deadRec.gkey, cap = cap, park = park }
+    end
 
     -- Missing base record variants: declare on the combat-legal live lane, then re-apply (mirrors the containers file's preset-ensure pattern).
     if missingBase and not d.dmEnsure then
@@ -1246,20 +2577,34 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                     local gkey = GroupKey(AK, r)
                     if not declared2[gkey] then
                         -- Stamp category (per-filter EFFECTS match on it) and arm ICON EFFECTS in the creation
-                        -- window (style applier ran before this stamp and found none).
-                        local catKey = r.key
+                        -- window (style applier ran before this stamp and found none). A Match All or Non-Player
+                        -- split record stamps its category LIST (its key names the same list, so a group's list
+                        -- never changes).
+                        local catKey = r.cats or r.key
                         -- Sized records bind their per-category sized style (buttons take physical size at creation).
                         local sk = r.fxSize
                             and EnsureBaseSizeStyle(d, s2, r.key, r.fxSize)
                             or StyleKeyFor(d)
-                        AK.AddGroupToContainer(c2, { key = gkey, filter = r.tokens,
-                            maxFrameCount = 0, style = sk,
+                        local groupSize = r.fxSize
+                            and EffectiveIconSize(d, r.fxSize) or s2.debuffSize or 18
+                        local groupSpacing = s2.debuffSpacing or 1
+                        AK.AddGroupToContainer(c2, {
+                            key = gkey,
+                            filter = r.tokens,
+                            candidateFilters = r.cand,
+                            maxFrameCount = 0,
+                            style = sk,
+                            layout = {
+                                elementWidth = groupSize, elementHeight = groupSize,
+                                elementSpacing = groupSpacing, lineSpacing = groupSpacing,
+                            },
                             extraInit = function(btn2, d2, style)
                                 if d2 then d2.dmCat = catKey end
                                 if style and ns.RFC_ApplyDmFx then
                                     ns.RFC_ApplyDmFx(btn2, d2, style)
                                 end
-                            end })
+                            end,
+                        })
                         declared2[gkey] = true
                     end
                 end
@@ -1270,9 +2615,11 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
 
     -- Tiles. Stash the host ref the deferred tile builds need (the base debuff container is parented to the unit button on every build path).
     d.dmHost = d.dmHost or (container.GetParent and container:GetParent())
-    local dmTiles = dm.tiles
+    -- The ACTIVE union: tiles from buckets the current spec doesn't render
+    -- (spec swaps, per-spec disables) fall out of `present` below and park
+    -- their containers exactly like a deleted tile.
+    local dmTiles = ns.DM_ActiveTiles()
     local live = d.dmTiles
-    local gatedTiles
     if dmTiles then
         for i = 1, #dmTiles do
             local t = dmTiles[i]
@@ -1287,16 +2634,16 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                     if not tGroups then tGroups = {}; d.dmTileGroups = tGroups end
                     local tDecl = tGroups[t.id]
                     if not tDecl then tDecl = {}; tGroups[t.id] = tDecl end
-                    local gatedContent = false
 
                     if isEffect then
                         -- One live-settable slot PER CHECKED category: filter setter takes the NORMALIZED string,
                         -- candidates an explicit empty table (NEVER nil -- NP field lesson); newly-checked categories without a slot add on the combat-legal live lane below.
                         local missingCats = false
-                        for cat, on in pairs(t.claim or {}) do
-                            if on then
+                        local cs = EffectCatSet(t)
+                        if cs then
+                            for cat in pairs(cs) do
                                 local skey = "fx_" .. cat
-                                local filter, cand, catGated = EffectFilterFor(dm, cat)
+                                local filter, cand = EffectFilterForTile(dm, t, cat)
                                 if tDecl[skey] then
                                     local fsig = AK.Filter(unpack(filter))
                                     if tDecl[skey] ~= fsig then
@@ -1307,7 +2654,6 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                 else
                                     missingCats = true
                                 end
-                                if catGated then gatedContent = true end
                             end
                         end
                         if missingCats then
@@ -1325,10 +2671,14 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                     local s2 = SettingsFor(d)
                                     local dm2 = DM() or {}
                                     if not s2 then return end
+                                    -- Active-union re-resolve (delete/spec
+                                    -- swap/per-spec disable between queue and
+                                    -- run = skip).
+                                    local act = ns.DM_ActiveTiles()
                                     local t2
-                                    if dm2.tiles then
-                                        for ti2 = 1, #dm2.tiles do
-                                            if dm2.tiles[ti2].id == tileId then t2 = dm2.tiles[ti2] break end
+                                    if act then
+                                        for ti2 = 1, #act do
+                                            if act[ti2].id == tileId then t2 = act[ti2] break end
                                         end
                                     end
                                     local host = d.dmHost
@@ -1336,11 +2686,12 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                     if not (t2 and host and hp) then return end
                                     local styleKey2 = EnsureTileStyle(d, s2, t2)
                                     local tileKind = t2.type
-                                    for cat, on in pairs(t2.claim or {}) do
+                                    local cs2 = EffectCatSet(t2)
+                                    for cat in pairs(cs2 or {}) do
                                         local skey = "fx_" .. cat
-                                        if on and not decl2[skey] then
+                                        if not decl2[skey] then
                                             local catKey = cat
-                                            local filter, cand = EffectFilterFor(dm2, catKey)
+                                            local filter, cand = EffectFilterForTile(dm2, t2, catKey)
                                             AK.AddSlotToContainer(tc2, {
                                                 key = skey,
                                                 filter = filter,
@@ -1378,31 +2729,50 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                             end
                         end
                         local tCap = t.cap or cap
-                        local tSize = t.size or 18
+                        local tSize = EffectiveIconSize(d, t.size or 18)
                         local tLayout = {
                             elementWidth = tSize, elementHeight = tSize,
                             elementSpacing = t.spacing or 1, lineSpacing = t.spacing or 1,
                         }
+                        -- Tooltip-eater footprint inputs for this tile (see the base site).
+                        local tN, tCell = 0, tSize
                         for gkey, r in pairs(tWanted) do
                             if tDecl[gkey] then
-                                local n = tCap
-                                if r.gated then
-                                    gatedContent = true
-                                    if not assist then n = 0 end
+                                local recordSize = r.fxSize and EffectiveIconSize(d, r.fxSize)
+                                if geoOn then
+                                    tN = tN + tCap
+                                    if recordSize and recordSize > tCell then tCell = recordSize end
                                 end
+                                local n = tCap
+                                if r.deadOnly then n = 0 end -- parked until the death edge unparks it
                                 tc:SetAuraGroupMaxFrameCount(gkey, n)
                                 tc:SetAuraGroupCandidateFilters(gkey, r.cand)
                                 if r.fxSize then
                                     -- Sized record: per-category tile style variant fresh + matching flow math.
                                     EnsureTileStyle(d, s, t, r.fxSize, r.key)
                                     tc:SetAuraGroupLayout(gkey, {
-                                        elementWidth = r.fxSize, elementHeight = r.fxSize,
+                                        elementWidth = recordSize, elementHeight = recordSize,
                                         elementSpacing = t.spacing or 1,
                                         lineSpacing = t.spacing or 1,
                                     })
                                 else
                                     tc:SetAuraGroupLayout(gkey, tLayout)
                                 end
+                            end
+                        end
+                        if geoOn then
+                            local geo = d.dmTipGeo
+                            if not geo then geo = { tiles = {} }; d.dmTipGeo = geo end
+                            local gt = geo.tiles[t.id]
+                            if not gt then gt = {}; geo.tiles[t.id] = gt end
+                            gt.n, gt.cell = tN, tCell
+                            -- Party Frames kit: this tile's seat, then the next
+                            -- one's below it (one block per tile, flowing right).
+                            gt.kitY = geo.kitY
+                            if geo.kitY then
+                                local _, th = TipFootprint(tN, tCell, t.spacing or 1,
+                                    tonumber(t.iconsPerRow) or 0, false)
+                                if th > 0 then geo.kitY = geo.kitY - th - (t.spacing or 1) end
                             end
                         end
                         if tMissing then
@@ -1427,21 +2797,31 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                         if r.tile and r.tile.id == tileId then
                                             local gkey = GroupKey(AK, r)
                                             if not decl2[gkey] then
-                                                local catKey = r.key
+                                                local catKey = r.cats or r.key
+                                                local groupSize = EffectiveIconSize(d,
+                                                    r.fxSize or r.tile.size or 18)
+                                                local groupSpacing = r.tile.spacing or 1
                                                 AK.AddGroupToContainer(tc2, {
-                                                    key = gkey, filter = r.tokens,
+                                                    key = gkey,
+                                                    filter = r.tokens,
+                                                    candidateFilters = r.cand,
                                                     maxFrameCount = 0,
                                                     -- Sized records bind the per-category sized tile-style variant.
                                                     style = r.fxSize
                                                         and EnsureTileStyle(d, s2, r.tile, r.fxSize, r.key)
                                                         or EnsureTileStyle(d, s2, r.tile),
+                                                    layout = {
+                                                        elementWidth = groupSize, elementHeight = groupSize,
+                                                        elementSpacing = groupSpacing, lineSpacing = groupSpacing,
+                                                    },
                                                     extraInit = function(btn2, d2, style)
                                                         if d2 then d2.dmCat = catKey end
                                                         -- Arm ICON EFFECTS in the creation window (see the base-record site).
                                                         if style and ns.RFC_ApplyDmFx then
                                                             ns.RFC_ApplyDmFx(btn2, d2, style)
                                                         end
-                                                    end })
+                                                    end,
+                                                })
                                                 decl2[gkey] = true
                                             end
                                         end
@@ -1451,16 +2831,21 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
                                 end, "rf:dm-tile-groups")
                             end
                         end
-                        AnchorTileContainer(tc, d.rfcHealth, s, t)
+                        -- Tile-hosted dead swap: park set = the tile's normal records with restore counts.
+                        if deadRec and deadRec.tile == t and tDecl[deadRec.gkey] then
+                            local park = {}
+                            for gkey, r in pairs(tWanted) do
+                                if tDecl[gkey] and not r.deadOnly then
+                                    park[gkey] = tCap
+                                end
+                            end
+                            d.dmDeadSwap = { show = deadRec.gkey, cap = tCap, park = park, tileId = t.id }
+                        end
+                        AnchorTileContainer(tc, d.rfcHealth, s, t, d)
                     end
 
-                    if gatedContent then
-                        gatedTiles = gatedTiles or {}
-                        gatedTiles[#gatedTiles + 1] = t.id
-                        tc:SetShown(assist)
-                    else
-                        tc:Show()
-                    end
+                    -- Shown on every unit (no assist gate, see the base records).
+                    tc:Show()
                     -- Same-unit re-sets are a full engine re-registration (the RF roster-reprocess storm lesson), so stamp on our own container frame and re-point on change.
                     if d.rfcUnit and tc._dmUnit ~= d.rfcUnit then
                         tc:SetUnit(d.rfcUnit)
@@ -1479,11 +2864,60 @@ function ns.DM_ApplyDebuffConfig(container, d, s, styleKey)
         if dmTiles then
             for i = 1, #dmTiles do present[dmTiles[i].id] = true end
         end
+        local stale = false
         for id, c in pairs(live) do
-            if not present[id] then c:Hide() end
+            if not present[id] then c:Hide(); stale = true end
+        end
+        -- A parked container keeps its slot buttons, so any healthcolor overlay it
+        -- built stays registered on the health bar and every later layout pass
+        -- walks it. Nothing releases these, so without this they accumulate for
+        -- the session. Live tiles re-register on their next paint.
+        if stale and d.rfcHealth then ns.RF_ClearBarTints(d.rfcHealth, "dm") end
+    end
+
+    -- Party Frames kit: the lowest seat the debuffs reach below the frame
+    -- (the base row's footprint, then every grid tile), which the Friendly
+    -- Boss group clears below horizontal frames. Every party button reads
+    -- one settings view, so any button's value is the floor.
+    if d.kit and d._isParty then
+        local floor = d.dmTipGeo and d.dmTipGeo.kitY
+        if floor ~= ns._kitDmFloor then
+            ns._kitDmFloor = floor
+            if ns.FB_ReAnchor then ns.FB_ReAnchor() end
         end
     end
-    d.dmGatedTiles = gatedTiles
+
+    -- Sync the dead swap to the unit's actual state: the count loops above wrote
+    -- alive-shape counts, so a corpse existing at apply time (config change while
+    -- someone is dead) must swap now -- no later event is guaranteed on a corpse.
+    d.dmDead = nil
+    if d.dmDeadSwap and d.rfcUnit then ns.DM_DeadEdge(d, d.rfcUnit) end
+
+    -- Tooltip-modifier eaters: footprint inputs above are fresh, and tile
+    -- containers built on the deferred lanes re-enter through this apply.
+    -- Off: nothing runs here (the containers reload's ensure parks on a flip).
+    if tipOn and ns.DM_TipModEnsure and d.dmHost then ns.DM_TipModEnsure(d.dmHost, d, s) end
+end
+
+-- Death-edge hook (from the UNIT_HEALTH repaint path, unit assignment, and the
+-- apply tail). Change-gated on d.dmDead; d.dmDeadSwap is nil for every button
+-- unless a config qualifies, so the hot-path cost is one field read. Count flips
+-- re-render engine-side without an UpdateAllAuras.
+function ns.DM_DeadEdge(d, unit)
+    local swap = d.dmDeadSwap
+    if not swap or not unit then return end
+    local dead = UnitIsDeadOrGhost(unit) and true or false
+    if d.dmDead == dead then return end
+    d.dmDead = dead
+    local c = swap.tileId and (d.dmTiles and d.dmTiles[swap.tileId]) or d.rfcDebuffs
+    if not c then return end
+    if dead then
+        for k in pairs(swap.park) do c:SetAuraGroupMaxFrameCount(k, 0) end
+        c:SetAuraGroupMaxFrameCount(swap.show, swap.cap)
+    else
+        for k, n in pairs(swap.park) do c:SetAuraGroupMaxFrameCount(k, n) end
+        c:SetAuraGroupMaxFrameCount(swap.show, 0)
+    end
 end
 
 -- Legacy-config tail hook: while INACTIVE the legacy ApplyDebuffConfig drives only its own preset groups, so a
@@ -1502,10 +2936,18 @@ end
 -- Unit re-assignment hook (from RFC_OnUnitAssigned's unit-change branch): tile containers must re-point like every
 -- per-button container; the engine does not re-parse on unit change alone.
 function ns.DM_OnUnitAssigned(d, unit)
+    -- New unit, unknown dead state: force the dead swap to re-evaluate.
+    if d.dmDeadSwap then
+        d.dmDead = nil
+        ns.DM_DeadEdge(d, unit)
+    end
     local tiles = d.dmTiles
     if not tiles then return end
     for _, c in pairs(tiles) do
-        if c._dmUnit ~= unit then
+        -- The container's own binding, not the stamp beside it: the stamp is a
+        -- shadow, and a re-point that reaches the container by any other route
+        -- would leave it lying about what the tile is actually parsing.
+        if c:GetUnit() ~= unit then
             c:SetUnit(unit)
             c:UpdateAllAuras()
             c._dmUnit = unit
@@ -1513,38 +2955,16 @@ function ns.DM_OnUnitAssigned(d, unit)
     end
 end
 
--- Assist-state hook (from ApplyAssistGate on real state changes): identity-gated records and tiles flip; everything
--- else is assist-blind, like the token-only legacy debuff row.
-function ns.DM_OnAssistChanged(d)
-    if not ns.DM_Active() then return end
-    local assist = d.rfcAssist ~= false
-    local keys = d.dmGatedKeys
-    local container = d.rfcDebuffs
-    if keys and container then
-        local n = assist and (d.dmCap or 3) or 0
-        for i = 1, #keys do
-            container:SetAuraGroupMaxFrameCount(keys[i], n)
-        end
-    end
-    local tiles = d.dmGatedTiles
-    if tiles and d.dmTiles then
-        for i = 1, #tiles do
-            local c = d.dmTiles[tiles[i]]
-            if c then c:SetShown(assist) end
-        end
-    end
-end
-
 -------------------------------------------------------------------------------
 -- Tile list editing API (consumed by the options page)
 -------------------------------------------------------------------------------
-function ns.DM_Tiles()
-    local dm = DM()
-    if not dm then return nil end
-    if not dm.tiles then dm.tiles = {} end
-    -- Read-heal: expand the old single-cat + width/height square shape once.
-    for i = 1, #dm.tiles do
-        local t = dm.tiles[i]
+-- Read-heals shared by every bucket: expand the old single-cat + width/
+-- height square shape, effect single-cat, fx single-config and healthcolor
+-- alpha once. Legacy shapes only ever existed in the all-specs array, but
+-- healing everywhere is idempotent and keeps one path.
+local function HealTiles(arr)
+    for i = 1, #arr do
+        local t = arr[i]
         if t.type == "square" and not t.claim then
             t.claim = {}
             if t.cat then t.claim[t.cat] = true; t.cat = nil end
@@ -1568,16 +2988,180 @@ function ns.DM_Tiles()
             t.opacity = math.floor((t.color.a * 100) + 0.5)
         end
     end
+end
+
+-- The ALL-SPECS bucket: the legacy dm.tiles array, IN PLACE (zero
+-- migration; profiles opened by older builds keep rendering it).
+function ns.DM_Tiles()
+    local dm = DM()
+    if not dm then return nil end
+    if not dm.tiles then dm.tiles = {} end
+    HealTiles(dm.tiles)
     return dm.tiles
 end
 
-function ns.DM_AddTile(tileType)
+-------------------------------------------------------------------------------
+-- Editing-spec buckets. dm.tiles IS "allspecs"; every other bucket lives
+-- under dm.specTiles[key] = { tiles, inhDis, baseOff }, key = "nonhealer"/"tanks"/
+-- "dps"/"healers" (group buckets) or "spec<ID>" (a concrete spec -- healer
+-- specs included; the Debuff Manager has no healer-key legacy). Tile ids
+-- stay globally unique across buckets (one shared dm.nextTileId), so
+-- per-spec disables key on the bare tile id. Absent specTiles = feature
+-- unused = the active union degenerates to the legacy array.
+-------------------------------------------------------------------------------
+local function SpecBucket(dm, key, create)
+    local st = dm.specTiles
+    if not st then
+        if not create then return nil end
+        st = {}; dm.specTiles = st
+    end
+    local b = st[key]
+    if not b then
+        if not create then return nil end
+        b = { tiles = {}, inhDis = {} }
+        st[key] = b
+    end
+    if not b.tiles then b.tiles = {} end
+    if not b.inhDis then b.inhDis = {} end
+    return b
+end
+
+-- Bucket tile array for an EDITED view ("allspecs"/nil = the legacy array).
+function ns.DM_BucketTiles(key, create)
+    if not key or key == "allspecs" then return ns.DM_Tiles() end
+    local dm = DM()
+    if not dm then return nil end
+    local b = SpecBucket(dm, key, create)
+    if not b then return nil end
+    HealTiles(b.tiles)
+    return b.tiles
+end
+
+-- Per-spec disable of a GROUP bucket's tile, stored on the viewing spec's
+-- concrete "spec<ID>" bucket (ids are global, so the bare id suffices).
+function ns.DM_InhDisabled(concreteKey, id)
+    local dm = DM()
+    local b = dm and SpecBucket(dm, concreteKey, false)
+    return (b and b.inhDis[id]) and true or false
+end
+
+function ns.DM_SetInhDisabled(concreteKey, id, disabled)
+    local dm = DM()
+    if not (dm and concreteKey and id) then return end
+    local b = SpecBucket(dm, concreteKey, true)
+    b.inhDis[id] = disabled and true or nil
+end
+
+-- Per-spec disable of the Base Icons grid (the All Specs base, inherited by
+-- every concrete spec like an All Specs tile): b.baseOff on the viewing
+-- spec's bucket, beside the tile disables.
+function ns.DM_BaseDisabled(concreteKey)
+    local dm = DM()
+    local b = dm and SpecBucket(dm, concreteKey, false)
+    return (b and b.baseOff) and true or false
+end
+
+function ns.DM_SetBaseDisabled(concreteKey, disabled)
+    local dm = DM()
+    if not (dm and concreteKey) then return end
+    local b = SpecBucket(dm, concreteKey, true)
+    b.baseOff = disabled and true or nil
+end
+
+-- Runtime read for the player's CURRENT spec (record synthesis + FP). No
+-- specTiles = buckets never used = zero cost.
+function ns.DM_CurrentSpecBaseOff()
+    local dm = DM()
+    local st = dm and dm.specTiles
+    if not st then return false end
+    local idx = GetSpecialization and GetSpecialization()
+    local sid = idx and GetSpecializationInfo and GetSpecializationInfo(idx) or nil
+    local b = sid and st["spec" .. sid] or nil
+    return (b and b.baseOff) and true or false
+end
+
+-- The ACTIVE union: every tile the CURRENT spec renders, in bucket order
+-- (allspecs, nonhealer, role group, own spec); group tiles the spec has
+-- per-spec disabled drop out here. Returns a FRESH array per call -- the
+-- apply pass iterates one while nested BuildRecords/EffectiveState calls
+-- build another, so a reused scratch would be wiped under the iterator.
+-- Config-pass frequency only (never per-frame), so the allocation is fine.
+-- The tile TABLES inside are the stable store tables. Role/tracked
+-- resolution rides the Buff Manager helpers (same ns, resolved at call
+-- time).
+function ns.DM_ActiveTiles()
+    -- Read dm.tiles WITHOUT materializing it (DM_Tiles creates the array;
+    -- this runs on the runtime config path and must not write an empty
+    -- table into every tile-less profile's SavedVariables).
+    local dm = DM()
+    if not dm then return nil end
+    local base = dm.tiles
+    if base then HealTiles(base) end
+    local out = {}
+    local st = dm.specTiles
+    local sid
+    do
+        local idx = GetSpecialization and GetSpecialization()
+        sid = idx and GetSpecializationInfo and GetSpecializationInfo(idx) or nil
+    end
+    local con = st and sid and st["spec" .. sid] or nil
+    local dis = con and con.inhDis or nil
+    if base then
+        for i = 1, #base do
+            local t = base[i]
+            if not (dis and dis[t.id]) then out[#out + 1] = t end
+        end
+    end
+    if st and sid then
+        local function AddBucket(key, filtered)
+            local b = st[key]
+            local tl = b and b.tiles
+            if not tl then return end
+            HealTiles(tl)
+            for i = 1, #tl do
+                local t = tl[i]
+                if not (filtered and dis and dis[t.id]) then out[#out + 1] = t end
+            end
+        end
+        if not (ns.BM_SpecKeyForSpecID and ns.BM_SpecKeyForSpecID(sid)) then
+            AddBucket("nonhealer", true)
+        end
+        local roleKey = ns.BM_RoleBucketForSpecID and ns.BM_RoleBucketForSpecID(sid)
+        if roleKey then AddBucket(roleKey, true) end
+        AddBucket("spec" .. sid, false)
+    end
+    return out
+end
+
+function ns.DM_AddTile(tileType, bucketKey)
     local p = ns.db and ns.db.profile
     if not p then return nil end
     local dm = p.dmDebuff
     if not dm then dm = {}; p.dmDebuff = dm end
     if not dm.tiles then dm.tiles = {} end
     local id = (dm.nextTileId or 1)
+    -- Counter heal: ids must stay GLOBALLY unique across every bucket
+    -- (per-spec disables key on the bare id), so a reset/hand-edited
+    -- counter re-bases above every existing tile before allocating.
+    do
+        local maxId = 0
+        for i = 1, #dm.tiles do
+            local tid = tonumber(dm.tiles[i].id) or 0
+            if tid > maxId then maxId = tid end
+        end
+        if dm.specTiles then
+            for _, b in pairs(dm.specTiles) do
+                local tl = b.tiles
+                if tl then
+                    for i = 1, #tl do
+                        local tid = tonumber(tl[i].id) or 0
+                        if tid > maxId then maxId = tid end
+                    end
+                end
+            end
+        end
+        if id <= maxId then id = maxId + 1 end
+    end
     dm.nextTileId = id + 1
     local t = { id = id, enabled = true, type = tileType or "icons" }
     if t.type == "icons" or t.type == "square" then
@@ -1610,15 +3194,58 @@ function ns.DM_AddTile(tileType)
             t.color = { r = 1, g = 0.78, b = 0.38, a = 1 }
         end
     end
-    dm.tiles[#dm.tiles + 1] = t
+    -- The edited bucket owns the new tile; ids come from the ONE shared
+    -- counter above regardless of bucket.
+    local target = dm.tiles
+    if bucketKey and bucketKey ~= "allspecs" then
+        target = SpecBucket(dm, bucketKey, true).tiles
+    end
+    target[#target + 1] = t
+    return t
+end
+
+-- Deep-copies a tile into another bucket (the right-click "Add To" menu):
+-- full settings clone under a fresh GLOBAL id; the source is untouched.
+-- DM_AddTile owns bucket creation + the healed id allocation; its default
+-- fields are then replaced wholesale by the clone (id kept).
+function ns.DM_CopyTile(src, bucketKey)
+    if not src then return nil end
+    local t = ns.DM_AddTile(src.type, bucketKey)
+    if not t then return nil end
+    local keep = t.id
+    local function Copy(v)
+        if type(v) ~= "table" then return v end
+        local o = {}
+        for k, v2 in pairs(v) do o[k] = Copy(v2) end
+        return o
+    end
+    for k in pairs(t) do t[k] = nil end
+    for k, v in pairs(src) do t[k] = Copy(v) end
+    t.id = keep
     return t
 end
 
 function ns.DM_DeleteTile(id)
     local dm = DM()
-    if not (dm and dm.tiles) then return end
-    for i = #dm.tiles, 1, -1 do
-        if dm.tiles[i].id == id then table.remove(dm.tiles, i) end
+    if not dm then return end
+    if dm.tiles then
+        for i = #dm.tiles, 1, -1 do
+            if dm.tiles[i].id == id then table.remove(dm.tiles, i) end
+        end
+    end
+    local st = dm.specTiles
+    if st then
+        for _, b in pairs(st) do
+            local tl = b.tiles
+            if tl then
+                for i = #tl, 1, -1 do
+                    if tl[i].id == id then table.remove(tl, i) end
+                end
+            end
+            -- Sweep the per-spec disable keys everywhere: ids are global and
+            -- never reused, so a deleted tile's key can only leak.
+            if b.inhDis then b.inhDis[id] = nil end
+        end
     end
 end
 

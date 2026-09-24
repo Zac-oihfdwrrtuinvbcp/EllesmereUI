@@ -37,11 +37,13 @@ if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_C
 --   ns.SolveLayout(barCfg, L, measureFn) -> segments (pure)
 --   ns.GetLiveAutoLength(barId, blockId) -> px | nil
 --   ns.BuildCurrencyList() -> values, order
+--   ns.BuildLDBList() -> values, order      LibDataBroker sources, by name
+--   ns.GetLDB() -> LibDataBroker-1.1 | nil
 --   ns.LocationWidthMode(blockSettings) -> "auto" | "manual"
 --   ns.LOC_MAX_WIDTH_DEFAULT               Manual-mode width before one is set
 --   ns.BlockTextDynamic(blockType) -> r, g, b   state-driven Text Color swatch
 --   ns.UpdateAllBarVisibility()
---   ns.MakePreviewBackdrop(host, themeCfg)
+--   ns.MakePreviewBackdrop(host, themeCfg, showBorder)
 --   ns.BLOCK_TYPES / ns.BLOCK_DEFAULTS / ns.EDB_VIS_CAPS / ns.EDGE_PAD
 --
 --  The one call that runs the other way (options file -> runtime): a block
@@ -113,6 +115,9 @@ local L = {
     CHANGE_LOOT_SPEC     = "Change Loot Spec",
     OPEN_TALENTS         = "Open Talents",
     CANNOT_USE_COMBAT    = "Cannot Use While In Combat",
+    COMBAT_STATUS        = "Combat Status",
+    IN_COMBAT            = "In Combat",
+    OUT_OF_COMBAT        = "Out of Combat",
     AUDIO                = "Audio",
     AUDIO_MASTER         = "Master",
     AUDIO_SFX            = "Sound Effects",
@@ -131,13 +136,25 @@ local L = {
     DELVE_JOURNEY        = "Delver's Journey",
     COMPANION_LEVEL      = "Companion Level",
     SELECT_CURRENCY      = "Select a currency",
+    SELECT_PLUGIN        = "Select a plugin",
     OPEN_SETTINGS        = "Open Settings",
+    CRESTS               = "Crests",
+    SEASON_MAXIMUM       = "Current Season Maximum",
+    ILVL                 = "ILVL",
+    ITEM_LEVEL           = "Item Level",
+    EQUIPPED             = "Equipped",
+    PVP_ITEM_LEVEL       = "PvP Item Level",
+    OPEN_CHARACTER       = "Open Character Sheet",
     WHISPER              = "Whisper",
     WHISPER_BNET         = "Whisper BNet",
     INVITE               = "Invite",
     NO_FRIENDS_ONLINE    = "No friends online",
     NOT_IN_GUILD         = "Not in a guild",
     TOGGLE_WORLD_MAP     = "Toggle World Map",
+    SWITCH_TO_REP        = "Switch to Reputation",
+    SWITCH_TO_XP         = "Switch to Experience",
+    PROGRESS             = "Progress",
+    RESTED               = "Rested",
 }
 ns.L = L
 
@@ -154,6 +171,7 @@ local wipe              = wipe
 local format            = string.format
 local tinsert, tremove  = table.insert, table.remove
 local tconcat           = table.concat
+local tsort             = table.sort
 local floor             = math.floor
 local max, min, abs     = math.max, math.min, math.abs
 
@@ -183,6 +201,7 @@ ns.BLOCK_TYPES = {
     { key = "coords",     label = "Coordinates" },
     { key = "gold",       label = "Gold" },
     { key = "durability", label = "Durability" },
+    { key = "combat",     label = "Combat Status" },
     { key = "xprep",      label = "XP / Reputation Bar" },
     { key = "spec",       label = "Spec & Loot Spec" },
     { key = "profession", label = "Professions" },
@@ -190,8 +209,11 @@ ns.BLOCK_TYPES = {
     { key = "travel",     label = "Travel Cooldowns" },
     { key = "micromenu",  label = "Micro Menu" },
     { key = "currency",   label = "Currency" },
+    { key = "crests",     label = "Crests" },
+    { key = "ilvl",       label = "Item Level" },
     { key = "greatvault", label = "Great Vault" },
     { key = "audio",      label = "Audio" },
+    { key = "ldb",        label = "Broker Plugin" },
     { key = "spacer",     label = "Spacer" },
 }
 
@@ -204,8 +226,9 @@ ns.BLOCK_DEFAULTS = {
     -- which the options page pulses about.
     location   = { showIcon = true, showSubZone = true },
     coords     = { showIcon = true, precision = 0, hideInInstance = true },
-    gold       = { showIcons = true, showBagSpace = false, showSmall = false, coinIcons = false },
+    gold       = { showIcons = true, showBagSpace = false, showSmall = false, coinIcons = false, abbreviate = false, forceEnglishUnits = false },
     durability = { showIcon = true },
+    combat     = { onlyInCombat = false },
     xprep      = { mode = "auto" },
     spec       = { showLoadout = true, useUppercase = false },
     profession = {},
@@ -215,13 +238,35 @@ ns.BLOCK_DEFAULTS = {
                    menu = true, guild = true, social = true, char = true, spell = true, ach = true, quest = true, lfg = true,
                    pvp = true, housing = true, journal = true, pet = true, shop = true, help = true },
     currency   = { currencyId = nil, showIcon = true, showDescription = true },
+    -- t1..t5 are TIER slots, not currency ids: a season swap replaces the ids
+    -- in the blocks file and the player's checklist selection still applies.
+    crests     = { t1 = true, t2 = true, t3 = true, t4 = true, t5 = true,
+                   showIcons = true, separator = "slash", showSeasonProgress = false,
+                   hideEmpty = false, reverse = false },
+    ilvl       = { prefix = "short", value = "equipped", precision = 0 },
     greatvault = {},
     audio      = { channel = "master" },
+    -- Broker plugin: one block type for every LibDataBroker data source, picked
+    -- by name (source). stripColors defaults ON -- broker text arrives full of
+    -- the plugin's own |cff.. codes, which would silently beat this block's Text
+    -- Color and its accent hover. maxWidth nil = size from the live string.
+    ldb        = { source = nil, showIcon = true, showLabel = false, showText = true,
+                   stripColors = true, maxWidth = nil },
     spacer     = {},
 }
 
 -- Factories are registered by EllesmereUIDataBars_Blocks.lua.
 ns.BlockFactories = {}
+
+-- WoW Forever has no Great Vault: the block leaves the picker (BLOCK_TYPES),
+-- the add path refuses it (no default) and the blocks file registers no
+-- factory, so a bar saved with one shows an empty slot there instead of erroring.
+if EllesmereUI.IS_FOREVER then
+    for i = #ns.BLOCK_TYPES, 1, -1 do
+        if ns.BLOCK_TYPES[i].key == "greatvault" then table.remove(ns.BLOCK_TYPES, i) end
+    end
+    ns.BLOCK_DEFAULTS.greatvault = nil
+end
 
 local DeepCopy = EllesmereUI.Lite.DeepCopy
 
@@ -333,6 +378,14 @@ local function CoinMarker(i, coinIcons, coloured)
     return d.symbol
 end
 
+-- Gold abbreviation (SI units): 284208 -> "284.2K". The breakpoint table and
+-- any locale-specific algorithm (e.g. CJK wan/yi grouping) live in the
+-- shared EllesmereUI_NumberFormat.lua, so every module abbreviates the same way.
+local function GoldDisplay(val, abbreviate, forceEnglish)
+    if abbreviate then return EllesmereUI.AbbreviateNumber(val, forceEnglish) end
+    return BreakUpLargeNumbers and BreakUpLargeNumbers(val) or tostring(val)
+end
+
 -- Money split per denomination: one token per coin, so callers can align them
 -- in columns (tooltip) or separate lines (vertical bar) -- a single formatted
 -- string can't, since the proportional font makes "9g" and "1 234g" different
@@ -340,12 +393,11 @@ end
 -- Tip_AddColumns copies it, so one buffer serves all rows.
 local _moneyTokens = {}
 
-function ns.MoneyTokens(amount, showSmall, coinIcons, coloured)
+function ns.MoneyTokens(amount, showSmall, coinIcons, coloured, abbreviate, forceEnglish)
     amount = floor(abs(amount or 0))
     wipe(_moneyTokens)
     local gold = floor(amount / DENOMINATIONS[1].divisor)
-    local gStr = BreakUpLargeNumbers and BreakUpLargeNumbers(gold) or tostring(gold)
-    _moneyTokens[1] = gStr .. CoinMarker(1, coinIcons, coloured)
+    _moneyTokens[1] = GoldDisplay(gold, abbreviate, forceEnglish) .. CoinMarker(1, coinIcons, coloured)
     if showSmall ~= false then
         local silver = floor((amount % DENOMINATIONS[1].divisor) / DENOMINATIONS[2].divisor)
         _moneyTokens[2] = silver .. CoinMarker(2, coinIcons, coloured)
@@ -354,7 +406,7 @@ function ns.MoneyTokens(amount, showSmall, coinIcons, coloured)
     return _moneyTokens
 end
 
-function ns.FormatMoneyPlain(amount, showSmall, coinIcons)
+function ns.FormatMoneyPlain(amount, showSmall, coinIcons, abbreviate, forceEnglish)
     amount = floor(abs(amount or 0))
     local parts, foundGold = {}, false
     for i, denom in ipairs(DENOMINATIONS) do
@@ -362,8 +414,7 @@ function ns.FormatMoneyPlain(amount, showSmall, coinIcons)
         amount = amount % denom.divisor
         if i == 1 and val > 0 then
             foundGold = true
-            local display = BreakUpLargeNumbers and BreakUpLargeNumbers(val) or tostring(val)
-            parts[#parts + 1] = display .. CoinMarker(i, coinIcons, false)
+            parts[#parts + 1] = GoldDisplay(val, abbreviate, forceEnglish) .. CoinMarker(i, coinIcons, false)
         elseif i > 1 and (not foundGold or showSmall ~= false) and (val > 0 or (i == 3 and #parts == 0)) then
             parts[#parts + 1] = val .. CoinMarker(i, coinIcons, false)
         end
@@ -372,7 +423,7 @@ function ns.FormatMoneyPlain(amount, showSmall, coinIcons)
     return "0" .. CoinMarker(3, coinIcons, false)
 end
 
-function ns.FormatMoney(amount, useColors, showSmall, coinIcons)
+function ns.FormatMoney(amount, useColors, showSmall, coinIcons, abbreviate, forceEnglish)
     amount = floor(abs(amount or 0))
     local coloured = useColors ~= false
     local parts, foundGold = {}, false
@@ -381,8 +432,7 @@ function ns.FormatMoney(amount, useColors, showSmall, coinIcons)
         amount = amount % denom.divisor
         if i == 1 and val > 0 then
             foundGold = true
-            local display = BreakUpLargeNumbers and BreakUpLargeNumbers(val) or tostring(val)
-            parts[#parts + 1] = display .. CoinMarker(i, coinIcons, coloured)
+            parts[#parts + 1] = GoldDisplay(val, abbreviate, forceEnglish) .. CoinMarker(i, coinIcons, coloured)
         elseif i > 1 and (not foundGold or showSmall ~= false) and (val > 0 or (i == 3 and #parts == 0)) then
             parts[#parts + 1] = val .. CoinMarker(i, coinIcons, coloured)
         end
@@ -1705,7 +1755,7 @@ local function EnsureThemeTextures(host)
     UpdateBgTexCoords()
 end
 
-local function ApplyThemeToHost(host, theme, texKey)
+local function ApplyThemeToHost(host, theme, texKey, showBorder)
     EnsureThemeTextures(host)
     theme = theme or {}
     -- Bar Texture (per-bar cfg.barTexture): resolved through the shared
@@ -1748,13 +1798,20 @@ local function ApplyThemeToHost(host, theme, texKey)
     end
     -- Bar Opacity carries the border with it: the base border alpha (0.8)
     -- is baked into the strip textures, frame alpha multiplies on top.
-    -- SetAlpha is combat-legal even on implicitly protected bars.
-    if host._edbBorder then host._edbBorder:SetAlpha(op) end
+    -- SetAlpha is combat-legal even on implicitly protected bars. Off
+    -- (cfg.hideBorder == true) zeros it rather than Hide(), same reason.
+    if host._edbBorder then
+        if showBorder == false then
+            host._edbBorder:SetAlpha(0)
+        else
+            host._edbBorder:SetAlpha(op)
+        end
+    end
 end
 
 -- Exposed so the options preview strip renders the exact same recipe.
-function ns.MakePreviewBackdrop(host, themeCfg)
-    ApplyThemeToHost(host, themeCfg)
+function ns.MakePreviewBackdrop(host, themeCfg, showBorder)
+    ApplyThemeToHost(host, themeCfg, nil, showBorder)
 end
 
 -------------------------------------------------------------------------------
@@ -2106,6 +2163,17 @@ ApplyLayout = function(id)
     end
 end
 
+--- "Never" is this module's only disable channel, so every gate that asks it has to ask
+--- the EFFECTIVE value: an applied Visibility override replaces the whole setting, the
+--- scalar included, so Always or Mouseover has to keep a bar alive whose stored scalar
+--- reads never, and an override of Never disables one whose scalar does not.
+function ns.VisIsNever(cfg)
+    if not cfg then return true end
+    local ov = EllesmereUI.VisOverrideValue and EllesmereUI.VisOverrideValue(cfg)
+    if ov then return ov == "never" end
+    return cfg.visibility == "never"
+end
+
 -- Idempotent create-or-update of one bar from its cfg.
 function ns.ApplyBar(id)
     local profile = ns.GetProfile()
@@ -2126,7 +2194,7 @@ function ns.ApplyBar(id)
     -- instances, no events, no ticks). A stray cfg.enabled key may still
     -- exist in old stored data -- it is deliberately IGNORED everywhere;
     -- visibility is the only disable channel.
-    if not cfg or cfg.visibility == "never" then
+    if ns.VisIsNever(cfg) then
         if rec and rec.enabled then
             for _, inst in pairs(rec.insts) do
                 if inst.Disable then inst:Disable() end
@@ -2190,7 +2258,7 @@ function ns.ApplyBar(id)
     end
 
     ApplyBarPosition(id)
-    ApplyThemeToHost(rec.bar, cfg.theme, cfg.barTexture)
+    ApplyThemeToHost(rec.bar, cfg.theme, cfg.barTexture, not cfg.hideBorder)
 
     -- Reconcile block instances against cfg.blocks
     local want = {}
@@ -2251,7 +2319,7 @@ function ns.ApplyTheme(id)
     local rec = live[id]
     local cfg = ns.GetBar(id)
     if not (rec and rec.bar and cfg) then return end
-    ApplyThemeToHost(rec.bar, cfg.theme, cfg.barTexture)
+    ApplyThemeToHost(rec.bar, cfg.theme, cfg.barTexture, not cfg.hideBorder)
 end
 
 function ns.GetLiveAutoLength(barId, blockId)
@@ -2397,7 +2465,8 @@ do
         "PLAYER_TARGET_CHANGED", "GROUP_ROSTER_UPDATE",
         "PLAYER_MOUNT_DISPLAY_CHANGED", "PLAYER_CAN_GLIDE_CHANGED",
         "ZONE_CHANGED_NEW_AREA", "UPDATE_SHAPESHIFT_FORM",
-        "PLAYER_ENTERING_WORLD",
+        "PLAYER_ENTERING_WORLD", "PLAYER_UPDATE_RESTING",
+        "UNIT_ENTERED_VEHICLE", "UNIT_EXITED_VEHICLE",
     }
 
     -- Legacy scalar evaluation for the modes the multi engine declines.
@@ -2469,7 +2538,7 @@ do
         if not profile then return false end
         local bars = profile.bars
         for i = 1, #bars do
-            if bars[i].visibility ~= "never" then
+            if not ns.VisIsNever(bars[i]) then
                 return true
             end
         end
@@ -2546,7 +2615,7 @@ do
         if not profile then return false end
         local bars = profile.bars
         for i = 1, #bars do
-            if bars[i].visibility ~= "never"
+            if not ns.VisIsNever(bars[i])
                and bars[i].lengthMode == "full" then
                 return true
             end
@@ -3040,6 +3109,50 @@ function ns.BuildCurrencyList()
     for i = #collapsed, 1, -1 do
         C_CurrencyInfo.ExpandCurrencyList(collapsed[i], false)
     end
+    return values, order
+end
+
+-------------------------------------------------------------------------------
+--  LibDataBroker access (the "ldb" block type)
+-------------------------------------------------------------------------------
+-- The suite ships the library itself (EllesmereUI parent, beside the
+-- CallbackHandler it needs) rather than borrowing it from whichever broker addon
+-- happens to load: every broker we read sorts after EllesmereUIDataBars, so
+-- borrowing would hand back nil at our load time. Resolved lazily all the same --
+-- a half-updated install must go quiet here, not error.
+local _ldb
+function ns.GetLDB()
+    if _ldb then return _ldb end
+    if not LibStub then return nil end
+    _ldb = LibStub:GetLibrary("LibDataBroker-1.1", true)
+    return _ldb
+end
+
+-- Display label for one data object. The registered NAME is what the block
+-- stores, so it always leads; a self-declared label that differs rides along in
+-- grey, so a plugin that calls itself something other than its name is still
+-- findable in the picker.
+function ns.LDBLabel(name, obj)
+    if not obj then return name end
+    local lbl = obj.label
+    if type(lbl) == "string" and lbl ~= "" and lbl ~= name then
+        return name .. " |cff808080(" .. lbl .. ")|r"
+    end
+    return name
+end
+
+-- Every data source registered right now, sorted case-insensitively. Rebuilt at
+-- each dropdown open (never cached): plugins register on their own schedule, and
+-- some appear only after their addon finishes loading.
+function ns.BuildLDBList()
+    local values, order = {}, {}
+    local LDB = ns.GetLDB()
+    if not LDB then return values, order end
+    for name, obj in LDB:DataObjectIterator() do
+        values[name] = ns.LDBLabel(name, obj)
+        order[#order + 1] = name
+    end
+    tsort(order, function(a, b) return a:lower() < b:lower() end)
     return values, order
 end
 

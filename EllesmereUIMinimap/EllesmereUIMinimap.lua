@@ -68,6 +68,14 @@ local defaults = {
     profile = {
         minimap = {
             enabled       = true,
+            -- Blizzard Style (Global Settings > Style): the stock compass ring,
+            -- top border bar and element placement on our map with every EUI
+            -- feature intact. Default OFF; reload-gated.
+            useBlizzardStyle = false,
+            -- Classic WoW UI (Global Settings > Style): the vanilla ring, zone
+            -- banner and zoom buttons on our map, the same stock-mode geometry
+            -- as Blizzard Style. Default OFF; reload-gated.
+            useClassicStyle = false,
             shape         = "square",
             rotateMinimap = false,
             borderSize    = 1,
@@ -112,9 +120,13 @@ local defaults = {
             scrollZoom    = true,
             openMicroMenuOnMiddleClick = true,
             savedZoom     = 0,
+            -- Auto Zoom Reset: seconds of inactivity after a manual zoom change before snapping back to zoom level 0 (max distance). 0 = disabled (default).
+            zoomResetSeconds = 0,
             -- false = Zoom +/- Icons checked in Show Blizzard Elements (buttons hover-show). The old true default was inert on Midnight (targeted pre-Midnight global button names), so flipping it changed nobody's visual state.
             hideZoomButtons      = false,
-            hideTrackingButton   = true,
+            -- false = Tracking checked in Show Blizzard Elements on both clients (user
+            -- decision 2026-09-21); a profile that never touched the row gains the button.
+            hideTrackingButton   = false,
             hideGameTime         = false,
             hideMail             = false,
             -- Mail indicator: "button" = element row, or a map corner (TOPLEFT/TOPRIGHT/BOTTOMLEFT/BOTTOMRIGHT) pinned like Omnium Folio's, nudged by X/Y offsets.
@@ -230,10 +242,19 @@ end)
 -------------------------------------------------------------------------------
 --  Minimap Skin
 -------------------------------------------------------------------------------
+-- MinimapBackdrop (the frame) is deliberately NOT in this list: hiding the
+-- texture regions is enough (its only other art, StaticOverlayTexture, ships
+-- hidden; its one child button is managed separately below), and third-party
+-- encounter tools read the player's facing from
+-- MinimapCompassTexture:GetRotation() -- the instanced-content stand-in for
+-- the restricted GetPlayerFacing(). The compass is a REGION of the backdrop:
+-- with the parent frame hidden it never renders, the client stops rotating
+-- it, and those tools' facing reads freeze. They re-Show the texture
+-- themselves (raw metatable Show, at alpha 0), so hiding the TEXTURE here is
+-- fully compatible; hiding its PARENT is not.
 local minimapDecorations = {
     "MinimapBorder",
     "MinimapBorderTop",
-    "MinimapBackdrop",
     "MinimapNorthTag",
     "MinimapCompassTexture",
     "TimeManagerClockButton",
@@ -393,6 +414,9 @@ local function RestoreButtonDecorations(btn)
 end
 
 local function IsUngrouped(btn)
+    -- A group of one has nothing to open: the only grouped button stands on
+    -- the row by itself (decided per scan, see GatherMinimapButtons).
+    if btn == EBS._soloAddonButton then return true end
     local mp = EBS.db and EBS.db.profile.minimap
     if not mp or not mp.ungroupedButtons then return false end
     local name = btn:GetName()
@@ -425,6 +449,27 @@ end
 local function LayoutFlyoutButtons()
     if not flyoutPanel then return end
     local buttons = CollectFlyoutButtons()
+    -- Same lockdown rule as HideMinimapChild: every per-button call in the loop below
+    -- (SetParent/SetFrameStrata/SetPoint/SetSize/Show/SetFrameLevel) is protected and
+    -- is blocked silently for a protected button, which would leave it half-moved with
+    -- a flyoutSavedParents entry claiming it was placed. Drop those buttons from THIS
+    -- pass -- before the saved-parent capture, so nothing is recorded for a move that
+    -- never happened -- and queue the re-apply. ApplyMinimap invalidates and closes the
+    -- flyout, so the next open rebuilds the full grid. The list is a fresh table per
+    -- call, so compacting it in place is safe.
+    if InCombatLockdown() then
+        local kept = 0
+        for i = 1, #buttons do
+            local btn = buttons[i]
+            if btn:IsProtected() then
+                QueueApplyAll()
+            else
+                kept = kept + 1
+                buttons[kept] = btn
+            end
+        end
+        for i = #buttons, kept + 1, -1 do buttons[i] = nil end
+    end
     local count = #buttons
     if count == 0 then
         flyoutPanel:SetSize(1, 1)
@@ -507,27 +552,6 @@ local function LayoutFlyoutButtons()
         end
         GetFFD(btn).flyoutRing:Show()
     end
-end
-
-local function RestoreFlyoutButtons()
-    for btn, saved in pairs(flyoutSavedParents) do
-        RestoreButtonDecorations(btn)
-        if GetFFD(btn).flyoutRing then GetFFD(btn).flyoutRing:Hide() end
-        if btn.SetFixedFrameStrata then btn:SetFixedFrameStrata(false) end
-        if btn.SetFixedFrameLevel then btn:SetFixedFrameLevel(false) end
-        btn:SetParent(saved.parent)
-        btn:SetFrameStrata(saved.strata)
-        btn:ClearAllPoints()
-        if saved.point and saved.relTo then
-            btn:SetPoint(saved.point, saved.relTo, saved.relPoint, saved.x, saved.y)
-        end
-        -- Re-hide on the minimap surface
-        _suppressVisTrack = true
-        btn:Hide()
-        btn:SetAlpha(0)
-        _suppressVisTrack = false
-    end
-    wipe(flyoutSavedParents)
 end
 
 -- Grow Tooltip/Popup: shared open-direction for all popups/tooltips off minimap
@@ -680,19 +704,22 @@ end
 -- upward); vertical rows hug the outside of the left/right edge, horizontal rows run
 -- above/below. point/rel = per-button anchor -> map anchor; dirX/dirY = growth vector;
 -- awayX/awayY = Distance from Map push. PlaceRowButton/PlaceElement advance a cursor in snapped physical-pixel steps so icons stay flush at 0 spacing with equal gaps.
+-- arc/arcDir: Blizzard Style walks the same row round the compass ring instead --
+-- arc = the corner's angle on the circle (degrees, 0 = right, counter-clockwise),
+-- arcDir = which way the row walks from it (+1 counter-clockwise, -1 clockwise).
 local BTN_ROW_MODES = {
     -- Left edge (vertical)
-    blUp    = { point = "BOTTOMRIGHT", rel = "BOTTOMLEFT",  dirX = 0,  dirY = 1,  awayX = -1, awayY = 0 },
-    tlDown  = { point = "TOPRIGHT",    rel = "TOPLEFT",     dirX = 0,  dirY = -1, awayX = -1, awayY = 0 },
+    blUp    = { point = "BOTTOMRIGHT", rel = "BOTTOMLEFT",  dirX = 0,  dirY = 1,  awayX = -1, awayY = 0,  arc = 225, arcDir = -1 },
+    tlDown  = { point = "TOPRIGHT",    rel = "TOPLEFT",     dirX = 0,  dirY = -1, awayX = -1, awayY = 0,  arc = 135, arcDir = 1 },
     -- Right edge (vertical)
-    brUp    = { point = "BOTTOMLEFT",  rel = "BOTTOMRIGHT", dirX = 0,  dirY = 1,  awayX = 1,  awayY = 0 },
-    trDown  = { point = "TOPLEFT",     rel = "TOPRIGHT",    dirX = 0,  dirY = -1, awayX = 1,  awayY = 0 },
+    brUp    = { point = "BOTTOMLEFT",  rel = "BOTTOMRIGHT", dirX = 0,  dirY = 1,  awayX = 1,  awayY = 0,  arc = 315, arcDir = 1 },
+    trDown  = { point = "TOPLEFT",     rel = "TOPRIGHT",    dirX = 0,  dirY = -1, awayX = 1,  awayY = 0,  arc = 45,  arcDir = -1 },
     -- Above the map (horizontal)
-    tlRight = { point = "BOTTOMLEFT",  rel = "TOPLEFT",     dirX = 1,  dirY = 0,  awayX = 0,  awayY = 1 },
-    trLeft  = { point = "BOTTOMRIGHT", rel = "TOPRIGHT",    dirX = -1, dirY = 0,  awayX = 0,  awayY = 1 },
+    tlRight = { point = "BOTTOMLEFT",  rel = "TOPLEFT",     dirX = 1,  dirY = 0,  awayX = 0,  awayY = 1,  arc = 135, arcDir = -1 },
+    trLeft  = { point = "BOTTOMRIGHT", rel = "TOPRIGHT",    dirX = -1, dirY = 0,  awayX = 0,  awayY = 1,  arc = 45,  arcDir = 1 },
     -- Below the map (horizontal)
-    blRight = { point = "TOPLEFT",     rel = "BOTTOMLEFT",  dirX = 1,  dirY = 0,  awayX = 0,  awayY = -1 },
-    brLeft  = { point = "TOPRIGHT",    rel = "BOTTOMRIGHT", dirX = -1, dirY = 0,  awayX = 0,  awayY = -1 },
+    blRight = { point = "TOPLEFT",     rel = "BOTTOMLEFT",  dirX = 1,  dirY = 0,  awayX = 0,  awayY = -1, arc = 225, arcDir = 1 },
+    brLeft  = { point = "TOPRIGHT",    rel = "BOTTOMRIGHT", dirX = -1, dirY = 0,  awayX = 0,  awayY = -1, arc = 315, arcDir = -1 },
 }
 
 local function GetBtnRowMode(mp)
@@ -1118,6 +1145,25 @@ local function SaveZoomLevel()
     p.savedZoom = Minimap:GetZoom()
 end
 
+-- Auto Zoom Reset: (re)arms a one-shot timer on every manual zoom change (scroll wheel, zoom buttons) that snaps the map back to zoom level 0 (max distance) after zoomResetSeconds of inactivity. 0 = disabled.
+local zoomResetTimer
+local function RestartZoomResetTimer()
+    if zoomResetTimer then
+        zoomResetTimer:Cancel()
+        zoomResetTimer = nil
+    end
+    local p = EBS.db and EBS.db.profile.minimap
+    local secs = p and p.zoomResetSeconds or 0
+    if not secs or secs <= 0 then return end
+    zoomResetTimer = C_Timer.NewTimer(secs, function()
+        zoomResetTimer = nil
+        if Minimap:GetZoom() ~= 0 then
+            Minimap:SetZoom(0)
+            SaveZoomLevel()
+        end
+    end)
+end
+
 -- Global names of third-party buttons that REPLACE the expansion landing page button:
 -- they hide Blizzard's (usually unregistering its events first) and parent their own to the minimap in the same corner.
 local FOLIO_REPLACEMENT_BUTTONS = {
@@ -1151,7 +1197,15 @@ local addonButtonHooks = {}
 
 local function HideMinimapChild(btn)
     _suppressVisTrack = true
-    btn:Hide()
+    -- Hide() on a protected frame is blocked inside lockdown for ANY insecure caller,
+    -- taint or not, and the block is silent (no Lua error) -- so the SetAlpha below
+    -- still ran and the button just went invisible-but-shown. Skip only the blocked
+    -- call and queue the re-apply, which performs the real Hide() on PLAYER_REGEN_ENABLED.
+    if InCombatLockdown() and btn:IsProtected() then
+        QueueApplyAll()
+    else
+        btn:Hide()
+    end
     btn:SetAlpha(0)
     _suppressVisTrack = false
     if not addonButtonHooks[btn] then
@@ -1276,6 +1330,21 @@ local function GatherMinimapButtons()
             end
         end
     end
+    -- The lone grouped button, if the scan left exactly one: it shows on the
+    -- row ungrouped and no group toggle appears (IsUngrouped reads this). A
+    -- second button, or the user grouping one back, ends the solo state on
+    -- the next scan.
+    local mp = EBS.db and EBS.db.profile.minimap
+    local ug = mp and mp.ungroupedButtons
+    local solo, count = nil, 0
+    for _, btn in ipairs(cachedAddonButtons) do
+        local name = btn:GetName()
+        if _addonVisible[btn] ~= false and not (ug and name and ug[name]) then
+            count = count + 1
+            solo = btn
+        end
+    end
+    EBS._soloAddonButton = (count == 1) and solo or nil
 end
 
 -- Expose for options UI
@@ -1413,12 +1482,6 @@ end
 -- Great Vault button: top of the ungrouped stack above the flyout toggle; a single "whole" atlas scaled to fit.
 local _greatVaultBtn = nil
 local GREAT_VAULT_WHOLE_ATLAS = "greatVault-whole-normal"
-
-local function RegisterVaultEscClose()
-    local wrf = _G.WeeklyRewardsFrame
-    if not wrf or not EllesmereUI.RegisterEscapeClose then return end
-    EllesmereUI.RegisterEscapeClose(wrf)
-end
 
 local function ColorizeVaultText(text, r, g, b)
     r = math.floor(math.max(0, math.min(1, r or 1)) * 255 + 0.5)
@@ -1641,7 +1704,6 @@ local function ToggleGreatVault()
     if Load and IsLoaded and not IsLoaded("Blizzard_WeeklyRewards") then
         Load("Blizzard_WeeklyRewards")
     end
-    RegisterVaultEscClose()
     if WeeklyRewardsFrame then
         WeeklyRewardsFrame:SetShown(not WeeklyRewardsFrame:IsShown())
     end
@@ -2147,7 +2209,8 @@ local function GatherOnlineFriends()
             if online and name then
                 local short = name:match("^([^%-]+)") or name
                 if short ~= myName then
-                    guild[#guild + 1] = { name = short, full = name, class = classFile, zone = zone or "", level = level, kind = "guild" }
+                    -- Fix "Name-Realm-Realm" to "Name-Realm"
+                    guild[#guild + 1] = { name = short, full = EllesmereUI.BuildFullName(name) or name, class = classFile, zone = zone or "", level = level, kind = "guild" }
                 end
             end
         end
@@ -2166,11 +2229,8 @@ local function GatherOnlineFriends()
                     if ci and ci.classFile then classFile = ci.classFile end
                 end
                 local zone = gameInfo.areaName or ""
-                local realm = gameInfo.realmName
-                local full = charName
-                if charName and realm and realm ~= "" then
-                    full = charName .. "-" .. realm
-                end
+                -- Fix "Name-Realm-Realm" to "Name-Realm"
+                local full = EllesmereUI.BuildFullName(charName, gameInfo.realmName) or charName
                 -- Battle tag without the #discriminator (fall back to accountName/RealID)
                 local rawTag = acct.battleTag or acct.accountName
                 local tagName = rawTag and rawTag:match("^([^#]+)") or rawTag
@@ -2206,7 +2266,7 @@ local function GatherOnlineFriends()
             if charName and not seenBNet[charName] then
                 friends[#friends + 1] = {
                     name = charName:match("^([^%-]+)") or charName,
-                    full = charName,
+                    full = EllesmereUI.BuildFullName(charName) or charName,
                     class = info.className and info.className:upper():gsub(" ", ""),
                     zone = info.area or "",
                     level = info.level,
@@ -2313,7 +2373,9 @@ local function FTTOpenWhisper(charName, bnetName)
     end
     if charName and charName ~= "" then
         local sendTell = (ChatFrameUtil and ChatFrameUtil.SendTell) or ChatFrame_SendTell
-        if sendTell then sendTell(charName, DEFAULT_CHAT_FRAME) end
+        -- Fix "Name-Realm-Realm" to "Name-Realm"
+        local target = EllesmereUI.BuildFullName(charName) or charName
+        if sendTell then sendTell(target, DEFAULT_CHAT_FRAME) end
     end
 end
 
@@ -2360,7 +2422,7 @@ local function GetFTTMenu()
     MakeItem("Whisper", -PAD, FTTOpenWhisper)
     MakeItem("Invite", -PAD - RH, function(target)
         if target and target ~= "" and C_PartyInfo and C_PartyInfo.InviteUnit then
-            C_PartyInfo.InviteUnit(target)
+            C_PartyInfo.InviteUnit(EllesmereUI.BuildFullName(target) or target)
         end
     end)
 
@@ -3070,14 +3132,24 @@ local function BuildCustomIndicators(minimap)
     end)
 
     -- Great Vault + M+ Portal buttons: built once, anchored in LayoutIndicatorFrames.
-    _greatVaultBtn = CreateGreatVaultBtn(minimap)
-    _portalBtn = CreatePortalBtn(minimap)
+    -- Neither exists on WoW Forever (no vault, no keystone portals): the buttons are
+    -- never built there, every reader guards on nil, and the options drop their rows.
+    if not EllesmereUI.IS_FOREVER then
+        _greatVaultBtn = CreateGreatVaultBtn(minimap)
+        _portalBtn = CreatePortalBtn(minimap)
+    end
 end
 
 -- Hide the Blizzard originals so they never render or intercept clicks
 local function HideBlizzardIndicators()
     local tracking = MinimapCluster and MinimapCluster.Tracking
-    if tracking then tracking:SetAlpha(0); tracking:EnableMouse(false) end
+    if tracking then
+        tracking:SetAlpha(0); tracking:EnableMouse(false)
+        -- The click and tooltip scripts live on the child button, and a
+        -- parent's mouse state does not reach it: left enabled it is an
+        -- invisible hotspot at the cluster's corner.
+        if tracking.Button then tracking.Button:EnableMouse(false) end
+    end
     local gameTime = _G.GameTimeFrame
     if gameTime then gameTime:SetAlpha(0); gameTime:EnableMouse(false) end
     local indicator = MinimapCluster and MinimapCluster.IndicatorFrame
@@ -3122,7 +3194,10 @@ local _moHooked  = {}      -- frames whose OnEnter/OnLeave we've already hooked
 local _moHideTimer = nil
 
 local function MO_OverAny()
-    if Minimap and Minimap:IsMouseOver() then return true end
+    if Minimap then
+        local mapRegion = GetFFD(Minimap).pingBlocker or GetFFD(Minimap).layoutFrame or Minimap
+        if mapRegion:IsMouseOver() then return true end
+    end
     if _portalFlyout and _portalFlyout:IsShown() then return true end
     if flyoutPanel and flyoutPanel:IsShown() then return true end
     -- The friends tooltip is interactive (whisper/invite rows), so it keeps the stack
@@ -3210,8 +3285,104 @@ end
 
 local MAIL_CORNER_POINTS = { TOPLEFT = true, TOPRIGHT = true, BOTTOMLEFT = true, BOTTOMRIGHT = true }
 
+-- Stock styles: dress one of OUR row buttons (and, under Classic WoW UI, the
+-- indicators) as the stock round minimap
+-- button: a 31px button with the 53px ring-border texture hung from its
+-- top-left exactly as addon buttons hang it (its shadow falls bottom-right).
+-- Measured on that texture at the 53px draw size, the gold band's inner
+-- opening spans x 7..26 and y 7..25 -- centre 16.6,-16.2 from the button's
+-- top-left, with the band's inner shadow on the top-left -- so the dark disc
+-- and the icon are centred THERE, not at the addon-button icon slot (7,-6 at
+-- 17px), which is drawn for icons with transparent margins; ours are
+-- full-bleed art. The icon is clipped round by a mask so a square icon reads
+-- as a round button. `crop` trims an atlas icon to its centre fraction (the
+-- group toggle's plate art carries a small glyph) through the sheet file and
+-- coords, since SetTexCoord on an atlas samples garbage. Extra args are the
+-- button's own icon textures; the EUI black box hides. Created once,
+-- re-applied per pass. Our own buttons only (keys are written on the button).
+function EBS._ClassicRingButton(btn, crop, ...)
+    if not btn then return end
+    btn:SetSize(31, 31)
+    if btn._bg then btn._bg:Hide() end
+    local ring = btn._classicRing
+    if not ring then
+        ring = btn:CreateTexture(nil, "OVERLAY")
+        ring:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+        ring:SetSize(53, 53)
+        ring:SetPoint("TOPLEFT", btn, "TOPLEFT", 0, 0)
+        btn._classicRing = ring
+        local disc = btn:CreateTexture(nil, "BACKGROUND")
+        disc:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+        disc:SetSize(20, 20)
+        disc:SetPoint("CENTER", btn, "TOPLEFT", 16.6, -16.2)
+        btn._classicDisc = disc
+        local hl = btn:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight")
+        hl:SetBlendMode("ADD")
+        hl:SetAllPoints(btn)
+        btn._classicHL = hl
+        -- Icon 16px inside the 20px disc: a sliver of disc shows round the
+        -- icon, as on the stock round buttons, rather than the art running
+        -- under the band (which reads as zoomed in).
+        local mask = btn:CreateMaskTexture()
+        mask:SetTexture("Interface\\AddOns\\EllesmereUI\\media\\portraits\\circle_mask.tga", "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+        mask:SetSize(16, 16)
+        mask:SetPoint("CENTER", btn, "TOPLEFT", 16.6, -16.2)
+        btn._classicMask = mask
+    end
+    ring:Show()
+    btn._classicDisc:Show()
+    btn._classicHL:Show()
+    for i = 1, select("#", ...) do
+        local tex = select(i, ...)
+        if tex then
+            tex:ClearAllPoints()
+            tex:SetSize(16, 16)
+            tex:SetPoint("CENTER", btn, "TOPLEFT", 16.6, -16.2)
+            if crop then
+                -- GetAtlas is nil once the sheet file is on the texture, so
+                -- this runs once per texture.
+                local atlas = tex:GetAtlas()
+                local info = atlas and C_Texture.GetAtlasInfo(atlas)
+                if info and (info.file or info.filename) then
+                    local r, g, b, a = tex:GetVertexColor()
+                    tex:SetTexture(info.file or info.filename)
+                    local l, rt, t, bt = info.leftTexCoord, info.rightTexCoord, info.topTexCoord, info.bottomTexCoord
+                    local dw, dh = (rt - l) * crop, (bt - t) * crop
+                    tex:SetTexCoord(l + dw, rt - dw, t + dh, bt - dh)
+                    tex:SetVertexColor(r, g, b, a)
+                end
+            end
+            if not tex._classicMasked then
+                tex:AddMaskTexture(btn._classicMask)
+                tex._classicMasked = true
+            end
+        end
+    end
+end
+
+-- Takes the ring dress off a button the pass renders bare (a mail pinned to a
+-- corner): ring, disc and highlight hide and the round mask comes off the
+-- textures given, so the pass's own geometry shows unclipped. Re-dressing
+-- puts everything back; a button never dressed is left alone.
+function EBS._ClassicRingUndress(btn, ...)
+    local ring = btn and btn._classicRing
+    if not ring then return end
+    ring:Hide()
+    btn._classicDisc:Hide()
+    btn._classicHL:Hide()
+    for i = 1, select("#", ...) do
+        local tex = select(i, ...)
+        if tex and tex._classicMasked then
+            tex:RemoveMaskTexture(btn._classicMask)
+            tex._classicMasked = nil
+        end
+    end
+end
+
 local function LayoutIndicatorFrames(minimap, p, circleMode)
     local flvl = minimap:GetFrameLevel() + 10
+    local mapAnchor = GetFFD(minimap).layoutFrame or minimap
 
     -- Build our custom buttons once, hide Blizzard originals
     BuildCustomIndicators(minimap)
@@ -3226,10 +3397,12 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
     -- Resize buttons and update icon aspect ratios
     local inset = 3
     local avail = sz - inset * 2
+    local blizzHdr = EBS._MinimapBlizz() and GetFFD(minimap).blizzHeader or nil
     local function ResizeIndicator(btn)
         if not btn then return end
         btn:SetSize(sz, sz)
-        if btn._bg then btn._bg:SetShown(showBg) end
+        -- Stock styles: no EUI black box behind the indicators.
+        if btn._bg then btn._bg:SetShown(showBg and not blizzHdr) end
         local ratio = btn._upAtlas and INDICATOR_ATLAS_RATIO[btn._upAtlas]
         if ratio and btn._icon then
             local scale = INDICATOR_ATLAS_SCALE[btn._upAtlas] or 1
@@ -3270,7 +3443,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
         local rowBaseX, rowBaseY = GetRowBase(rowMode, p.btnRowDistance)
         local resES = minimap:GetEffectiveScale()
         flyoutToggle:ClearAllPoints()
-        flyoutToggle:SetPoint(rowMode.point, minimap, rowMode.rel,
+        flyoutToggle:SetPoint(rowMode.point, mapAnchor, rowMode.rel,
             PP.SnapForES(rowBaseX, resES), PP.SnapForES(rowBaseY, resES))
     end
 
@@ -3282,25 +3455,113 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
         diffFrame:SetParent(minimap)
         diffFrame:SetFrameLevel(flvl + 2)
         diffFrame:ClearAllPoints()
-        diffFrame:SetPoint("TOPRIGHT", minimap, "TOPRIGHT", 2, 1)
+        diffFrame:SetPoint("TOPRIGHT", mapAnchor, "TOPRIGHT", 2, 1)
         -- Text mode overrides Show Blizzard Elements: the flag is always suppressed.
-        if p.hideRaidDifficulty or p.diffTextEnabled then
-            diffFrame:SetAlpha(0)
-        else
-            diffFrame:SetAlpha(1)
-        end
+        -- Alpha leaves the hit region live, so a suppressed flag still answers mouseover
+        -- with Blizzard's difficulty tooltip at the top-right corner.
+        local suppressed = p.hideRaidDifficulty or p.diffTextEnabled
+        diffFrame:SetAlpha(suppressed and 0 or 1)
+        diffFrame:EnableMouseMotion(not suppressed)
+        if diffFrame.Guild then diffFrame.Guild:EnableMouseMotion(not suppressed) end
     end
     if not minimap.Layout then minimap.Layout = function() end end
 
-    if circleMode then
-        -- Circle layout: horizontal row around the clock
+    if blizzHdr then
+        -- Stock styles: placement around the top bar -- tracking on its left,
+        -- calendar on its right, crafting stacked under the tracking button,
+        -- the difficulty flag hung under the bar's right end. Blizzard Style
+        -- stacks the mail under the tracking button too; Classic WoW UI puts
+        -- it at the vanilla spot on the ring's upper right, below the flag,
+        -- and dresses the row's indicators as the vanilla round buttons (a
+        -- corner-pinned mail renders bare). Corner mail and every hide toggle
+        -- still apply.
+        local classic = EBS._MinimapClassic()
+        local cs = (p.mapSize or 140) / 140
         if ci.tracking and not p.hideTrackingButton then
-            ci.tracking:ClearAllPoints()
-            if clockBg and clockBg:IsShown() then
-                ci.tracking:SetPoint("RIGHT", clockBg, "LEFT", 0, 0)
-            else
-                ci.tracking:SetPoint("TOP", minimap, "TOP", -20, -3)
+            if classic then
+                EBS._ClassicRingButton(ci.tracking, nil, ci.tracking._icon)
+            elseif not ci.tracking._blizzRing then
+                -- The stock tracking button sits on a round plate (our own button, so the
+                -- texture lives on it directly).
+                local ring = ci.tracking:CreateTexture(nil, "BACKGROUND")
+                ring:SetAllPoints(ci.tracking)
+                ring:SetAtlas("ui-hud-minimap-button")
+                ci.tracking._blizzRing = ring
             end
+            ci.tracking:ClearAllPoints()
+            ci.tracking:SetPoint("RIGHT", blizzHdr, "LEFT", -2, 0)
+            ci.tracking:Show()
+        elseif ci.tracking then
+            ci.tracking:Hide()
+        end
+        if ci.calendar and not p.hideGameTime then
+            -- Stock: the clock hangs from the bar's top-right corner.
+            ci.calendar:ClearAllPoints()
+            ci.calendar:SetPoint("TOPLEFT", blizzHdr, "TOPRIGHT", 1, 0)
+        end
+        local under = (ci.tracking and ci.tracking:IsShown()) and ci.tracking or nil
+        if ci.mail and ci.mail:IsShown() then
+            if classic then
+                if mailCorner then
+                    EBS._ClassicRingUndress(ci.mail, ci.mail._icon)
+                else
+                    EBS._ClassicRingButton(ci.mail, nil, ci.mail._icon)
+                    -- The dress squares its icon; the envelope keeps its atlas
+                    -- aspect at the ring's 16px icon height.
+                    local ratio = ci.mail._upAtlas and INDICATOR_ATLAS_RATIO[ci.mail._upAtlas]
+                    if ratio and ci.mail._icon then ci.mail._icon:SetSize(16 * ratio, 16) end
+                end
+            end
+            ci.mail:ClearAllPoints()
+            if mailCorner then
+                ci.mail:SetPoint(mailCorner, mapAnchor, mailCorner, p.mailOffsetX or 0, p.mailOffsetY or 0)
+            elseif classic then
+                -- The vanilla mail frame: 33px, its TOPRIGHT 24,-37 off the map's
+                -- top-right corner, ring border hung from its top-left; placed by
+                -- that top-left, 6 lower than the vanilla spot so the difficulty
+                -- flag hanging under the banner's right end clears the ring.
+                ci.mail:SetPoint("TOPLEFT", minimap, "TOPRIGHT", -9 * cs, -43 * cs)
+            else
+                if under then
+                    ci.mail:SetPoint("TOP", under, "BOTTOM", 0, 0)
+                else
+                    ci.mail:SetPoint("RIGHT", blizzHdr, "LEFT", -2, 0)
+                end
+                under = ci.mail
+            end
+        end
+        if ci.crafting and ci.crafting:IsShown() then
+            if classic then EBS._ClassicRingButton(ci.crafting, nil, ci.crafting._icon) end
+            ci.crafting:ClearAllPoints()
+            if under then
+                ci.crafting:SetPoint("TOP", under, "BOTTOM", 0, 0)
+            else
+                ci.crafting:SetPoint("RIGHT", blizzHdr, "LEFT", -2, 0)
+            end
+        end
+        if diffFrame then
+            diffFrame:ClearAllPoints()
+            diffFrame:SetPoint("TOPRIGHT", blizzHdr, "BOTTOMRIGHT", 0, 1)
+        end
+        if indicatorBg then indicatorBg:Hide() end
+
+    elseif circleMode then
+        -- Circle layout: horizontal row growing left from the clock. Each element chains
+        -- to the previous shown one; a hidden element is skipped, since anchoring to a
+        -- frame that was never positioned leaves the whole chain undrawn.
+        local leftAnchor = (clockBg and clockBg:IsShown()) and clockBg or nil
+        local function PlaceLeft(btn)
+            btn:ClearAllPoints()
+            if leftAnchor then
+                btn:SetPoint("RIGHT", leftAnchor, "LEFT", 0, 0)
+            else
+                btn:SetPoint("TOP", mapAnchor, "TOP", -20, -3)
+            end
+            leftAnchor = btn
+        end
+
+        if ci.tracking and not p.hideTrackingButton then
+            PlaceLeft(ci.tracking)
             ci.tracking:Show()
         elseif ci.tracking then
             ci.tracking:Hide()
@@ -3311,24 +3572,21 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
             if clockBg and clockBg:IsShown() then
                 ci.calendar:SetPoint("LEFT", clockBg, "RIGHT", 0, 0)
             else
-                ci.calendar:SetPoint("TOP", minimap, "TOP", 20, -3)
+                ci.calendar:SetPoint("TOP", mapAnchor, "TOP", 20, -3)
             end
         end
 
         if ci.mail and ci.mail:IsShown() then
-            ci.mail:ClearAllPoints()
             if mailCorner then
-                ci.mail:SetPoint(mailCorner, minimap, mailCorner, p.mailOffsetX or 0, p.mailOffsetY or 0)
+                ci.mail:ClearAllPoints()
+                ci.mail:SetPoint(mailCorner, mapAnchor, mailCorner, p.mailOffsetX or 0, p.mailOffsetY or 0)
             else
-                ci.mail:SetPoint("RIGHT", ci.tracking, "LEFT", 0, 0)
+                PlaceLeft(ci.mail)
             end
         end
 
         if ci.crafting and ci.crafting:IsShown() then
-            ci.crafting:ClearAllPoints()
-            -- Corner-pinned mail is out of the row, so crafting chains to tracking
-            local anchor = (ci.mail and ci.mail:IsShown() and not mailCorner) and ci.mail or ci.tracking
-            ci.crafting:SetPoint("RIGHT", anchor, "LEFT", 0, 0)
+            PlaceLeft(ci.crafting)
         end
 
         if indicatorBg then indicatorBg:Hide() end
@@ -3345,7 +3603,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
         local elY = PP.SnapForES(baseY, elES)
         local function PlaceElement(btn)
             btn:ClearAllPoints()
-            btn:SetPoint(rowMode.point, minimap, rowMode.rel, elX, elY)
+            btn:SetPoint(rowMode.point, mapAnchor, rowMode.rel, elX, elY)
             local adv = (rowMode.dirX ~= 0) and btn:GetWidth() or btn:GetHeight()
             adv = math.floor(adv / elPx + 0.001) * elPx + elGap
             elX = elX + adv * rowMode.dirX
@@ -3366,7 +3624,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
         if ci.mail and ci.mail:IsShown() then
             if mailCorner then
                 ci.mail:ClearAllPoints()
-                ci.mail:SetPoint(mailCorner, minimap, mailCorner, p.mailOffsetX or 0, p.mailOffsetY or 0)
+                ci.mail:SetPoint(mailCorner, mapAnchor, mailCorner, p.mailOffsetX or 0, p.mailOffsetY or 0)
             else
                 PlaceElement(ci.mail)
             end
@@ -3391,19 +3649,43 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
         local rowGap = PP.SnapForES(p.btnRowSpacing or 0, rowES)
         local rowX = PP.SnapForES(rowBaseX, rowES)
         local rowY = PP.SnapForES(rowBaseY, rowES)
+        -- Stock styles: the row follows the ring instead of the square's edge,
+        -- as the stock map's addon buttons do -- each button centred on the
+        -- circle just outside the map (the stock addon-button radius, 5px scaled
+        -- with the map, plus Distance from Map), starting at the row's corner and
+        -- walking round in its growth direction; Icon Spacing becomes the arc gap.
+        local arcR, arcT, arcDir
+        if blizzHdr then
+            local mapW = minimap:GetWidth() or 140
+            arcR = mapW / 2 + 5 * (mapW / 198) + (p.btnRowDistance or 0)
+            arcT = math.rad(rowMode.arc or 225)
+            arcDir = rowMode.arcDir or -1
+        end
         local function PlaceRowButton(btn)
-            btn:SetPoint(rowMode.point, minimap, rowMode.rel, rowX, rowY)
             local adv = (rowMode.dirX ~= 0) and btn:GetWidth() or btn:GetHeight()
             adv = math.floor(adv / rowPx + 0.001) * rowPx + rowGap
-            rowX = rowX + adv * rowMode.dirX
-            rowY = rowY + adv * rowMode.dirY
+            if arcR then
+                EBS._ArcPoint(btn, minimap, arcR, arcT, rowES)
+                arcT = arcT + arcDir * adv / arcR
+            else
+                btn:SetPoint(rowMode.point, mapAnchor, rowMode.rel, rowX, rowY)
+                rowX = rowX + adv * rowMode.dirX
+                rowY = rowY + adv * rowMode.dirY
+            end
         end
+        -- Stock styles: every button on the ring wears the round minimap-button
+        -- look -- ours dressed by EBS._ClassicRingButton, addon buttons in
+        -- their own native dress (the common minimap-button library draws
+        -- exactly that look).
+        if arcR then EBS._ClassicRingButton(flyoutToggle, 0.12, flyoutToggle._norm, flyoutToggle._pushed, flyoutToggle._hl) end
         flyoutToggle:ClearAllPoints()
         local flyoutVisible = flyoutToggle:IsShown()
         if flyoutVisible then
             PlaceRowButton(flyoutToggle)
+        elseif arcR then
+            EBS._ArcPoint(flyoutToggle, minimap, arcR, arcT, rowES)
         else
-            flyoutToggle:SetPoint(rowMode.point, minimap, rowMode.rel, rowX, rowY)
+            flyoutToggle:SetPoint(rowMode.point, mapAnchor, rowMode.rel, rowX, rowY)
         end
         local mp = EBS.db and EBS.db.profile.minimap
         local ungrouped = {}
@@ -3428,17 +3710,24 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
             btn:SetParent(minimap)
             btn:SetFrameLevel(minimap:GetFrameLevel() + 11)
             btn:ClearAllPoints()
-            if showBg then
+            -- Black boxes only on the EUI look; Blizzard Style keeps the button's
+            -- own dress (the common library dress is the stock round minimap
+            -- button) at its native size, restored BEFORE placement so the row
+            -- advances by the size the button really draws at.
+            local rowBoxes = showBg and not arcR
+            if rowBoxes then
                 -- Strip BEFORE resize so the snapshot captures the real native size.
                 StripButtonDecorations(btn)
                 btn:SetSize(ungroupBtnSize, ungroupBtnSize)
+            else
+                RestoreButtonDecorations(btn)
             end
             PlaceRowButton(btn)
             btn:SetMovable(false)
             btn:RegisterForDrag()
             btn:SetScript("OnDragStart", nil)
             btn:SetScript("OnDragStop", nil)
-            if showBg then
+            if rowBoxes then
                 local icon = btn.icon or btn.Icon
                 if not icon then
                     for _, region in ipairs({ btn:GetRegions() }) do
@@ -3473,9 +3762,8 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
                 ubg:Show()
                 if btn._ungroupRing then btn._ungroupRing:Hide() end
             else
-                -- No backgrounds: restore native appearance, hide our overlays. Do NOT
+                -- No boxes: native appearance (restored above), our overlays hidden. Do NOT
                 -- override button size -- native ring textures have fixed anchors correct only at the original size.
-                RestoreButtonDecorations(btn)
                 if GetFFD(btn).ungroupBg then GetFFD(btn).ungroupBg:Hide() end
                 if btn._ungroupRing then btn._ungroupRing:Hide() end
             end
@@ -3496,6 +3784,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
                         _greatVaultBtn:Hide()
                     else
                         SizeGreatVaultBtn(_greatVaultBtn, showBg)
+                        if arcR then EBS._ClassicRingButton(_greatVaultBtn, nil, _greatVaultBtn._whole) end
                         _greatVaultBtn:SetParent(minimap)
                         _greatVaultBtn:SetFrameLevel(minimap:GetFrameLevel() + 11)
                         _greatVaultBtn:ClearAllPoints()
@@ -3510,6 +3799,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
                     else
                         ci.friends:SetSize(sz, sz)
                         if ci.friends._bg then ci.friends._bg:SetShown(showBg) end
+                        if arcR then EBS._ClassicRingButton(ci.friends, nil, ci.friends._icon) end
                         ci.friends:SetParent(minimap)
                         ci.friends:SetFrameLevel(minimap:GetFrameLevel() + 11)
                         ci.friends:ClearAllPoints()
@@ -3523,6 +3813,7 @@ local function LayoutIndicatorFrames(minimap, p, circleMode)
                         _portalBtn:Hide()
                     else
                         SizePortalBtn(_portalBtn, showBg)
+                        if arcR then EBS._ClassicRingButton(_portalBtn, nil, _portalBtn._icon) end
                         _portalBtn:SetParent(minimap)
                         _portalBtn:SetFrameLevel(minimap:GetFrameLevel() + 11)
                         _portalBtn:ClearAllPoints()
@@ -3584,7 +3875,10 @@ local function RestoreIndicatorFrames()
     end
     -- Restore Blizzard originals
     local tracking = MinimapCluster and MinimapCluster.Tracking
-    if tracking then tracking:SetAlpha(1); tracking:EnableMouse(true) end
+    if tracking then
+        tracking:SetAlpha(1); tracking:EnableMouse(true)
+        if tracking.Button then tracking.Button:EnableMouse(true) end
+    end
     local gameTime = _G.GameTimeFrame
     if gameTime then gameTime:SetAlpha(1); gameTime:EnableMouse(true) end
     local indicator = MinimapCluster and MinimapCluster.IndicatorFrame
@@ -3604,6 +3898,15 @@ local function CaptureBlizzardMinimap()
     if not minimap then return end
     local p = EBS.db.profile.minimap
     if p._capturedOnce then return end
+    -- WoW Forever starts every install from the base layout, never from a
+    -- snapshot of Blizzard's minimap (EllesmereUI_ForeverLayout.lua): the
+    -- map opens at the Forever size, and with no position it takes the
+    -- top-right default below.
+    if EllesmereUI.IS_FOREVER then
+        p.mapSize = EllesmereUI.FOREVER_MINIMAP_SIZE or 200
+        p._capturedOnce = true
+        return
+    end
 
     local uiScale = UIParent:GetEffectiveScale()
     local mScale  = minimap:GetEffectiveScale()
@@ -3652,6 +3955,8 @@ end
 
 -- Folio mode with legacy fallback: pre-dropdown data carries showOmniumFolio (default ON; only false is ever stored).
 local function GetOmniumFolioMode(mp)
+    -- No expansion landing page on WoW Forever: every folio path reads "never".
+    if EllesmereUI.IS_FOREVER then return "never" end
     if not mp then return "always" end
     if mp.omniumFolioMode then return mp.omniumFolioMode end
     if mp.showOmniumFolio == false then return "never" end
@@ -3672,7 +3977,20 @@ local function PositionOmniumFolio(btn)
     btn:ClearAllPoints()
     -- Anchor the button's chosen corner to the minimap's same corner; X/Y nudge from there (positive X = right, positive Y = up, regardless of corner).
     local corner = mp.omniumFolioCorner or "BOTTOMLEFT"
-    btn:SetPoint(corner, Minimap, corner, mp.omniumFolioX or 0, mp.omniumFolioY or 0)
+    if EBS._MinimapBlizz() then
+        -- Stock styles: the stock spot on the ring (the button's centre
+        -- 84 left and 63.5 below the map centre at the stock 198px map: the
+        -- backdrop's TOPLEFT -3,-150 for the 53px button), mirrored to the chosen
+        -- corner and scaled with the map. Anchor offsets are in the button's own
+        -- scale, so the map units divide by it; the nudges stay as they were.
+        local mapW = Minimap:GetWidth() or (mp.mapSize or 140)
+        local s = (mapW / 198) / (btn:GetScale() or 1)
+        local cx = (corner == "BOTTOMRIGHT" or corner == "TOPRIGHT") and 84 or -84
+        local cy = (corner == "TOPLEFT" or corner == "TOPRIGHT") and 63.5 or -63.5
+        btn:SetPoint("CENTER", Minimap, "CENTER", cx * s + (mp.omniumFolioX or 0), cy * s + (mp.omniumFolioY or 0))
+    else
+        btn:SetPoint(corner, GetFFD(Minimap).layoutFrame or Minimap, corner, mp.omniumFolioX or 0, mp.omniumFolioY or 0)
+    end
     _omniumFolioApplying = false
 end
 
@@ -3683,7 +4001,8 @@ end
 -- (resolution/scale dependent, which is why it repros on some machines only); the
 -- expanded rect ensures "engine entered" implies "this test passes", so the exit watcher never fires early.
 function EBS._HoverStillOver(minimap)
-    if minimap:IsMouseOver(4, -4, -4, 4) then return true end
+    local hoverFrame = GetFFD(minimap).pingBlocker or GetFFD(minimap).layoutFrame or minimap
+    if hoverFrame:IsMouseOver(4, -4, -4, 4) then return true end
     local b = _G.ExpansionLandingPageMinimapButton
     if b and b:IsShown() and b:IsMouseOver(4, -4, -4, 4) then return true end
     return false
@@ -3802,6 +4121,9 @@ function EBS._HVRevealMapHover()
 end
 
 local function ApplyOmniumFolio()
+    -- No expansion landing page on WoW Forever: the button is left to
+    -- Blizzard entirely (its own refresh path errors there), no hooks either.
+    if EllesmereUI.IS_FOREVER then return end
     local btn = _G.ExpansionLandingPageMinimapButton
     if not btn or not Minimap then return end
     local mp = EBS.db and EBS.db.profile and EBS.db.profile.minimap
@@ -3898,7 +4220,35 @@ function EBS._PositionAddonCompartment(btn)
     -- Anchor the button's chosen corner to the minimap's same corner; X/Y nudge
     -- from there (positive X = right, positive Y = up), same as the folio.
     local corner = mp.addonCompartmentCorner or "TOPRIGHT"
-    btn:SetPoint(corner, Minimap, corner, mp.addonCompartmentX or 0, mp.addonCompartmentY or 0)
+    local placed = false
+    if EBS._MinimapBlizz() then
+        -- Stock styles: the stock spot is under the calendar (the button's
+        -- top-left to the calendar's bottom-left; calendar hidden = right of the
+        -- top bar); any other corner is that corner's diagonal on the compass
+        -- ring. The nudges still apply.
+        local nx, ny = mp.addonCompartmentX or 0, mp.addonCompartmentY or 0
+        if corner == "TOPRIGHT" then
+            local cal = _customIndicators.calendar
+            local hdr = GetFFD(Minimap).blizzHeader
+            if cal and cal:IsShown() then
+                btn:SetPoint("TOPLEFT", cal, "BOTTOMLEFT", nx, ny)
+                placed = true
+            elseif hdr then
+                btn:SetPoint("TOPLEFT", hdr, "TOPRIGHT", 1 + nx, ny)
+                placed = true
+            end
+        else
+            local mapW = Minimap:GetWidth() or (mp.mapSize or 140)
+            local r = (mapW / 2 + 5 * (mapW / 198)) / (btn:GetScale() or 1)
+            local dx = (corner == "BOTTOMLEFT" or corner == "TOPLEFT") and -0.7071 or 0.7071
+            local dy = (corner == "BOTTOMLEFT" or corner == "BOTTOMRIGHT") and -0.7071 or 0.7071
+            btn:SetPoint("CENTER", Minimap, "CENTER", r * dx + nx, r * dy + ny)
+            placed = true
+        end
+    end
+    if not placed then
+        btn:SetPoint(corner, GetFFD(Minimap).layoutFrame or Minimap, corner, mp.addonCompartmentX or 0, mp.addonCompartmentY or 0)
+    end
     -- The cluster's alpha/mouse state does not follow the reparent, and the
     -- pre-fix sessions left it parked on a hidden frame -- re-assert both.
     btn:SetAlpha(1)
@@ -3953,12 +4303,238 @@ function EBS._ApplyAddonCompartment()
     end
 end
 
+-- The mask that crops rectangular mode's square canvas covers the terrain only -- the
+-- engine keeps drawing unit blips across the whole canvas, and the one thing that
+-- confines the native render is the minimap's PARENT rect (ordinary child frames and
+-- textures are not clipped by it, so our border and buttons still draw outside).
+-- Parenting the canvas to the 4:3 layout frame is what crops the blips.
+local function DesiredMapParent(minimap)
+    local p = EBS.db and EBS.db.profile.minimap
+    -- The stock styles are always the round map, whatever shape is stored.
+    if p and (p.shape or "square") == "rectangular" and not EBS._MinimapBlizz() then
+        return GetFFD(minimap).layoutFrame or UIParent
+    end
+    return UIParent
+end
+
+-------------------------------------------------------------------------------
+--  Stock styles (Global Settings > Style): Blizzard Style and Classic WoW UI.
+--  Both force the round map, drop the EUI border and put the zoom buttons,
+--  indicators and button row where a stock layout puts them; only the art
+--  differs. Blizzard Style wears the 12.1 kit: Blizzard's compass ring (its
+--  own texture, so Rotate Minimap keeps turning it) sized onto the map and a
+--  header of ours in the stock NineSlice kit. Classic WoW UI wears the
+--  vanilla texture files: the UI-Minimap-Border ring and zone banner on
+--  frames of ours, the vanilla zoom buttons, the ring-border indicators.
+--  Every EUI feature keeps working. Reload-gated per-profile flags, read only
+--  on apply passes; all of this is skipped while both are off.
+-------------------------------------------------------------------------------
+-- The style this module RENDERS this session: "eui" | "blizzard" | "classic".
+-- Read from the profile once (first call with a profile present) and latched
+-- for the session: a live profile switch never flips the look under the
+-- one-time chrome setup; the profile system prompts for a reload instead.
+EBS._MinimapStyle = function()
+    local v = EBS._styleLatch
+    if v == nil then
+        local m = EBS.db and EBS.db.profile and EBS.db.profile.minimap
+        if not m then return "eui" end
+        v = (m.useClassicStyle and "classic") or (m.useBlizzardStyle and "blizzard") or "eui"
+        EBS._styleLatch = v
+    end
+    return v
+end
+-- Stock-art mode: true for both stock styles (the geometry, gating and
+-- placement they share).
+EBS._MinimapBlizz = function() return EBS._MinimapStyle() ~= "eui" end
+EBS._MinimapClassic = function() return EBS._MinimapStyle() == "classic" end
+-- Published on the module ns for the Style page and the profile-switch check.
+EllesmereUI._ModuleNS[ADDON_NAME].MinimapBlizz = EBS._MinimapBlizz
+EllesmereUI._ModuleNS[ADDON_NAME].MinimapStyle = EBS._MinimapStyle
+
+-- Zoom button anchor, shared by the apply pass and the SetPoint re-assert
+-- hooks: EUI stacks them at the bottom-right corner; the stock styles place
+-- them where their stock map does (offsets scale with the map size).
+EBS._ZoomAnchor = function(btn, isIn, minimap)
+    local p = EBS.db and EBS.db.profile.minimap
+    btn:ClearAllPoints()
+    local style = p and EBS._MinimapStyle() or "eui"
+    if style == "classic" then
+        -- Vanilla: MinimapZoomIn CENTER 69,-37 and MinimapZoomOut CENTER 43,-65
+        -- of the backdrop centred on the 140px map.
+        local s = (p.mapSize or 140) / 140
+        if isIn then
+            btn:SetPoint("CENTER", minimap, "CENTER", 69 * s, -37 * s)
+        else
+            btn:SetPoint("CENTER", minimap, "CENTER", 43 * s, -65 * s)
+        end
+    elseif style == "blizzard" then
+        local s = (p.mapSize or 140) / 198
+        if isIn then
+            btn:SetPoint("CENTER", minimap, "CENTER", 88 * s, -68 * s)
+        else
+            btn:SetPoint("CENTER", minimap, "CENTER", 72 * s, -84 * s)
+        end
+    else
+        btn:SetPoint("BOTTOMRIGHT", GetFFD(minimap).layoutFrame or minimap, "BOTTOMRIGHT", -2, isIn and 20 or 2)
+    end
+end
+
+-- A button's spot on the ring round the map (stock-style button row):
+-- radius r, angle t (radians, 0 = right, counter-clockwise), snapped to the
+-- physical grid at the row's effective scale.
+EBS._ArcPoint = function(btn, minimap, r, t, es)
+    btn:SetPoint("CENTER", minimap, "CENTER",
+        PP.SnapForES(r * math.cos(t), es), PP.SnapForES(r * math.sin(t), es))
+end
+
+-- Compass ring + top border bar. The compass lives on MinimapBackdrop, the
+-- Minimap's own child, which stays put and is only sized onto the map
+-- (method calls, no keys written). The bar is a frame of our own wearing the
+-- stock header kit: the cluster's BorderTop is a NineSlice with this layout,
+-- and moving Blizzard's frame here would drag the cluster children anchored
+-- to it (tracking, indicator frame, clock) along and inflate the cluster's
+-- Edit Mode layout rect. Idempotent per apply pass.
+EBS._ApplyBlizzMinimapChrome = function(minimap, mapSize)
+    local s = mapSize / 198
+    local d = GetFFD(minimap)
+    local compass = _G.MinimapCompassTexture
+    -- MinimapBackdrop is the Minimap's own child frame carrying the compass ring
+    -- (and the landing page button, which this module positions itself).
+    local backdrop = _G.MinimapBackdrop
+    if backdrop and backdrop ~= minimap then
+        if backdrop:GetParent() ~= minimap then backdrop:SetParent(minimap) end
+        backdrop:ClearAllPoints()
+        backdrop:SetPoint("CENTER", minimap, "CENTER", 0, 0)
+        backdrop:SetSize(215 * s, 226 * s)
+        backdrop:SetFrameLevel(minimap:GetFrameLevel() + 3)
+        backdrop:SetAlpha(1)
+        backdrop:Show()
+    end
+    if compass then
+        compass:ClearAllPoints()
+        compass:SetPoint("CENTER", minimap, "CENTER", 0, 0)
+        compass:SetSize(215 * s, 226 * s)
+        compass:SetAlpha(1)
+        compass:Show()
+    end
+    -- Top bar: the stock 175x16 kit, bottom edge 24px above the map's top,
+    -- centred 5px right of the map centre in the stock cluster; scaled, so
+    -- the offsets stay unscaled.
+    local header = d.blizzHeader
+    if not header then
+        header = CreateFrame("Frame", nil, minimap)
+        header:SetSize(175, 16)
+        header:EnableMouse(false)
+        if NineSliceUtil and NineSliceUtil.ApplyLayoutByName then
+            pcall(NineSliceUtil.ApplyLayoutByName, header, "UniqueCornersLayout", "ui-hud-minimap-button")
+        end
+        d.blizzHeader = header
+    end
+    header:ClearAllPoints()
+    header:SetPoint("BOTTOM", minimap, "TOP", 5, 24)
+    header:SetScale(s)
+    header:SetFrameLevel(minimap:GetFrameLevel() + 4)
+    header:Show()
+end
+
+-- Classic WoW UI: the stock zoom button wearing the vanilla button files at
+-- the vanilla 32px size, scaled with the map. Texture setters and SetSize
+-- only on this Blizzard button; the one-time skin is memoized in its lookup
+-- record. The vanilla files fill the whole button, so the atlas coordinates
+-- the stock art left behind are reset.
+EBS._ClassicZoomButton = function(btn, isIn, s)
+    btn:SetSize(32 * s, 32 * s)
+    local d = GetFFD(btn)
+    if d.classicSkin then return end
+    d.classicSkin = true
+    local base = isIn and "Interface\\Minimap\\UI-Minimap-ZoomInButton-" or "Interface\\Minimap\\UI-Minimap-ZoomOutButton-"
+    btn:SetNormalTexture(base .. "Up")
+    btn:SetPushedTexture(base .. "Down")
+    btn:SetDisabledTexture(base .. "Disabled")
+    btn:SetHighlightTexture("Interface\\Minimap\\UI-Minimap-ZoomButton-Highlight", "ADD")
+    local tex = btn:GetNormalTexture()
+    if tex then tex:SetTexCoord(0, 1, 0, 1) end
+    tex = btn:GetPushedTexture()
+    if tex then tex:SetTexCoord(0, 1, 0, 1) end
+    tex = btn:GetDisabledTexture()
+    if tex then tex:SetTexCoord(0, 1, 0, 1); tex:SetDesaturated(false) end
+    tex = btn:GetHighlightTexture()
+    if tex then tex:SetTexCoord(0, 1, 0, 1); tex:SetBlendMode("ADD") end
+end
+
+-- Classic WoW UI chrome: the vanilla UI-Minimap-Border file on two frames of
+-- ours. The ring: the 192x192 region the vanilla MinimapBorder draws, centred
+-- 8 left and 24 below the map centre (the art's circle sits on the map, the
+-- rest is the lower-left bulge), on a frame above the map like the vanilla
+-- backdrop, scaled by mapSize/140. The banner: the MinimapBorderTop strip
+-- (sheet rows 0..28, columns 80..256) on OUR header frame (the same header
+-- record the indicators, compartment and zone text anchor to), drawn in
+-- three pieces at the sheet's own pixel size -- the 36-column rounded left
+-- end, the 16-column right end and the middle stretched between them -- so
+-- it spans the map plus the vanilla 18 a side without growing taller on a
+-- big map; its bottom sits 4 above the map's top, under the map and ring as
+-- the cluster's own region is; its zone-text slot is a 12-tall box centred
+-- on the banner between the ends. Created once, re-anchored per apply pass.
+EBS._ApplyClassicMinimapChrome = function(minimap, mapSize)
+    local s = mapSize / 140
+    local d = GetFFD(minimap)
+    local ring = d.classicRing
+    if not ring then
+        ring = CreateFrame("Frame", nil, minimap)
+        ring:EnableMouse(false)
+        local tex = ring:CreateTexture(nil, "ARTWORK")
+        tex:SetAllPoints(ring)
+        tex:SetTexture("Interface\\Minimap\\UI-Minimap-Border")
+        tex:SetTexCoord(0.25, 1.0, 0.125, 0.875)
+        d.classicRing = ring
+    end
+    ring:ClearAllPoints()
+    ring:SetPoint("CENTER", minimap, "CENTER", -8 * s, -24 * s)
+    ring:SetSize(192 * s, 192 * s)
+    ring:SetFrameLevel(minimap:GetFrameLevel() + 3)
+    ring:Show()
+    local header = d.blizzHeader
+    if not header then
+        header = CreateFrame("Frame", nil, minimap)
+        header:EnableMouse(false)
+        local file = "Interface\\Minimap\\UI-Minimap-Border"
+        local capL = header:CreateTexture(nil, "ARTWORK")
+        capL:SetTexture(file)
+        capL:SetTexCoord(0.3125, 0.453125, 0.0, 0.109375)
+        capL:SetSize(36, 28)
+        capL:SetPoint("TOPLEFT", header, "TOPLEFT", 0, 0)
+        local capR = header:CreateTexture(nil, "ARTWORK")
+        capR:SetTexture(file)
+        capR:SetTexCoord(0.9375, 1.0, 0.0, 0.109375)
+        capR:SetSize(16, 28)
+        capR:SetPoint("TOPRIGHT", header, "TOPRIGHT", 0, 0)
+        local mid = header:CreateTexture(nil, "ARTWORK")
+        mid:SetTexture(file)
+        mid:SetTexCoord(0.453125, 0.9375, 0.0, 0.109375)
+        mid:SetPoint("TOPLEFT", capL, "TOPRIGHT", 0, 0)
+        mid:SetPoint("BOTTOMRIGHT", capR, "BOTTOMLEFT", 0, 0)
+        local slot = CreateFrame("Frame", nil, header)
+        slot:SetHeight(12)
+        slot:SetPoint("CENTER", header, "CENTER", 0, 1)
+        slot:EnableMouse(false)
+        header._zoneSlot = slot
+        d.blizzHeader = header
+    end
+    header:ClearAllPoints()
+    header:SetSize(mapSize + 36, 28)
+    header:SetPoint("BOTTOM", minimap, "TOP", 0, 4)
+    header._zoneSlot:SetWidth(math.max(40, mapSize + 36 - 52))
+    header:SetFrameLevel(math.max(0, minimap:GetFrameLevel() - 1))
+    header:Show()
+end
+
 local function ApplyMinimap()
     if TEMP_DISABLED.minimap then return end
     if InCombatLockdown() then QueueApplyAll(); return end
 
     local p = EBS.db.profile.minimap
     p.enabled = true
+    local blizz = EBS._MinimapBlizz()
 
     -- Rotate Minimap: enforce the CVar to match our setting (out of combat only).
     SetCVar("rotateMinimap", p.rotateMinimap and "1" or "0")
@@ -3981,17 +4557,22 @@ local function ApplyMinimap()
     -- Snapshot Blizzard's native size/position before we modify anything
     CaptureBlizzardMinimap()
 
-    -- Reparent to UIParent so MinimapCluster layout cannot override our size. Deferred
-    -- via C_Timer.After(0) to avoid tainting the secure frame environment when
+    -- Reparent out of MinimapCluster so its layout cannot override our size, and so the
+    -- native render is clipped by the frame we own rather than by Blizzard's cluster.
+    -- Deferred via C_Timer.After(0) to avoid tainting the secure frame environment when
     -- ApplyMinimap fires during a ShowUIPanel/World Map open -- that taint causes
     -- ADDON_ACTION_BLOCKED when the dungeon pin data provider later calls the protected SetPropagateMouseClicks() on map pins.
-    local needsReparent = minimap:GetParent() ~= UIParent
     local needsClusterHide = MinimapCluster and MinimapCluster:IsShown()
+    -- The rectangular canvas's parent is built later in this pass, so the first switch
+    -- to that shape has to schedule the reparent on the layout frame's absence.
+    local needsReparent = minimap:GetParent() ~= DesiredMapParent(minimap)
+        or ((p.shape or "square") == "rectangular" and not blizz and not GetFFD(minimap).layoutFrame)
     if needsReparent or needsClusterHide then
         C_Timer.After(0, function()
-            if InCombatLockdown() then return end
-            if needsReparent and minimap:GetParent() ~= UIParent then
-                minimap:SetParent(UIParent)
+            if InCombatLockdown() then QueueApplyAll(); return end
+            local want = DesiredMapParent(minimap)
+            if minimap:GetParent() ~= want then
+                minimap:SetParent(want)
             end
             if needsClusterHide and MinimapCluster then
                 MinimapCluster:SetAlpha(0)
@@ -3999,13 +4580,19 @@ local function ApplyMinimap()
             end
         end)
     end
-    -- Blizzard reparents the minimap during housing transitions and other events; hook SetParent to force it back to UIParent.
+    -- Blizzard reparents the minimap during housing transitions and other events; hook SetParent to force it back.
     if not GetFFD(minimap).parentGuard then
         GetFFD(minimap).parentGuard = true
         hooksecurefunc(minimap, "SetParent", function()
-            if minimap:GetParent() ~= UIParent then
-                if not InCombatLockdown() then
-                    minimap:SetParent(UIParent)
+            local want = DesiredMapParent(minimap)
+            if minimap:GetParent() ~= want then
+                if InCombatLockdown() then
+                    -- Dropping it would leave the map parented to -- and clipped by --
+                    -- whatever reparented it (the cluster, on a battleground or housing
+                    -- transition) for the rest of the session.
+                    QueueApplyAll()
+                else
+                    minimap:SetParent(want)
                 end
             end
         end)
@@ -4022,8 +4609,9 @@ local function ApplyMinimap()
             minimap:SetAlpha(1)
             minimap:Show()
         elseif vis == "mouseover" then
-            minimap:SetAlpha(0)
-            minimap:Show()
+            -- Idle state is a real Hide(), not alpha 0 -- see UpdateMinimapVisibility.
+            minimap:SetAlpha(1)
+            if minimap:IsMouseOver() then minimap:Show() else minimap:Hide() end
         elseif vis then
             minimap:SetAlpha(1)
             minimap:Show()
@@ -4061,6 +4649,7 @@ local function ApplyMinimap()
             end
             minimap:SetZoom(zoom)
             SaveZoomLevel()
+            RestartZoomResetTimer()
         end)
         -- Map-region hover reveal, entry-path-proof: the Minimap's motion focus follows
         -- its CIRCULAR hit region, so entering the square skin through a corner (or
@@ -4075,12 +4664,17 @@ local function ApplyMinimap()
 
     for _, name in ipairs(minimapDecorations) do
         local frame = _G[name]
-        if frame then frame:Hide() end
+        -- Blizzard Style keeps the stock compass ring (placed once the map has
+        -- its size); Classic WoW UI draws its own ring and hides it like EUI.
+        if frame and not (blizz and not EBS._MinimapClassic() and name == "MinimapCompassTexture") then frame:Hide() end
     end
     -- The addon compartment is placed (or parked) by EBS._ApplyAddonCompartment
     -- at the end of this pass, once the map has its final size and position.
 
-    local isCircle = (p.shape == "circle" or p.shape == "textured_circle")
+    local shape = p.shape or "square"
+    if blizz then shape = "circle" end  -- the stock map is round; the stored shape waits for the EUI look
+    local isCircle = (shape == "circle" or shape == "textured_circle")
+    local isRectangular = (shape == "rectangular")
 
     if GetFFD(minimap).bg then GetFFD(minimap).bg:SetAlpha(0) end
 
@@ -4093,9 +4687,62 @@ local function ApplyMinimap()
         minimap:SetQuestBlobRingScalar(isCircle and 1 or 0)
     end
 
-    if p.shape == "square" then
-        -- Square: shared border-style engine (solid = PP strips, textured = BackdropTemplate)
-        -- on a dedicated host frame -- the engine shows/hides the host freely, so it must never be the Minimap itself.
+    minimap:SetScale(1.0)
+    local mapSize = p.mapSize or 140
+    -- Blizzard's map projection and native player arrow require a square Minimap
+    -- canvas. Rectangular mode therefore crops that square canvas with a centered
+    -- 4:3 mask; resizing the Blizzard frame itself makes the terrain slide away
+    -- from the arrow as zoom changes.
+    minimap:SetSize(mapSize, mapSize)
+    local maskID = isCircle and 186178
+        or (isRectangular and "Interface\\AddOns\\EllesmereUIMinimap\\Media\\minimap_rectangular-crop-mask.tga")
+        or 130937
+    minimap:SetMaskTexture(maskID)
+    if isRectangular then
+        local cropInset = mapSize * 32 / 256
+        minimap:SetHitRectInsets(0, 0, cropInset, cropInset)
+    else
+        minimap:SetHitRectInsets(0, 0, 0, 0)
+    end
+    if isRectangular and not GetFFD(minimap).layoutFrame then
+        local layout = CreateFrame("Frame", nil, UIParent)
+        layout:EnableMouse(false)
+        GetFFD(minimap).layoutFrame = layout
+    end
+    do
+        local layout = GetFFD(minimap).layoutFrame
+        if layout then
+            -- Re-anchored every pass for the reason the border host below is: this
+            -- anchor spans the deferred SetParent that hangs the canvas off it.
+            layout:ClearAllPoints()
+            layout:SetPoint("CENTER", minimap, "CENTER")
+            layout:SetSize(mapSize, isRectangular and (mapSize * 192 / 256) or mapSize)
+            layout:SetFrameLevel(minimap:GetFrameLevel())
+        end
+    end
+    do
+        local blocker = GetFFD(minimap).pingBlocker
+        if blocker then
+            blocker:ClearAllPoints()
+            blocker:SetAllPoints(GetFFD(minimap).layoutFrame or minimap)
+        end
+    end
+
+    if blizz then
+        -- Stock styles: the stock chrome (compass ring + top bar, or the vanilla
+        -- ring + banner) instead of any EUI border.
+        if EBS._MinimapClassic() then
+            EBS._ApplyClassicMinimapChrome(minimap, mapSize)
+        else
+            EBS._ApplyBlizzMinimapChrome(minimap, mapSize)
+        end
+        if GetFFD(minimap).borderHost then GetFFD(minimap).borderHost:Hide() end
+        if GetFFD(minimap).circBorder then GetFFD(minimap).circBorder:Hide() end
+        if GetFFD(minimap).texCircBorder then GetFFD(minimap).texCircBorder:Hide() end
+    elseif not isCircle then
+        -- Square / Rectangular: shared border-style engine (solid = PP strips, textured =
+        -- BackdropTemplate) on a dedicated host frame -- the engine shows/hides the host
+        -- freely, so it must never be the Minimap itself.
         local bs = p.borderSize or 1
         local host = GetFFD(minimap).borderHost
         if not host then
@@ -4113,15 +4760,17 @@ local function ApplyMinimap()
         -- creation made it permanent for the session, tracking how much else was loading
         -- at login rather than the actual setting. Re-setting the points forces a layout recompute; harmless no-op otherwise.
         host:ClearAllPoints()
-        host:SetAllPoints(minimap)
+        host:SetAllPoints(GetFFD(minimap).layoutFrame or minimap)
         -- Same level as the minimap keeps the border under all child buttons; Show Behind drops it under the map surface for the Shadow style.
         host:SetFrameLevel(p.borderBehind and math.max(0, minimap:GetFrameLevel() - 1) or minimap:GetFrameLevel())
         host:SetAlpha(1)
+        -- Exact size beside the legacy step (nil = the legacy path unchanged).
+        local px = EllesmereUI.BorderPx(p.borderSizePx, bs, p.borderTexture or "solid")
         EllesmereUI.ApplyBorderStyle(host, bs, r, g, b, borderA,
             p.borderTexture or "solid",
             p.borderTextureOffset, p.borderTextureOffsetY,
             p.borderTextureShiftX, p.borderTextureShiftY,
-            "minimap", bs)
+            "minimap", bs, nil, px)
         if GetFFD(minimap).circBorder then GetFFD(minimap).circBorder:Hide() end
         if GetFFD(minimap).texCircBorder then GetFFD(minimap).texCircBorder:Hide() end
     elseif p.shape == "circle" then
@@ -4186,30 +4835,34 @@ local function ApplyMinimap()
         EllesmereUI.RegAccent({ type = "callback", fn = GetFFD(minimap).accentBorderCB })
     end
 
-    minimap:SetScale(1.0)
-    local mapSize = p.mapSize or 140
-    minimap:SetSize(mapSize, mapSize)
-    local maskID = isCircle and 186178 or 130937
-    minimap:SetMaskTexture(maskID)
     -- Custom housing overlay: our own texture behind the minimap showing the housing indoor map when Blizzard hides the real content. No Blizzard frame manipulation.
     if not GetFFD(minimap).housingTex then
         local frame = CreateFrame("Frame", nil, minimap)
-        frame:SetAllPoints(minimap)
+        frame:SetAllPoints(GetFFD(minimap).layoutFrame or minimap)
         frame:SetFrameLevel(minimap:GetFrameLevel() + 1)
         local tex = frame:CreateTexture(nil, "ARTWORK")
         if isCircle then
             local inset = -mapSize * 0.10
             tex:SetPoint("TOPLEFT", frame, "TOPLEFT", inset, -inset)
             tex:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -inset, inset)
+        elseif isRectangular then
+            tex:SetSize(mapSize, mapSize)
+            tex:SetPoint("CENTER", frame, "CENTER")
         else
             tex:SetAllPoints(frame)
         end
-        if isCircle then
+        if isCircle or isRectangular then
             local mask = frame:CreateMaskTexture()
             mask:SetAllPoints(frame)
-            mask:SetTexture(maskID)
+            -- The housing frame already has the visible 4:3 dimensions. It uses
+            -- the full rectangular mask, while the square Blizzard canvas uses
+            -- the centered crop mask above.
+            mask:SetTexture(isRectangular
+                and "Interface\\AddOns\\EllesmereUIMinimap\\Media\\minimap_rectangular-mask.blp"
+                or maskID)
             tex:AddMaskTexture(mask)
             frame._mask = mask
+            frame._maskAttached = true
         end
         frame._isCircle = isCircle
         frame._tex = tex
@@ -4242,6 +4895,7 @@ local function ApplyMinimap()
                     frame:Hide()
                 end
             end
+            GetFFD(minimap).checkHousing = CheckHousing
             -- Check on zone transitions
             if not GetFFD(minimap).housingZoneHook then
                 GetFFD(minimap).housingZoneHook = true
@@ -4255,21 +4909,62 @@ local function ApplyMinimap()
             end
         end
     else
-        -- Update existing housing frame on reapply
+        -- Update existing housing frame on reapply (shape/mask can change live).
         local frame = GetFFD(minimap).housingFrame
         if frame then
+            frame:ClearAllPoints()
+            frame:SetAllPoints(GetFFD(minimap).layoutFrame or minimap)
             frame:SetFrameLevel(minimap:GetFrameLevel() + 1)
-            if frame._mask then
-                frame._mask:SetTexture(maskID)
-            elseif not isCircle and frame._mask then
-                -- Switched to square, remove mask
+            frame._isCircle = isCircle
+            if frame._tex then
+                frame._tex:ClearAllPoints()
+                if isCircle then
+                    local inset = -mapSize * 0.10
+                    frame._tex:SetPoint("TOPLEFT", frame, "TOPLEFT", inset, -inset)
+                    frame._tex:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -inset, inset)
+                elseif isRectangular then
+                    frame._tex:SetSize(mapSize, mapSize)
+                    frame._tex:SetPoint("CENTER", frame, "CENTER")
+                else
+                    frame._tex:SetAllPoints(frame)
+                end
+            end
+            if isCircle or isRectangular then
+                if not frame._mask then
+                    local mask = frame:CreateMaskTexture()
+                    mask:SetAllPoints(frame)
+                    frame._mask = mask
+                end
+                if frame._tex and not frame._maskAttached then
+                    frame._tex:AddMaskTexture(frame._mask)
+                    frame._maskAttached = true
+                end
+                frame._mask:SetTexture(isRectangular
+                    and "Interface\\AddOns\\EllesmereUIMinimap\\Media\\minimap_rectangular-mask.blp"
+                    or maskID)
+                frame._mask:Show()
+            elseif frame._mask then
+                if frame._tex and frame._maskAttached then
+                    pcall(frame._tex.RemoveMaskTexture, frame._tex, frame._mask)
+                    frame._maskAttached = false
+                end
+                frame._mask:Hide()
             end
         end
     end
-    -- Clamp to screen so the border never extends off-screen
+    -- Shape changes do not fire a zone event. Reuse the existing housing detector
+    -- so atlas/texture selection follows the new shape immediately.
+    if GetFFD(minimap).checkHousing then GetFFD(minimap).checkHousing() end
+    -- Clamp to the visible shape. Rectangular mode keeps a square native canvas,
+    -- so allow only its hidden top/bottom strips beyond the screen bounds.
     minimap:SetClampedToScreen(true)
-    local bInset = isCircle and (p.borderSize or 1) or 0
-    minimap:SetClampRectInsets(-bInset, bInset, bInset, -bInset)
+    if isRectangular then
+        local cropInset = mapSize * 32 / 256
+        minimap:SetClampRectInsets(0, 0, -cropInset, cropInset)
+    else
+        local bInset = isCircle and (p.borderSize or 1) or 0
+        minimap:SetClampRectInsets(-bInset, bInset, bInset, -bInset)
+    end
     -- Force the engine to re-render at the new size: nudge zoom, restore same frame.
     local curZoom = minimap:GetZoom()
     minimap:SetZoom(curZoom > 0 and 0 or 1)
@@ -4289,8 +4984,8 @@ local function ApplyMinimap()
     if zoomIn then
         zoomIn:SetParent(hideZoom and EBS._hiddenFrame or minimap)
         zoomIn:SetFrameLevel(minimap:GetFrameLevel() + 10)
-        zoomIn:ClearAllPoints()
-        zoomIn:SetPoint("BOTTOMRIGHT", minimap, "BOTTOMRIGHT", -2, 20)
+        EBS._ZoomAnchor(zoomIn, true, minimap)
+        if EBS._MinimapClassic() then EBS._ClassicZoomButton(zoomIn, true, mapSize / 140) end
         zoomIn:EnableMouse(true)
         zoomIn:SetAlpha(1)
         -- Start in Blizzard's between-hovers state (hidden; hover handlers Show/Hide on map enter/leave) so it is not visible from /reload until hovered.
@@ -4299,8 +4994,7 @@ local function ApplyMinimap()
             hooksecurefunc(zoomIn, "SetPoint", function(self)
                 if GetFFD(self).inHook then return end
                 GetFFD(self).inHook = true
-                self:ClearAllPoints()
-                self:SetPoint("BOTTOMRIGHT", minimap, "BOTTOMRIGHT", -2, 20)
+                EBS._ZoomAnchor(self, true, minimap)
                 GetFFD(self).inHook = false
             end)
             GetFFD(zoomIn).hooked = true
@@ -4309,8 +5003,8 @@ local function ApplyMinimap()
     if zoomOut then
         zoomOut:SetParent(hideZoom and EBS._hiddenFrame or minimap)
         zoomOut:SetFrameLevel(minimap:GetFrameLevel() + 10)
-        zoomOut:ClearAllPoints()
-        zoomOut:SetPoint("BOTTOMRIGHT", minimap, "BOTTOMRIGHT", -2, 2)
+        EBS._ZoomAnchor(zoomOut, false, minimap)
+        if EBS._MinimapClassic() then EBS._ClassicZoomButton(zoomOut, false, mapSize / 140) end
         zoomOut:EnableMouse(true)
         zoomOut:SetAlpha(1)
         -- Same between-hovers start as ZoomIn above
@@ -4319,8 +5013,7 @@ local function ApplyMinimap()
             hooksecurefunc(zoomOut, "SetPoint", function(self)
                 if GetFFD(self).inHook then return end
                 GetFFD(self).inHook = true
-                self:ClearAllPoints()
-                self:SetPoint("BOTTOMRIGHT", minimap, "BOTTOMRIGHT", -2, 2)
+                EBS._ZoomAnchor(self, false, minimap)
                 GetFFD(self).inHook = false
             end)
             GetFFD(zoomOut).hooked = true
@@ -4346,11 +5039,11 @@ local function ApplyMinimap()
     end
 
     if zoomIn and not GetFFD(zoomIn).zoomSaveHooked then
-        zoomIn:HookScript("OnClick", function() SaveZoomLevel() end)
+        zoomIn:HookScript("OnClick", function() SaveZoomLevel(); RestartZoomResetTimer() end)
         GetFFD(zoomIn).zoomSaveHooked = true
     end
     if zoomOut and not GetFFD(zoomOut).zoomSaveHooked then
-        zoomOut:HookScript("OnClick", function() SaveZoomLevel() end)
+        zoomOut:HookScript("OnClick", function() SaveZoomLevel(); RestartZoomResetTimer() end)
         GetFFD(zoomOut).zoomSaveHooked = true
     end
 
@@ -4446,7 +5139,7 @@ local function ApplyMinimap()
         end
         local cpt, crel, cbx, cby = ResolveElementAnchor(p.clockPosition or "top", clockMode, isCircle)
         clockBg:ClearAllPoints()
-        clockBg:SetPoint(cpt, minimap, crel, cbx + cxOff, cby + cyOff)
+        clockBg:SetPoint(cpt, GetFFD(minimap).layoutFrame or minimap, crel, cbx + cxOff, cby + cyOff)
         -- Align the TEXT edge with the anchor so it lands where the coordinates text
         -- would: inside style pins text to the same wrapper corner the wrapper pins to
         -- the map (wrapper is wider, so centered text would drift toward the middle); edge style keeps it centered in the box.
@@ -4521,7 +5214,7 @@ local function ApplyMinimap()
             local mp = EBS.db and EBS.db.profile.minimap
             if not mp or not mp.enabled then return end
             SyncIndicatorVisibility()
-            LayoutIndicatorFrames(minimap, mp, (mp.shape or "square") ~= "square")
+            LayoutIndicatorFrames(minimap, mp, mp.shape == "circle" or mp.shape == "textured_circle")
         end
         hooksecurefunc(mailFrame, "Show", onMailChange)
         hooksecurefunc(mailFrame, "Hide", onMailChange)
@@ -4532,7 +5225,7 @@ local function ApplyMinimap()
             local mp = EBS.db and EBS.db.profile.minimap
             if not mp or not mp.enabled then return end
             SyncIndicatorVisibility()
-            LayoutIndicatorFrames(minimap, mp, (mp.shape or "square") ~= "square")
+            LayoutIndicatorFrames(minimap, mp, mp.shape == "circle" or mp.shape == "textured_circle")
         end
         hooksecurefunc(craftingFrame, "Show", onCraftChange)
         hooksecurefunc(craftingFrame, "Hide", onCraftChange)
@@ -4568,12 +5261,22 @@ local function ApplyMinimap()
         end
         local lpt, lrel, lbx, lby = ResolveElementAnchor(p.locationPosition or "bottom", locationMode, isCircle)
         locationBg:ClearAllPoints()
-        locationBg:SetPoint(lpt, minimap, lrel, lbx + lxOff, lby + lyOff)
+        locationBg:SetPoint(lpt, GetFFD(minimap).layoutFrame or minimap, lrel, lbx + lxOff, lby + lyOff)
         -- Align the TEXT edge with the anchor (see the clock block above): inside pins it to the wrapper corner matching the map anchor, edge keeps it centered.
         locationFrame:ClearAllPoints()
         if locationMode == "inside" then
             locationFrame:SetPoint(lpt, locationBg, lpt, 0, 0)
         else
+            locationFrame:SetPoint("CENTER", locationBg, "CENTER", 0, 0)
+        end
+        if blizz and GetFFD(minimap).blizzHeader then
+            -- Stock styles: the zone text rides the top bar -- the banner's text
+            -- slot under Classic WoW UI (offsets still apply).
+            local hdr = GetFFD(minimap).blizzHeader
+            locationBg:SetBackdropColor(0, 0, 0, 0)
+            locationBg:ClearAllPoints()
+            locationBg:SetPoint("CENTER", hdr._zoneSlot or hdr, "CENTER", lxOff, lyOff)
+            locationFrame:ClearAllPoints()
             locationFrame:SetPoint("CENTER", locationBg, "CENTER", 0, 0)
         end
         local ls = p.locationScale or 1.15
@@ -4598,7 +5301,7 @@ local function ApplyMinimap()
     local cpx = p and p.coordsBelowOffsetX or 0
     local cpy = p and p.coordsBelowOffsetY or 0
     coordFrame:ClearAllPoints()
-    coordFrame:SetPoint(cpAnchor[1], minimap, cpAnchor[2], cpAnchor[3] + cpx, cpAnchor[4] + cpy)
+    coordFrame:SetPoint(cpAnchor[1], GetFFD(minimap).layoutFrame or minimap, cpAnchor[2], cpAnchor[3] + cpx, cpAnchor[4] + cpy)
     coordFrame:SetScale(p and p.coordsScale or 1.0)
     _G._EBS_CoordFrame = coordFrame
     if not coordTicker then
@@ -4750,7 +5453,7 @@ local function ApplyMinimap()
         local fAnchor = MAP_POS_ANCHORS[p.fpsPosition or "bottomLeft"] or MAP_POS_ANCHORS.bottomLeft
         -- One evenly spaced chain at natural widths; the anchored corner is the stable edge the row breathes from.
         fpsBg:ClearAllPoints()
-        fpsBg:SetPoint(fAnchor[1], minimap, fAnchor[2],
+        fpsBg:SetPoint(fAnchor[1], GetFFD(minimap).layoutFrame or minimap, fAnchor[2],
             fAnchor[3] + (p.fpsOffsetX or 0), fAnchor[4] + (p.fpsOffsetY or 0))
         fpsBg:SetScale(p.fpsScale or 1.0)
         _G._EBS_FpsBg = fpsBg
@@ -4850,7 +5553,7 @@ local function ApplyMinimap()
         ApplyMinimapFont(fs, p.diffTextSize or 12)
         local a = MAP_POS_ANCHORS[p.diffTextPosition or "topLeft"] or MAP_POS_ANCHORS.topLeft
         fs:ClearAllPoints()
-        fs:SetPoint(a[1], minimap, a[2], a[3] + (p.diffTextOffsetX or 0), a[4] + (p.diffTextOffsetY or 0))
+        fs:SetPoint(a[1], GetFFD(minimap).layoutFrame or minimap, a[2], a[3] + (p.diffTextOffsetX or 0), a[4] + (p.diffTextOffsetY or 0))
         fs:Show()
         diffTextFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
         diffTextFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
@@ -4879,6 +5582,11 @@ local function ApplyMinimap()
             minimap:SetZoom(saved)
         end
     end
+
+    -- Re-arm (or disarm) the Auto Zoom Reset timer on every apply, so
+    -- enabling it or changing the seconds slider in the options takes
+    -- effect immediately.
+    RestartZoomResetTimer()
 
     -- Position: only set on first activation; after that, unlock mode owns positioning.
     if not GetFFD(minimap).active then
@@ -4920,6 +5628,16 @@ local _mmDriverStr
 
 -- Compile the profile's selection into macro-conditional grammar for the secure driver, or nil when it cannot be expressed as one.
 local function MinimapDriverString(p, vm)
+    -- An applied Visibility override replaces the whole setting: a constant, and the
+    -- shared selection underneath never reaches the driver.
+    local visOv = EllesmereUI.VisOverrideValue and EllesmereUI.VisOverrideValue(p)
+    if visOv then return (visOv == "never") and "hide" or "show" end
+    -- Any match: Lua-only lanes (instances, housing, skyriding mount) are resolved at
+    -- build time (caller runs out of combat only); a later zone/mount edge re-runs the
+    -- dispatcher and re-registers the string.
+    if p.visibilityMatch == "any" and EllesmereUI.BuildAnyMatchTail then
+        return (EllesmereUI.BuildAnyMatchTail(p, "visibility", vm))
+    end
     if vm then
         return EllesmereUI.BuildVisibilityDriverString
             and EllesmereUI.BuildVisibilityDriverString("", vm)
@@ -4974,8 +5692,13 @@ local function UpdateMinimapVisibility()
     if InCombatLockdown() then return end
     local vis = EllesmereUI.EvalVisibility(p)
     if vis == "mouseover" then
-        minimap:SetAlpha(0)
-        minimap:Show()
+        -- Mouseover idle is a real Hide(), not alpha 0: frame alpha does not cover
+        -- everything drawn on this frame, so an alpha-0 map still left its icons on
+        -- screen until the first hover. Hide() is also exactly what the shared
+        -- mouseover poll applies, so both ends of the mode agree. Shown (not hidden)
+        -- while the cursor already sits on the map, so a re-apply mid-hover cannot blink.
+        minimap:SetAlpha(1)
+        if minimap:IsMouseOver() then minimap:Show() else minimap:Hide() end
     elseif vis then
         minimap:SetAlpha(1)
         minimap:Show()
@@ -5097,8 +5820,9 @@ do
                 end)
 
                 y = y - BUTTON_H
-            else
-                -- Secure click passthrough to a Blizzard MicroButton
+            elseif EllesmereUI.SecureSnippetsOK() then
+                -- Secure click passthrough to a Blizzard MicroButton (the
+                -- entry is skipped where snippets cannot compile: WoW Forever beta)
                 local microRef = item.microButton and _G[item.microButton]
                 local btnName = "EUI_MicroMenu_" .. item.text:gsub("%s", "")
                 local btn = CreateFrame("Button", btnName, menuFrame, "SecureActionButtonTemplate,SecureHandlerStateTemplate")
@@ -5189,6 +5913,14 @@ function EBS:OnInitialize()
                 mp.hidePortals = nil
             end
         end
+        -- WoW Forever has no Great Vault: a saved "vault" hover tooltip (clock or
+        -- FPS readout) falls back to none there, since both hover and click paths
+        -- would otherwise open a vault that does not exist. The options dropdowns
+        -- do not offer the choice on that client.
+        if EllesmereUI.IS_FOREVER then
+            if mp.clockHoverTooltip == "vault" then mp.clockHoverTooltip = "none" end
+            if mp.fpsHoverTooltip == "vault" then mp.fpsHoverTooltip = "none" end
+        end
     end
 
     -- Full rebuild: wipes cached button state so the next ApplyMinimap re-snapshots native sizes/textures (as if /reload). Used by btnBackgrounds and ungrouping.
@@ -5277,6 +6009,8 @@ function EBS:OnEnable()
                 noAnchorTo = true,
                 getFrame = function() return Minimap end,
                 getSize  = function()
+                    local layout = GetFFD(Minimap).layoutFrame
+                    if layout then return layout:GetWidth(), layout:GetHeight() end
                     return Minimap:GetWidth(), Minimap:GetHeight()
                 end,
                 isHidden = function()

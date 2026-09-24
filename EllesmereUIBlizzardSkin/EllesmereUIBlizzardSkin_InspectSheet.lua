@@ -7,6 +7,9 @@ if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_C
 -------------------------------------------------------------------------------
 local ADDON_NAME, ns = ...
 local skinned = false
+local GetItemInfo = C_Item.GetItemInfo
+local GetItemInfoInstant = C_Item.GetItemInfoInstant
+local GetItemQualityColor = C_Item.GetItemQualityColor
 
 -- External weak-keyed lookup table for frame state (prevents tainting Blizzard frames)
 local FFD = setmetatable({}, { __mode = "k" })
@@ -73,6 +76,8 @@ local INSPECT_ENCHANT_SLOTS = {
     [INVSLOT_FINGER1] = true,
     [INVSLOT_FINGER2] = true,
     [INVSLOT_MAINHAND] = true,
+    -- INVSLOT_OFFHAND deliberately absent: checked dynamically below (weapon vs.
+    -- shield/held item), like CharacterSheet.
 }
 
 -- Drop every label a previous styling pass left on this slot. The widgets
@@ -173,6 +178,10 @@ local function EUI_UpdateSlotStyle(slotName, slotID, textOverlayFrame, isRightCo
         local enchantSize = EllesmereUIDB and EllesmereUIDB.charSheetEnchantSize or 9
         local enchantText = EllesmereUI.GetEnchantText(slotID, inspectUnit)
         local canHaveEnchant = INSPECT_ENCHANT_SLOTS[slotID]
+        if slotID == INVSLOT_OFFHAND then
+            local _, _, _, _, _, classID = GetItemInfoInstant(itemLink)
+            canHaveEnchant = (classID == Enum.ItemClass.Weapon)
+        end
         local inspLvl = UnitLevel(inspectUnit)
         local atEnchantLevel = inspLvl and not (issecretvalue and issecretvalue(inspLvl)) and inspLvl >= 90 or false
         local isMissing = atEnchantLevel and canHaveEnchant and itemLink and (enchantText == "" or not enchantText)
@@ -355,6 +364,9 @@ local function SkinInspectSheet()
         local BASE_V = BASE_B - BASE_T
         local function UpdateBgTexCoords()
             local fw, fh = frame:GetSize()
+            -- Secrecy test BEFORE the zero check: that check is itself a
+            -- comparison and throws on a secret size. Matches the engine.
+            if issecretvalue and (issecretvalue(fw) or issecretvalue(fh)) then return end
             if fw == 0 or fh == 0 then return end
             local frameAspect = fw / fh
             if frameAspect > BG_ASPECT then
@@ -367,9 +379,9 @@ local function SkinInspectSheet()
                 bg:SetTexCoord(BASE_L + trimU, BASE_R - trimU, BASE_T, BASE_B)
             end
         end
-        hooksecurefunc(frame, "SetSize", UpdateBgTexCoords)
-        hooksecurefunc(frame, "SetWidth", UpdateBgTexCoords)
-        hooksecurefunc(frame, "SetHeight", UpdateBgTexCoords)
+        -- One script hook instead of three setter hooks; also fires for
+        -- anchor-driven resizes (same shape as WSkin.Shell).
+        frame:HookScript("OnSizeChanged", UpdateBgTexCoords)
         UpdateBgTexCoords()
         -- Follows the Character Sheet window's style pick (the two share one
         -- enable + style setting).
@@ -1104,7 +1116,7 @@ local DOCK_MARGIN = 4
 -- since secure repositioning of a protected frame is blocked in combat.
 local securePositioner = CreateFrame("Frame", nil, UIParent, "SecureHandlerBaseTemplate")
 local function SecureSetPoint(frame, point, relPoint, x, y)
-    if InCombatLockdown() then return false end
+    if InCombatLockdown() or not EllesmereUI.SecureSnippetsOK() then return false end
     securePositioner:SetFrameRef("f", frame)
     securePositioner:SetAttribute("p", point)
     securePositioner:SetAttribute("rp", relPoint)

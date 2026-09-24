@@ -1,4 +1,5 @@
 if EUI_CLIENT_BLOCKED then return end -- pre-12.1 client failsafe (EllesmereUI_ClientGate.lua)
+if EllesmereUI and EllesmereUI.IS_FOREVER then return end -- no item upgrade system on WoW Forever: no frame, no DB, no equipment listener; the QoL Upgrader tab is not registered there (every reader of EUIUpgCalc / EUIUpgCalcFrame nil-guards)
 -------------------------------------------------------------------------------
 --  EUI_UpgradeCalc.lua  (part of EllesmereUIQoL)
 --  Gear upgrade planner: data tables, game logic, and calculator UI.
@@ -614,7 +615,70 @@ f:SetFrameStrata("DIALOG")
 f:SetMovable(true)
 f:EnableMouse(true)
 f:RegisterForDrag("LeftButton")
-f:SetScript("OnDragStart", function(self) self:StartMoving() end)
+
+-- Session snap: dock beside CharacterFrame on each open until the user drags.
+local _sessionUnpinned = false
+local _cfSnapHooked = false
+
+local function ShouldSnapToCharacterFrame()
+    if _sessionUnpinned then return false end
+    local cf = _G.CharacterFrame
+    return cf ~= nil and cf:IsShown()
+end
+
+local function DockToCharacterFrame()
+    local cf = _G.CharacterFrame
+    if not cf or not cf:IsShown() then return end
+    local margin = 4
+    local cs = cf:GetEffectiveScale() or 1
+    local es = f:GetEffectiveScale() or 1
+    local ues = UIParent:GetEffectiveScale() or 1
+    local wAbs = (f:GetWidth() or 0) * es
+    local leftRoom = (cf:GetLeft() or 0) * cs
+    local rightRoom = (GetScreenWidth() or 0) * ues - (cf:GetRight() or 0) * cs
+    local minRoom = wAbs + margin * es
+    local leftFits = leftRoom >= minRoom
+    local rightFits = rightRoom >= minRoom
+    local dockLeft
+    if rightFits then
+        dockLeft = false
+    elseif leftFits then
+        dockLeft = true
+    else
+        dockLeft = leftRoom >= rightRoom
+    end
+    f:ClearAllPoints()
+    if dockLeft then
+        f:SetPoint("TOPRIGHT", cf, "TOPLEFT", -margin, 0)
+    else
+        f:SetPoint("TOPLEFT", cf, "TOPRIGHT", margin, 0)
+    end
+end
+
+local function TrySnapToCharacterFrame()
+    if f:IsShown() and ShouldSnapToCharacterFrame() then
+        DockToCharacterFrame()
+    end
+end
+
+local function InstallCharacterFrameSnapHooks()
+    if _cfSnapHooked then return end
+    local cf = _G.CharacterFrame
+    if not cf then return end
+    _cfSnapHooked = true
+    cf:HookScript("OnShow", TrySnapToCharacterFrame)
+    hooksecurefunc(cf, "SetPoint", function()
+        TrySnapToCharacterFrame()
+    end)
+    hooksecurefunc(cf, "SetScale", function()
+        TrySnapToCharacterFrame()
+    end)
+end
+
+f:SetScript("OnDragStart", function(self)
+    _sessionUnpinned = true
+    self:StartMoving()
+end)
 f:SetScript("OnDragStop",  function(self) self:StopMovingOrSizing() end)
 f:Hide()
 
@@ -1689,6 +1753,8 @@ f:SetScript("OnShow", function()
     if IsLocked() then f:Hide(); return end
     Calc.ApplyBgOpacity()
     Calc.ApplyScale()
+    InstallCharacterFrameSnapHooks()
+    TrySnapToCharacterFrame()
     -- Reload persisted crest manual-add offsets each time the frame opens,
     -- so that values the user set before logging out are visible immediately.
     local dbAdds = DB().crestManualAdds
@@ -1701,6 +1767,7 @@ f:SetScript("OnShow", function()
 end)
 f:SetScript("OnHide", function()
     equipListener:UnregisterAllEvents()
+    _sessionUnpinned = false
     -- Cancel any pending equipment-change debounce.
     if _equipDebounce then _equipDebounce:Cancel(); _equipDebounce = nil end
     -- If hidden mid-scan (e.g. combat, /reload), unblock future scans.

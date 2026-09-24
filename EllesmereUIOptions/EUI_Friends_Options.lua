@@ -74,43 +74,6 @@ initFrame:SetScript("OnEvent", function(self)
     end
 
     ---------------------------------------------------------------------------
-    --  Visibility row builder (reused across all pages)
-    ---------------------------------------------------------------------------
-    local PP = EllesmereUI.PP
-    local function BuildVisibilityRow(W, parent, y, getCfg, refreshFn)
-        local visRow, visH = EllesmereUI.BuildVisibilityModeRow(W, parent, y,
-            { getStore = getCfg, legacyKey = "visibility",
-              caps = { partyIncludesRaid = false, luaDragonriding = true },
-              onChanged = function()
-                  if refreshFn then refreshFn() end
-                  if _G._EBS_UpdateVisibility then _G._EBS_UpdateVisibility() end
-              end },
-            { type="dropdown", text="Visibility Options",
-              values={ __placeholder = "..." }, order={ "__placeholder" },
-              getValue=function() return "__placeholder" end,
-              setValue=function() end })
-        do
-            local rightRgn = visRow._rightRegion
-            if rightRgn._control then rightRgn._control:Hide() end
-            local cbDD, cbDDRefresh = EllesmereUI.BuildVisOptsCBDropdown(
-                rightRgn, 210, rightRgn:GetFrameLevel() + 2,
-                EllesmereUI.VIS_OPT_ITEMS,
-                function(k) local c = getCfg(); return c and c[k] or false end,
-                function(k, v)
-                    local c = getCfg(); if not c then return end
-                    c[k] = v
-                    if _G._EBS_UpdateVisibility then _G._EBS_UpdateVisibility() end
-                    EllesmereUI:RefreshPage()
-                end)
-            PP.Point(cbDD, "RIGHT", rightRgn, "RIGHT", -20, 0)
-            rightRgn._control = cbDD
-            rightRgn._lastInline = nil
-            EllesmereUI.RegisterWidgetRefresh(cbDDRefresh)
-        end
-        return visH
-    end
-
-    ---------------------------------------------------------------------------
     --  Border color multiSwatch builder
     ---------------------------------------------------------------------------
     local function MakeBorderSwatch(getCfg, refreshFn)
@@ -232,6 +195,14 @@ initFrame:SetScript("OnEvent", function(self)
         return cogBtn
     end
 
+    -- Live repaint after a display toggle: the legacy list's row pass, plus a
+    -- decoration-only pass over the 12.1 cards (never Blizzard's view:Refresh,
+    -- which regenerates the list data from our execution and taints whispers).
+    local function RepaintFriendRows()
+        if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
+        if _G._EFR_RedecorateTiles then _G._EFR_RedecorateTiles() end
+    end
+
     local function BuildFriendsPage(pageName, parent, yOffset)
         local W = EllesmereUI.Widgets
         local y = yOffset
@@ -239,9 +210,21 @@ initFrame:SetScript("OnEvent", function(self)
 
         EllesmereUI:ClearContentHeader()
 
+        -- Stock styles (Blizzard Style / Classic WoW UI) keep Blizzard's own
+        -- window and rows on either friends window (12.1 Social UI or the
+        -- legacy one) and add the class icon, class-coloured name and region
+        -- mark to them, so those rows and auto-accept stay. The border and
+        -- accent rows drive only the EllesmereUI skin of the legacy window,
+        -- faction banners also the 12.1 tiles; all three hide under stock.
+        local BS = EllesmereUI.BlizzStyle
+        local function Gate(cfg)
+            if BS then BS.Gate("friends", cfg) end
+            return cfg
+        end
 
         -- DISPLAY
         _, h = W:SectionHeader(parent, "DISPLAY", y);  y = y - h
+        if BS then y = BS.Note(parent, y, "friends") end
 
         -- Class Icon Theme | Class Color Names
         _, h = W:DualRow(parent, y,
@@ -254,28 +237,28 @@ initFrame:SetScript("OnEvent", function(self)
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.iconStyle = v
-                if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
+                RepaintFriendRows()
               end },
             { type="toggle", text="Class Color Names",
               getValue=function() local f = FriendsDB(); return f and f.classColorNames end,
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.classColorNames = v
-                if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
+                RepaintFriendRows()
               end }
         );  y = y - h
 
         -- Border Size | Border Color
         _, h = W:DualRow(parent, y,
-            { type="slider", text="Border Size", min=0, max=4, step=1,
+            Gate({ type="slider", text="Border Size", min=0, max=4, step=1,
               getValue=function() local f = FriendsDB(); return f and f.borderSize or 0 end,
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.borderSize = v
                 RefreshFriends()
                 EllesmereUI:RefreshPage()
-              end },
-            { type="multiSwatch", text="Border Color",
+              end }),
+            Gate({ type="multiSwatch", text="Border Color",
               disabled=function()
                 local f = FriendsDB()
                 return not f or (f.borderSize or 0) == 0
@@ -325,25 +308,25 @@ initFrame:SetScript("OnEvent", function(self)
                       if not c or not c.enabled then return 0.15 end
                       return c.useClassColor and 1 or 0.3
                   end },
-              } }
+              } })
         );  y = y - h
 
         -- Enable Accent Colors | Enable Faction Banners
         _, h = W:DualRow(parent, y,
-            { type="toggle", text="Enable Accent Colors",
+            Gate({ type="toggle", text="Enable Accent Colors",
               getValue=function() local f = FriendsDB(); return f and (f.accentColors ~= false) end,
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.accentColors = v
                 RefreshFriends()
-              end },
-            { type="toggle", text="Enable Faction Banners",
+              end }),
+            Gate({ type="toggle", text="Enable Faction Banners",
               getValue=function() local f = FriendsDB(); return f and (f.factionBanners ~= false) end,
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.factionBanners = v
-                if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
-              end }
+                RepaintFriendRows()
+              end })
         );  y = y - h
 
         -- Show Region Icons | Auto-Accept Friend Invites
@@ -354,7 +337,7 @@ initFrame:SetScript("OnEvent", function(self)
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.showRegionIcons = v
-                if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
+                RepaintFriendRows()
               end },
             { type="toggle", text="Auto-Accept Friend Invites",
               tooltip="Auto-accepts all group invites from people on your friends list",
@@ -362,6 +345,7 @@ initFrame:SetScript("OnEvent", function(self)
               setValue=function(v)
                 local f = FriendsDB(); if not f then return end
                 f.autoAcceptFriendInvites = v
+                if _G._EFR_SyncAutoAccept then _G._EFR_SyncAutoAccept() end
                 EllesmereUI:RefreshPage()  -- update the auto-accept cog disabled state
               end }
         );  y = y - h
@@ -407,8 +391,8 @@ initFrame:SetScript("OnEvent", function(self)
             end
             EllesmereUI:InvalidatePageCache()
             if _G._EFR_ApplyFriends then _G._EFR_ApplyFriends() end
-            if _G._EFR_ProcessFriendButtons then _G._EFR_ProcessFriendButtons() end
-            if _G._EFR_RepaintTiles then _G._EFR_RepaintTiles() end
+            if _G._EFR_SyncAutoAccept then _G._EFR_SyncAutoAccept() end
+            RepaintFriendRows()
         end,
     })
 

@@ -21,6 +21,9 @@ local BAGS_DEFAULTS = {
         bagShowTrackRank      = false,
         itemlevelUseCustomColor = false,
         bagHideEmptyCategories = true,
+        bagSplitSetGearBySet  = false,
+        bagShowSetGearName    = false,
+        bagSetNameFontSize    = 9,
         bagMergeDuplicates    = true,
         bagSidebarCollapsed   = false,
         bankSidebarCollapsed  = false,
@@ -28,6 +31,7 @@ local BAGS_DEFAULTS = {
         bagShowRecentItems    = true,
         bagPinnedInOneBag     = true,
         bagRecentInOneBag     = false,
+        bagShowRecentClear    = false,
         bagShowPinRecentTips  = true,
         bagShowSortIcon       = true,
         bagSortToBottom       = false,
@@ -35,9 +39,17 @@ local BAGS_DEFAULTS = {
         bagDefaultBagType     = "all",   -- "all" | "onebag" | "multibag"
         bagDefaultOneBag      = false,   -- legacy; migrated to bagDefaultBagType
         bagNestByExpansion    = false,
+        bankNestByExpansion   = false,
+        bankGroupByCategory   = false,
+        bankCategorySidebar   = false,
+        bankHideTabsInSidebar = false,
+        bankHideEmptyWhenNested = false,
+        bagArmoryGroupBySlot  = false,
+        bagCompactArmorySlotGroups = false,
         bagHideOneBagWarning  = false,
         bagHideAddCategory    = false,
         bagMoveNoShift        = false,
+        bagStackSplitter      = false,
         enableGoldTracking    = true,
         detachReagentBag      = false,
         enhancedBags          = true,
@@ -56,6 +68,18 @@ initFrame:SetScript("OnEvent", function(self)
 
     if not EllesmereUIDB then EllesmereUIDB = {} end
     local p = db.profile
+
+    -- The bank grouping dropdowns were replaced by two toggles. Convert the
+    -- short-lived string keys once, then drop them.
+    if p.bankGroupBy ~= nil then
+        if p.bankGroupBy == "category" then
+            p.bankGroupByCategory = true
+        elseif p.bankGroupBy == "expansion" then
+            p.bankNestByExpansion = true
+        end
+        p.bankGroupBy = nil
+        p.bankSubGroupBy = nil
+    end
 
     -- Default disabled categories: Housing and Quest Items off by default
     if EllesmereUIDB.bagDisabledCategoriesSeeded == nil then
