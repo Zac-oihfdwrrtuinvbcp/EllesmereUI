@@ -1306,6 +1306,12 @@ local function BuildColorsPage(pageName, parent, yOffset)
                 DB().miniboss = { r = r, g = g, b = b }
                 RefreshAllPlates()
               end },
+            { tooltip = "Mini-Boss Casters",
+              getValue = function() return DBColor("minibossCaster") end,
+              setValue = function(r, g, b)
+                DB().minibossCaster = { r = r, g = g, b = b }
+                RefreshAllPlates()
+              end },
             { tooltip = "Bosses",
               getValue = function() return DBColor("boss") end,
               setValue = function(r, g, b)

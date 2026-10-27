@@ -1019,6 +1019,18 @@ local function GetReactionColor(unit)
                 return c.r, c.g, c.b
             end
         end
+        if _isCaster then
+            if dpsNoAggroActive then
+                local ovr = defaults.dpsNoAggroOverrideCaster
+                if db.dpsNoAggroOverrideCaster ~= nil then ovr = db.dpsNoAggroOverrideCaster end
+                if ovr then
+                    local c = _C("dpsNoAggro")
+                    return c.r, c.g, c.b
+                end
+            end
+            local c = _C("minibossCaster")
+            return MaybeDarken(c.r, c.g, c.b, inCombat)
+        end
         local c = _C("miniboss")
         return MaybeDarken(c.r, c.g, c.b, inCombat)
     end
@@ -1068,6 +1080,7 @@ local function GetReactionColor(unit)
         local c = _C("caster")
         return MaybeDarken(c.r, c.g, c.b, inCombat)
     end
+
     -- 9. Tank has aggro (if enabled) below focus/caster/miniboss. Normally sits above the boss
     -- color (step 10b); with "Override Boss colors" disabled it's held below boss instead (the
     -- 10b return wins for boss units, so has-aggro lands just below bosses).

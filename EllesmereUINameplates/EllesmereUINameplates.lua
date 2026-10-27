@@ -190,6 +190,7 @@ local defaults = {
     hoverOverlayTexture = "none",
     caster  = { r = 0.231, g = 0.510, b = 0.965 },
     miniboss = { r = 0.518, g = 0.243, b = 0.984 },
+    minibossCaster = { r = 0.518, g = 0.243, b = 0.984 },
     boss = { r = 0.518, g = 0.243, b = 0.984 },
     enemyInCombat = { r = 0.800, g = 0.137, b = 0.137 },
     -- "Mini Enemies" (non-elite trash) has no static default: unset views enemyInCombat, so it
