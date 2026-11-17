@@ -871,6 +871,10 @@ function EABR.FvSleepingBagOwned()
     return owned
 end
 
+-- Arcane Censer: track the buff, apply it with the item in the bags.
+local FV_CENSER_BUFF_IDS
+local FV_CENSER_ITEM = 275730
+
 -- WoW Forever collector: the Camp Benefits campfire buff, the Sleeping Bag's
 -- Well-Rested buff (missing or under its full stacks, or inside its cog's Show
 -- Below minutes of running out, then with the countdown; while a Cozy Sleeping
@@ -909,7 +913,8 @@ function EABR.CollectForever(missing, inInstance, inPvP)
     -- Weapon Buffs' bag listener (below) already hears every bag change.
     EABR.FvSyncSleepBagWatch(wantBag and not sleepBag and not EABR._fvMaxLevel
         and fo.weapon ~= true or false)
-    EABR.FvSyncBagEvent(shows and (fo.weapon == true or sleepBag) or false)
+    local wantCenser = shows and fo.arcaneCenser == true and EllesmereUI.IsInDungeon()
+    EABR.FvSyncBagEvent(shows and (fo.weapon == true or sleepBag or wantCenser) or false)
     local watchPickerSpells = shows and PickerEnabled() or false
     if watchPickerSpells ~= (EABR._fvPickerSpellEvents or false) then
         EABR.FvSyncPickerSpellEvents(watchPickerSpells)
@@ -958,6 +963,20 @@ function EABR.CollectForever(missing, inInstance, inPvP)
             e.expireAt, e.expireTotal = expireAt, remaining
             e.label = EllesmereUI.L("Sleeping")
             e.cat = "forever"; e.dismissKey = "forever:sleepingbag"
+            missing[#missing+1] = e
+        end
+    end
+    if wantCenser and not FV_CENSER_BUFF_IDS then FV_CENSER_BUFF_IDS = { 1297774 } end
+    if wantCenser and not PlayerHasAuraByID(FV_CENSER_BUFF_IDS)
+        and not (auraLock and not EABR.FvRanksReadable(FV_CENSER_BUFF_IDS)) then
+        local count = CachedGetItemCount(FV_CENSER_ITEM)
+        if count > 0 then
+            local e = AcquireEntry()
+            e.mode = "item"; e.itemID = FV_CENSER_ITEM
+            e.texture = Tex(FV_CENSER_BUFF_IDS[1]) or C_Item.GetItemIconByID(FV_CENSER_ITEM)
+            e.label = ShortLabel(SpellName(FV_CENSER_BUFF_IDS[1]) or "1297774")
+            e.bagCount = count
+            e.cat = "forever"; e.dismissKey = "forever:1297774"
             missing[#missing+1] = e
         end
     end
@@ -1060,7 +1079,8 @@ function EABR.CollectForever(missing, inInstance, inPvP)
     for i = 1, #custom do
         local id = custom[i]
         local off = classOff and classOff[id]
-        if not (off and off[class] == false) then
+        -- The built-in item reminder owns this ID while enabled.
+        if not (wantCenser and id == FV_CENSER_BUFF_IDS[1]) and not (off and off[class] == false) then
             local name = SpellName(id)
             if not (coveredIDs and (coveredIDs[id] or (name and coveredNames[name]))) then
                 local fam = EABR.ForeverFamily(id)
@@ -1088,44 +1108,22 @@ end
 
 -------------------------------------------------------------------------------
 --  WoW Forever Raid Buffs: the retail section's two views over that client's
---  buffs (RAID_BUFFS). A member has a buff while an aura with one of its
---  family's names is up (every rank, the group version, other casters'
---  versions). Under the game's aura restriction a buff is read only while none
+--  buffs (RAID_BUFFS). A member has a buff while an aura of its family is up
+--  (every rank, the group version, other casters' versions: the parent's
+--  ForeverFamilyAura). Under the game's aura restriction a buff is read only while none
 --  of its ranks is secret (a secret aura would read absent while up), and
 --  shows nothing otherwise rather than a false alarm. Absence only (no expiry
 --  thresholds).
 -------------------------------------------------------------------------------
--- Localized names of a family, cached per family (cold spell data stays uncached).
-function EABR.FvNames(fam)
-    local cache = EABR._fvNameCache
-    if not cache then cache = {}; EABR._fvNameCache = cache end
-    local names = cache[fam]
-    if names then return names end
-    names = {}
-    for _, id in ipairs(fam.names) do
-        local n = SpellName(id)
-        if n then names[#names + 1] = n end
-    end
-    if names[1] then cache[fam] = names end
-    return names
-end
-
 -- Whether a unit carries any rank of a family: true / false, or nil when the
 -- answer cannot be read. rec (optional) collects the found aura's instance ID
 -- for the group aura probe.
 function EABR.FvUnitHas(u, fam, rec)
-    local names = EABR.FvNames(fam)
-    if not names[1] then return nil end
-    for n = 1, #names do
-        local ok, aura = pcall(C_UnitAuras.GetAuraDataBySpellName, u, names[n], "HELPFUL")
-        if not ok or isSecret(aura) then return nil end
-        if aura then
-            local iid = rec and aura.auraInstanceID
-            if iid and not isSecret(iid) then rec[iid] = true end
-            return true
-        end
-    end
-    return false
+    local aura = EllesmereUI.ForeverFamilyAura(u, fam)
+    if not aura then return aura end
+    local iid = rec and aura.auraInstanceID
+    if iid and not isSecret(iid) then rec[iid] = true end
+    return true
 end
 
 -- The highest rank in a list (lowest first) the player knows, or nil.
@@ -1775,6 +1773,10 @@ function EABR.FvSyncGroupWatch(fams, roster)
             local fam = fams[i]
             W.fams[i] = fam
             for _, id in ipairs(fam.ids) do W.ids[id] = true end
+            -- A stronger buff of the same stat changes the answer too.
+            if fam.stronger then
+                for id in pairs(fam.stronger) do W.ids[id] = true end
+            end
         end
     end
     if W.any ~= any then
