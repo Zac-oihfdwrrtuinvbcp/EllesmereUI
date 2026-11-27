@@ -568,6 +568,30 @@ do
         return found
     end
 
+    local best, bestFoods, bestLevel
+
+    -- The food a click eats: the picked one, else the one this character last ate, else the highest-level one usable.
+    function EABR.PickForeverFood(foods, picked)
+        if picked and foods[picked] then return picked end
+        local char = EllesmereUI.CharEntry()
+        local last = char and char.foreverFood
+        if last and foods[last] then return last end
+        local level = UnitLevel("player") or 0
+        if bestFoods ~= foods or bestLevel ~= level then
+            bestFoods, bestLevel, best = foods, level, nil
+            local bestMin, bestIlvl = -1, -1
+            for id in pairs(foods) do
+                local _, _, _, ilvl, minLevel = C_Item.GetItemInfo(id)
+                minLevel, ilvl = minLevel or 0, ilvl or 0
+                if minLevel <= level and (minLevel > bestMin or (minLevel == bestMin
+                    and (ilvl > bestIlvl or (ilvl == bestIlvl and id > best)))) then
+                    best, bestMin, bestIlvl = id, minLevel, ilvl
+                end
+            end
+        end
+        return best
+    end
+
     function EABR.SyncForeverFoodWatch(want)
         if want == watching then return end
         watching = want
@@ -608,6 +632,13 @@ do
                         if Same(found, foods) then
                             spare = found
                             return
+                        end
+                        for fid, n in pairs(foods) do
+                            if (found[fid] or 0) < n then
+                                local char = EllesmereUI.CharEntry(true)
+                                if char then char.foreverFood = fid end
+                                break
+                            end
                         end
                         foods = found
                         if EABR.ValidateOpenPicker then EABR.ValidateOpenPicker() end
@@ -1437,7 +1468,7 @@ function EABR.CollectForever(missing, inInstance, inPvP, playerClass)
     if watchSpellbook ~= (EABR._fvSpellbookEvents or false) then
         EABR.FvSyncSpellbookEvents(watchSpellbook)
     end
-    local watchFood = itemShows and pickerEnabled and not inPvP and fo.wellFed or false
+    local watchFood = itemShows and not inPvP and fo.wellFed or false
     if not anyShows then
         EABR.FvSyncConsumableItemEvents(false, false)
         EABR.SyncForeverFoodWatch(false)
@@ -1600,9 +1631,9 @@ function EABR.CollectForever(missing, inInstance, inPvP, playerClass)
             if expireAt then e.expireAt, e.expireTotal = expireAt, remaining end
             if watchFood then
                 local foods = EABR.GetForeverFood()
-                e.foreverFood = next(foods) and foods or nil
-                local id = fo.wellFedItem
-                if id and foods[id] then
+                if pickerEnabled and next(foods) then e.foreverFood = foods end
+                local id = EABR.PickForeverFood(foods, pickerEnabled and fo.wellFedItem)
+                if id then
                     e.mode = "macro"
                     e.macro = EABR.ForeverFoodMacro(id)
                     e.spellID = nil
@@ -1672,6 +1703,26 @@ function EABR.CollectForever(missing, inInstance, inPvP, playerClass)
                     missing[#missing+1] = e
                 end
             end
+        end
+    end
+end
+
+-- Self Buffs ahead of Consumables from missing[first] on, each keeping its own order.
+do
+    local items = {}
+    function EABR.FvSelfFirst(missing, first)
+        local w, n = first, 0
+        for i = first, #missing do
+            local e = missing[i]
+            if e.fvSelf then
+                missing[w] = e; w = w + 1
+            else
+                n = n + 1; items[n] = e
+            end
+        end
+        for i = 1, n do
+            missing[w] = items[i]; w = w + 1
+            items[i] = nil
         end
     end
 end
@@ -2051,7 +2102,9 @@ local function Refresh()
     if EABR.FOREVER then
         if remindersOn then
             EABR.CollectForeverRaidBuffs(missing, playerClass, inInstance)
+            local first = #missing + 1
             EABR.CollectForever(missing, inInstance, inPvP, playerClass)
+            EABR.FvSelfFirst(missing, first)
         else
             EABR.FvStandDown()
         end
